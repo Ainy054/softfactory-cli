@@ -62,14 +62,31 @@ export class WorktreeManager {
     }
   }
 
-  async commitWorktree(taskId: string) {
+  async commitWorktree(taskId: string): Promise<{ committed: boolean; filesChanged: number }> {
     const worktreePath = path.join(this.worktreeBase, taskId);
 
     await execa('git', ['add', '.'], { cwd: worktreePath });
+
+    // Check if there's anything to commit
+    const { stdout: status } = await execa('git', ['status', '--porcelain'], { cwd: worktreePath });
+    if (!status.trim()) {
+      return { committed: false, filesChanged: 0 };
+    }
+
+    const filesChanged = status.trim().split('\n').length;
+    await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
+    return { committed: true, filesChanged };
+  }
+
+  async hasCommitsAhead(branchName: string, targetBranch: string): Promise<boolean> {
     try {
-      await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
+      const { stdout } = await execa(
+        'git', ['rev-list', '--count', `${targetBranch}..${branchName}`],
+        { cwd: this.baseDir }
+      );
+      return parseInt(stdout.trim(), 10) > 0;
     } catch {
-      // No changes to commit — that's okay
+      return false;
     }
   }
 

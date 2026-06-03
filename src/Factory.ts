@@ -68,6 +68,9 @@ export class Factory extends EventEmitter {
       return;
     }
 
+    // Validate "done" tasks — check that their merge commits actually exist in git
+    await this.validateDoneTasks();
+
     const failed = this.state.tasks.filter(t => t.status === 'failed' || t.status === 'rejected');
     if (failed.length === 0) {
       this.log('No failed tasks to resume.');
@@ -87,8 +90,48 @@ export class Factory extends EventEmitter {
     await this.saveState();
     this.emitEvent({ type: 'state:update', state: this.state });
 
-    // Run the workshop/inspection loop (skip blueprint stage)
     await this.runWorkshopLoop();
+  }
+
+  private async validateDoneTasks() {
+    let resetCount = 0;
+    for (const task of this.state.tasks) {
+      if (task.status !== 'done') continue;
+
+      // Check if a merge commit for this task exists in git history
+      const mergeExists = await this.mergeExistsInHistory(task.id);
+      if (!mergeExists) {
+        this.log(`GHOST: ${task.id} - ${task.title} (marked done but no merge found in git — resetting to pending)`);
+        task.status = 'pending';
+        task.attempts = 0;
+        task.last_feedback = undefined;
+        resetCount++;
+      }
+    }
+
+    if (resetCount > 0) {
+      this.log(`Validated state: ${resetCount} ghost task(s) reset to pending`);
+      await this.saveState();
+    }
+  }
+
+  private async mergeExistsInHistory(taskId: string): Promise<boolean> {
+    try {
+      const { stdout } = await execa(
+        'git', ['log', '--oneline', '--all', '--grep', `softfactory: merge ${taskId}`],
+        { cwd: this.baseDir }
+      );
+      if (stdout.trim()) return true;
+
+      // Also check for direct commits (in case merge was fast-forward)
+      const { stdout: stdout2 } = await execa(
+        'git', ['log', '--oneline', '--all', '--grep', `softfactory: complete task ${taskId}`],
+        { cwd: this.baseDir }
+      );
+      return !!stdout2.trim();
+    } catch {
+      return false;
+    }
   }
 
   async build(requirement: string) {
@@ -195,10 +238,31 @@ export class Factory extends EventEmitter {
       });
 
       // Commit changes in worktree so diff is visible for inspection
-      await this.worktreeManager.commitWorktree(task.id);
+      const commitResult = await this.worktreeManager.commitWorktree(task.id);
+
+      if (!commitResult.committed) {
+        this.log(`EMPTY: ${task.id} — worker produced no file changes`);
+        task.status = 'failed';
+        task.attempts++;
+        task.last_feedback = 'Worker completed but produced no file changes. Ensure you actually create/modify files, not just describe what to do.';
+        this.emitEvent({ type: 'task:fail', task, feedback: task.last_feedback });
+        return null;
+      }
+
+      this.log(`Committed ${commitResult.filesChanged} file(s) for ${task.id}`);
+
+      const diff = await this.getDiff(branchName);
+
+      if (!diff.trim()) {
+        this.log(`EMPTY DIFF: ${task.id} — commit succeeded but diff is empty (possible git state issue)`);
+        task.status = 'failed';
+        task.attempts++;
+        task.last_feedback = 'Changes were committed but diff against target branch is empty. This is likely a git state desync.';
+        this.emitEvent({ type: 'task:fail', task, feedback: task.last_feedback });
+        return null;
+      }
 
       this.log(`Inspection: Reviewing ${task.id}`);
-      const diff = await this.getDiff(branchName);
       const review = await this.gemini.inspectTask(task, diff, handoff.summary);
 
       if (review.verdict === 'PASS') {
