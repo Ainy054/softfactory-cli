@@ -34,22 +34,36 @@ export class WorktreeManager {
 
     await execa('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: this.baseDir });
 
+    // Seed .gitignore so workers don't commit build artifacts
+    await this.seedGitignore(worktreePath);
+
     return worktreePath;
+  }
+
+  private async seedGitignore(worktreePath: string) {
+    const REQUIRED_ENTRIES = [
+      'node_modules/',
+      '.softfactory/',
+      'dist/',
+      '.env',
+      '.env.local',
+    ];
+
+    const gitignorePath = path.join(worktreePath, '.gitignore');
+    let existing = '';
+    try {
+      existing = await fs.readFile(gitignorePath, 'utf-8');
+    } catch {}
+
+    const missing = REQUIRED_ENTRIES.filter(e => !existing.includes(e));
+    if (missing.length > 0) {
+      const suffix = (existing && !existing.endsWith('\n') ? '\n' : '') + missing.join('\n') + '\n';
+      await fs.appendFile(gitignorePath, suffix);
+    }
   }
 
   async commitWorktree(taskId: string) {
     const worktreePath = path.join(this.worktreeBase, taskId);
-
-    // Ensure .softfactory is ignored in worktree commits to avoid merge conflicts
-    const gitignorePath = path.join(worktreePath, '.gitignore');
-    try {
-      const existing = await fs.readFile(gitignorePath, 'utf-8');
-      if (!existing.includes('.softfactory/')) {
-        await fs.appendFile(gitignorePath, '\n.softfactory/\n');
-      }
-    } catch {
-      await fs.writeFile(gitignorePath, '.softfactory/\n');
-    }
 
     await execa('git', ['add', '.'], { cwd: worktreePath });
     try {

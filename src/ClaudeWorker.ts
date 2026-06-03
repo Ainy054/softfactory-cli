@@ -6,22 +6,48 @@ import { Task, HandoffSchema, Handoff } from './types.js';
 export interface WorkerOptions {
   onOutput?: (line: string) => void;
   streamToTerminal?: boolean;
+  projectContext?: string;
 }
 
 export class ClaudeWorker {
   async execute(task: Task, worktreePath: string, options: WorkerOptions = {}): Promise<Handoff> {
-    const { onOutput, streamToTerminal = false } = options;
+    const { onOutput, streamToTerminal = false, projectContext } = options;
     const handoffPath = path.join(worktreePath, '.softfactory', 'handoff.json');
     await fs.mkdir(path.dirname(handoffPath), { recursive: true });
 
-    const prompt = `
+    let prompt = `
 You are a SoftFactory Line Worker (Claude CLI).
 Task ID: ${task.id}
 Title: ${task.title}
 Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
+`;
 
-Your goal is to implement this task.
+    if (projectContext) {
+      prompt += `
+Project Context:
+${projectContext}
+`;
+    }
+
+    prompt += `
+RULES:
+- NEVER commit node_modules/, dist/, .env, or build artifacts. They belong in .gitignore.
+- If you run npm install or any package manager, the dependencies are for runtime only — do NOT stage node_modules.
+- Respect the existing .gitignore file.
+- Write clean, production-quality code.
+`;
+
+    if (task.last_feedback) {
+      prompt += `
+IMPORTANT — PREVIOUS ATTEMPT FAILED (attempt ${task.attempts}/3):
+The quality inspector rejected your previous work with this feedback:
+"${task.last_feedback}"
+You MUST address this feedback in your implementation. Do NOT repeat the same mistake.
+`;
+    }
+
+    prompt += `
 CRITICAL: Before you exit, you MUST write a JSON handoff file to: ${handoffPath}
 The JSON must follow this schema:
 {

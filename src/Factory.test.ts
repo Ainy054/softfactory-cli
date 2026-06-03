@@ -1,11 +1,28 @@
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Task } from './types.js';
 
-// We test the logic extracted from Factory without needing real git/API calls.
-// This tests the task scheduling algorithm directly.
+// Mirror the scheduling logic from Factory for unit testing.
+
+function markRejected(tasks: Task[]) {
+  const terminallyFailed = new Set(
+    tasks
+      .filter(t => t.status === 'rejected' || (t.status === 'failed' && t.attempts >= 3))
+      .map(t => t.id)
+  );
+  for (const task of tasks) {
+    if (task.status === 'pending' || (task.status === 'failed' && task.attempts < 3)) {
+      const deps = [...task.dependencies, ...task.blockedBy];
+      if (deps.some(dep => terminallyFailed.has(dep))) {
+        task.status = 'rejected';
+      }
+    }
+  }
+}
 
 function getReadyTasks(tasks: Task[]): Task[] {
+  markRejected(tasks);
+
   const doneTasks = new Set(
     tasks.filter(t => t.status === 'done').map(t => t.id)
   );
@@ -17,8 +34,10 @@ function getReadyTasks(tasks: Task[]): Task[] {
     if (!allDepsResolved) return false;
 
     const earlierPhaseTasks = tasks.filter(other => other.phase < t.phase);
-    const allEarlierDone = earlierPhaseTasks.every(other => other.status === 'done');
-    return allEarlierDone;
+    const allEarlierSettled = earlierPhaseTasks.every(
+      other => other.status === 'done' || other.status === 'rejected' || (other.status === 'failed' && other.attempts >= 3)
+    );
+    return allEarlierSettled;
   });
 }
 
@@ -141,6 +160,44 @@ describe('getReadyTasks', () => {
     const ready = getReadyTasks(tasks);
     assert.equal(ready.length, 0);
   });
+
+  it('should reject tasks whose dependency exhausted retries', () => {
+    const tasks = [
+      makeTask({ id: 'T001', phase: 1, status: 'failed', attempts: 3 }),
+      makeTask({ id: 'T002', phase: 1, status: 'pending', dependencies: ['T001'] }),
+    ];
+    getReadyTasks(tasks);
+    assert.equal(tasks[1].status, 'rejected');
+  });
+
+  it('should allow phase-2 tasks when phase-1 has exhausted failures', () => {
+    const tasks = [
+      makeTask({ id: 'T001', phase: 1, status: 'done' }),
+      makeTask({ id: 'T002', phase: 1, status: 'failed', attempts: 3 }),
+      makeTask({ id: 'T003', phase: 2 }),
+    ];
+    const ready = getReadyTasks(tasks);
+    assert.equal(ready.length, 1);
+    assert.equal(ready[0].id, 'T003');
+  });
+
+  it('should cascade rejection through dependency chains', () => {
+    const tasks = [
+      makeTask({ id: 'T001', phase: 1, status: 'failed', attempts: 3 }),
+      makeTask({ id: 'T002', phase: 2, status: 'pending', dependencies: ['T001'] }),
+      makeTask({ id: 'T003', phase: 3, status: 'pending', dependencies: ['T002'] }),
+    ];
+    getReadyTasks(tasks);
+    assert.equal(tasks[1].status, 'rejected');
+    // T003 depends on T002 which is now rejected — run again to cascade
+    getReadyTasks(tasks);
+    assert.equal(tasks[2].status, 'rejected');
+  });
+
+  it('should preserve last_feedback on task', () => {
+    const task = makeTask({ id: 'T001', status: 'failed', attempts: 1, last_feedback: 'Remove node_modules' });
+    assert.equal(task.last_feedback, 'Remove node_modules');
+  });
 });
 
 describe('hasUnfinishedTasks', () => {
@@ -174,6 +231,15 @@ describe('hasUnfinishedTasks', () => {
 
   it('should return false for rejected tasks', () => {
     const tasks = [makeTask({ id: 'T001', status: 'rejected' })];
+    assert.equal(hasUnfinishedTasks(tasks), false);
+  });
+
+  it('should return false when all tasks are settled (mix of done, failed, rejected)', () => {
+    const tasks = [
+      makeTask({ id: 'T001', status: 'done' }),
+      makeTask({ id: 'T002', status: 'failed', attempts: 3 }),
+      makeTask({ id: 'T003', status: 'rejected' }),
+    ];
     assert.equal(hasUnfinishedTasks(tasks), false);
   });
 });

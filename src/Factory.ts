@@ -129,12 +129,20 @@ export class Factory extends EventEmitter {
       await this.saveState();
     }
 
-    const hasFailed = this.state.tasks.some(t => t.status === 'failed' || t.status === 'rejected');
-    this.state.status = hasFailed ? 'failed' : 'completed';
+    const failedTasks = this.state.tasks.filter(t => t.status === 'failed' || t.status === 'rejected');
+    const doneTasks = this.state.tasks.filter(t => t.status === 'done');
+    this.state.status = failedTasks.length > 0 ? 'failed' : 'completed';
     await this.saveState();
 
     this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
-    this.log(`Build ${this.state.status}: ${this.state.feature}`);
+    if (failedTasks.length > 0) {
+      this.log(`Build partial: ${doneTasks.length}/${this.state.tasks.length} tasks completed, ${failedTasks.length} failed/skipped`);
+      for (const t of failedTasks) {
+        this.log(`  - ${t.id} ${t.title}: ${t.status}${t.last_feedback ? ` (${t.last_feedback.slice(0, 100)})` : ''}`);
+      }
+    } else {
+      this.log(`Build completed: ${this.state.feature}`);
+    }
   }
 
   private async executeAndInspect(task: Task): Promise<TaskResult | null> {
@@ -147,8 +155,10 @@ export class Factory extends EventEmitter {
     const worktreePath = await this.worktreeManager.create(task.id, branchName);
 
     try {
+      const projectContext = await this.getProjectContext(worktreePath);
       const handoff = await this.worker.execute(task, worktreePath, {
         streamToTerminal: this.streamToTerminal,
+        projectContext,
         onOutput: (line) => {
           this.emitEvent({ type: 'worker:output', taskId: task.id, line });
         },
@@ -168,6 +178,7 @@ export class Factory extends EventEmitter {
         this.log(`FAILED: ${task.id}. Feedback: ${review.feedback}`);
         task.status = 'failed';
         task.attempts++;
+        task.last_feedback = review.feedback;
         this.emitEvent({ type: 'task:fail', task, feedback: review.feedback });
         return null;
       }
@@ -175,6 +186,7 @@ export class Factory extends EventEmitter {
       this.log(`Error running task ${task.id}: ${e.message || e}`);
       task.status = 'failed';
       task.attempts++;
+      task.last_feedback = e.message;
       this.emitEvent({ type: 'task:fail', task, feedback: e.message });
       return null;
     }
@@ -184,6 +196,24 @@ export class Factory extends EventEmitter {
     const doneTasks = new Set(
       this.state.tasks.filter(t => t.status === 'done').map(t => t.id)
     );
+    const terminallyFailed = new Set(
+      this.state.tasks
+        .filter(t => t.status === 'rejected' || (t.status === 'failed' && t.attempts >= 3))
+        .map(t => t.id)
+    );
+
+    // Mark tasks blocked by terminally failed dependencies as 'rejected'
+    for (const task of this.state.tasks) {
+      if (task.status === 'pending' || (task.status === 'failed' && task.attempts < 3)) {
+        const deps = [...task.dependencies, ...task.blockedBy];
+        const blockedByExhausted = deps.some(dep => terminallyFailed.has(dep));
+        if (blockedByExhausted) {
+          task.status = 'rejected';
+          this.log(`SKIPPED: ${task.id} - ${task.title} (dependency exhausted retries)`);
+          this.emitEvent({ type: 'task:fail', task, feedback: 'Skipped: dependency failed permanently' });
+        }
+      }
+    }
 
     const eligible = this.state.tasks.filter(t => {
       if (t.status !== 'pending' && !(t.status === 'failed' && t.attempts < 3)) return false;
@@ -192,13 +222,39 @@ export class Factory extends EventEmitter {
       const allDepsResolved = [...t.dependencies, ...t.blockedBy].every(dep => doneTasks.has(dep));
       if (!allDepsResolved) return false;
 
-      // All tasks in earlier phases must be done
+      // All tasks in earlier phases must be done or permanently settled
       const earlierPhaseTasks = this.state.tasks.filter(other => other.phase < t.phase);
-      const allEarlierDone = earlierPhaseTasks.every(other => other.status === 'done');
-      return allEarlierDone;
+      const allEarlierSettled = earlierPhaseTasks.every(
+        other => other.status === 'done' || other.status === 'rejected' || (other.status === 'failed' && other.attempts >= 3)
+      );
+      return allEarlierSettled;
     });
 
     return eligible;
+  }
+
+  private async getProjectContext(worktreePath: string): Promise<string> {
+    const parts: string[] = [];
+
+    // Include .gitignore
+    try {
+      const gitignore = await fs.readFile(path.join(worktreePath, '.gitignore'), 'utf-8');
+      parts.push(`.gitignore:\n${gitignore}`);
+    } catch {}
+
+    // Include file listing
+    try {
+      const { stdout } = await execa('git', ['ls-files'], { cwd: worktreePath });
+      if (stdout.trim()) parts.push(`Tracked files:\n${stdout}`);
+    } catch {}
+
+    // Include package.json if it exists
+    try {
+      const pkg = await fs.readFile(path.join(worktreePath, 'package.json'), 'utf-8');
+      parts.push(`package.json:\n${pkg}`);
+    } catch {}
+
+    return parts.join('\n\n');
   }
 
   private async getRepoContext(): Promise<string> {
