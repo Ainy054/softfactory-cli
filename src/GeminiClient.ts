@@ -1,12 +1,12 @@
 import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
-import { FactoryState, Task } from './types.js';
+import { Task } from './types.js';
 
 export class GeminiClient {
   private genAI: GoogleGenerativeAI;
   private proModel: GenerativeModel;
   private flashModel: GenerativeModel;
 
-  constructor(apiKey: string, proModelName: string = 'gemini-1.5-pro', flashModelName: string = 'gemini-1.5-flash') {
+  constructor(apiKey: string, proModelName: string, flashModelName: string) {
     this.genAI = new GoogleGenerativeAI(apiKey);
     this.proModel = this.genAI.getGenerativeModel({ model: proModelName });
     this.flashModel = this.genAI.getGenerativeModel({ model: flashModelName });
@@ -14,7 +14,7 @@ export class GeminiClient {
 
   async generateBlueprint(requirement: string, codebaseContext: string, memoryPatterns: string): Promise<any> {
     const prompt = `
-You are the SoftFactory Blueprint Architect (using Gemini 3.1 Pro Preview logic).
+You are the SoftFactory Blueprint Architect.
 Your task is to analyze a requirement and a codebase context to produce a structured task plan.
 
 Requirement: ${requirement}
@@ -42,23 +42,25 @@ Output a strictly valid JSON object following this schema:
   ]
 }
 
-Ensure tasks are granular, parallelizable where possible, and include file hints.
+Rules:
+- Assign phase numbers so independent tasks share the same phase (they run in parallel).
+- Use dependencies/blockedBy to express ordering within a phase.
+- Ensure tasks are granular, parallelizable where possible, and include file hints.
 `;
 
     const result = await this.proModel.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
-    
-    // Extract JSON from response (handling potential markdown blocks)
+
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error("Failed to parse JSON from Gemini response");
-    
+
     return JSON.parse(jsonMatch[0]);
   }
 
   async inspectTask(task: Task, diff: string, handoffSummary: string): Promise<{ verdict: 'PASS' | 'FAIL', feedback: string }> {
     const prompt = `
-You are the SoftFactory Quality Inspector (using Gemini 3.5 Flash logic).
+You are the SoftFactory Quality Inspector.
 Your task is to review a code diff against a task description and a worker's handoff summary.
 
 Task Description: ${task.description}

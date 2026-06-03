@@ -37,3 +37,17 @@ export const HandoffSchema = z.object({
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;
+
+export interface TaskResult {
+  task: Task;
+  branchName: string;
+}
+
+export type FactoryEvent =
+  | { type: 'task:start'; task: Task }
+  | { type: 'task:done'; task: Task }
+  | { type: 'task:fail'; task: Task; feedback?: string }
+  | { type: 'state:update'; state: FactoryState }
+  | { type: 'worker:output'; taskId: string; line: string }
+  | { type: 'phase:start'; phase: number }
+  | { type: 'build:complete'; status: 'completed' | 'failed'; feature: string };

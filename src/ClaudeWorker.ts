@@ -3,10 +3,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
 
-export class ClaudeWorker {
-  constructor() {}
+export interface WorkerOptions {
+  onOutput?: (line: string) => void;
+  streamToTerminal?: boolean;
+}
 
-  async execute(task: Task, worktreePath: string): Promise<Handoff> {
+export class ClaudeWorker {
+  async execute(task: Task, worktreePath: string, options: WorkerOptions = {}): Promise<Handoff> {
+    const { onOutput, streamToTerminal = false } = options;
     const handoffPath = path.join(worktreePath, '.softfactory', 'handoff.json');
     await fs.mkdir(path.dirname(handoffPath), { recursive: true });
 
@@ -17,7 +21,7 @@ Title: ${task.title}
 Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
 
-Your goal is to implement this task. 
+Your goal is to implement this task.
 CRITICAL: Before you exit, you MUST write a JSON handoff file to: ${handoffPath}
 The JSON must follow this schema:
 {
@@ -31,26 +35,49 @@ The JSON must follow this schema:
 You have full tool access in this worktree. Begin.
 `;
 
-    // Start the Claude process
-    const process = execa('claude', ['-p', prompt], {
+    const command = 'npx';
+    const args = ['--yes', '@anthropic-ai/claude-code', '--print', '--dangerously-skip-permissions', prompt];
+
+    const useStreaming = onOutput && !streamToTerminal;
+
+    const proc = execa(command, args, {
       cwd: worktreePath,
-      stdio: 'inherit', // Stream output to terminal
+      stdio: useStreaming ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     });
 
-    try {
-      await process;
-    } catch (e) {
-      console.error(`Claude execution failed for ${task.id}:`, e);
+    if (useStreaming && proc.stdout) {
+      let buffer = '';
+      proc.stdout.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (line.trim()) onOutput(line);
+        }
+      });
     }
 
-    // Wait for handoff file (polling for up to 30 seconds after process ends if not found)
+    if (useStreaming && proc.stderr) {
+      proc.stderr.on('data', (chunk: Buffer) => {
+        const line = chunk.toString().trim();
+        if (line) onOutput?.(`[stderr] ${line}`);
+      });
+    }
+
+    try {
+      await proc;
+    } catch (e) {
+      onOutput?.(`Claude execution error for ${task.id}`);
+    }
+
+    // Poll for handoff file (up to 30 seconds)
     let attempts = 0;
-    while (attempts < 10) {
+    while (attempts < 30) {
       try {
         const content = await fs.readFile(handoffPath, 'utf-8');
         const json = JSON.parse(content);
         return HandoffSchema.parse(json);
-      } catch (e) {
+      } catch {
         attempts++;
         await new Promise(resolve => setTimeout(resolve, 1000));
       }

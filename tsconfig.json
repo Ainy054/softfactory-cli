@@ -10,7 +10,9 @@
     "strict": true,
     "skipLibCheck": true,
     "declaration": true,
+    "jsx": "react-jsx",
     "types": ["node"]
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["src/**/*.test.ts"]
 }
