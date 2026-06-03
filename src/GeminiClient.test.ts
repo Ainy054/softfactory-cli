@@ -1,85 +1,84 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-// Test the response parsing logic extracted from GeminiClient
+// Test the response parsing logic used by GeminiClient with structured outputs.
+// With responseMimeType: 'application/json', Gemini returns pure JSON — no regex needed.
 
-function extractJson(text: string): any {
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('Failed to parse JSON from Gemini response');
-  return JSON.parse(jsonMatch[0]);
+function parseBlueprint(jsonText: string): any {
+  return JSON.parse(jsonText);
 }
 
-function parseVerdict(text: string): { verdict: 'PASS' | 'FAIL'; feedback: string } {
-  const verdictMatch = text.match(/VERDICT:\s*(PASS|FAIL)/i);
-  const feedbackMatch = text.match(/FEEDBACK:\s*([\s\S]*)/i);
+function parseVerdict(jsonText: string): { verdict: 'PASS' | 'FAIL'; feedback: string } {
+  const parsed = JSON.parse(jsonText);
   return {
-    verdict: (verdictMatch?.[1].toUpperCase() as 'PASS' | 'FAIL') || 'FAIL',
-    feedback: feedbackMatch?.[1].trim() || 'No feedback provided.',
+    verdict: (parsed.verdict?.toUpperCase() === 'PASS' ? 'PASS' : 'FAIL') as 'PASS' | 'FAIL',
+    feedback: parsed.feedback || 'No feedback provided.',
   };
 }
 
-describe('Blueprint JSON extraction', () => {
-  it('should extract JSON from plain response', () => {
+describe('Blueprint JSON parsing (structured output)', () => {
+  it('should parse a valid blueprint', () => {
     const text = '{"feature": "Auth", "tasks": []}';
-    const result = extractJson(text);
+    const result = parseBlueprint(text);
     assert.equal(result.feature, 'Auth');
+    assert.deepEqual(result.tasks, []);
   });
 
-  it('should extract JSON from markdown code block', () => {
-    const text = 'Here is the plan:\n```json\n{"feature": "Auth", "tasks": []}\n```';
-    const result = extractJson(text);
-    assert.equal(result.feature, 'Auth');
-  });
-
-  it('should extract JSON with surrounding text', () => {
-    const text = 'Based on analysis, here is the blueprint:\n\n{"feature": "API", "tasks": [{"id": "T001"}]}\n\nLet me know if changes are needed.';
-    const result = extractJson(text);
+  it('should parse blueprint with tasks', () => {
+    const text = JSON.stringify({
+      feature: 'API',
+      tasks: [{ id: 'T001', title: 'Setup', description: 'Init', agent_role: 'coder', phase: 1 }],
+    });
+    const result = parseBlueprint(text);
     assert.equal(result.feature, 'API');
     assert.equal(result.tasks.length, 1);
-  });
-
-  it('should throw on response with no JSON', () => {
-    assert.throws(() => {
-      extractJson('No JSON here, just text.');
-    }, /Failed to parse JSON/);
+    assert.equal(result.tasks[0].id, 'T001');
   });
 
   it('should throw on invalid JSON', () => {
     assert.throws(() => {
-      extractJson('{invalid json}');
+      parseBlueprint('not json');
     });
+  });
+
+  it('should handle empty tasks array', () => {
+    const result = parseBlueprint('{"feature": "Empty", "tasks": []}');
+    assert.equal(result.tasks.length, 0);
   });
 });
 
-describe('Verdict parsing', () => {
+describe('Verdict parsing (structured output)', () => {
   it('should parse PASS verdict', () => {
-    const result = parseVerdict('VERDICT: PASS\nFEEDBACK: Code looks good.');
+    const result = parseVerdict('{"verdict": "PASS", "feedback": "Code looks good."}');
     assert.equal(result.verdict, 'PASS');
     assert.equal(result.feedback, 'Code looks good.');
   });
 
   it('should parse FAIL verdict', () => {
-    const result = parseVerdict('VERDICT: FAIL\nFEEDBACK: Missing error handling.');
+    const result = parseVerdict('{"verdict": "FAIL", "feedback": "Missing error handling."}');
     assert.equal(result.verdict, 'FAIL');
     assert.equal(result.feedback, 'Missing error handling.');
   });
 
-  it('should be case-insensitive', () => {
-    const result = parseVerdict('verdict: pass\nfeedback: All good');
+  it('should normalize case to uppercase', () => {
+    const result = parseVerdict('{"verdict": "pass", "feedback": "All good"}');
     assert.equal(result.verdict, 'PASS');
-    assert.equal(result.feedback, 'All good');
   });
 
-  it('should default to FAIL when no verdict found', () => {
-    const result = parseVerdict('Some random text without a verdict');
+  it('should default to FAIL for unknown verdict', () => {
+    const result = parseVerdict('{"verdict": "maybe", "feedback": "Uncertain"}');
     assert.equal(result.verdict, 'FAIL');
+  });
+
+  it('should provide default feedback when missing', () => {
+    const result = parseVerdict('{"verdict": "PASS"}');
     assert.equal(result.feedback, 'No feedback provided.');
   });
 
   it('should handle multiline feedback', () => {
-    const result = parseVerdict('VERDICT: FAIL\nFEEDBACK: Issue 1: no tests.\nIssue 2: no docs.\nIssue 3: hardcoded values.');
+    const result = parseVerdict('{"verdict": "FAIL", "feedback": "Issue 1: no tests.\\nIssue 2: no docs."}');
     assert.equal(result.verdict, 'FAIL');
     assert.ok(result.feedback.includes('Issue 1'));
-    assert.ok(result.feedback.includes('Issue 3'));
+    assert.ok(result.feedback.includes('Issue 2'));
   });
 });

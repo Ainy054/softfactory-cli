@@ -23,6 +23,23 @@ Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
 `;
 
+    // Proactive context injection: read files_hint contents so the worker
+    // doesn't spend tool calls reading files it was already told to modify
+    const fileContents: string[] = [];
+    for (const hint of task.files_hint) {
+      try {
+        const filePath = path.join(worktreePath, hint);
+        const content = await fs.readFile(filePath, 'utf-8');
+        fileContents.push(`--- ${hint} ---\n${content.slice(0, 4000)}`);
+      } catch {}
+    }
+    if (fileContents.length > 0) {
+      prompt += `
+EXISTING FILE CONTENTS (files you may need to modify):
+${fileContents.join('\n\n')}
+`;
+    }
+
     if (projectContext) {
       prompt += `
 Project Context:

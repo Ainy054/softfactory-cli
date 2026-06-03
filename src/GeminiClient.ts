@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
+import { GoogleGenerativeAI, GenerativeModel, SchemaType } from '@google/generative-ai';
 import { Task } from './types.js';
 
 export class GeminiClient {
@@ -28,37 +28,44 @@ ${memoryPatterns}
 Previously Built Features:
 ${featureHistory || 'None — this is the first feature for this project.'}
 
-Output a strictly valid JSON object following this schema:
-{
-  "feature": "Name of the feature",
-  "tasks": [
-    {
-      "id": "T001",
-      "title": "Short title",
-      "description": "Detailed implementation instructions for a builder agent",
-      "agent_role": "coder" | "test_writer" | "docs" | "devops" | "architect" | "builder",
-      "phase": 1,
-      "dependencies": [],
-      "blockedBy": [],
-      "files_hint": ["path/to/file.ts"]
-    }
-  ]
-}
-
 Rules:
 - Assign phase numbers so independent tasks share the same phase (they run in parallel).
 - Use dependencies/blockedBy to express ordering within a phase.
 - Ensure tasks are granular, parallelizable where possible, and include file hints.
 `;
 
-    const result = await this.proModel.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
+    const result = await this.proModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: SchemaType.OBJECT,
+          properties: {
+            feature: { type: SchemaType.STRING },
+            tasks: {
+              type: SchemaType.ARRAY,
+              items: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  id: { type: SchemaType.STRING },
+                  title: { type: SchemaType.STRING },
+                  description: { type: SchemaType.STRING },
+                  agent_role: { type: SchemaType.STRING },
+                  phase: { type: SchemaType.INTEGER },
+                  dependencies: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                  blockedBy: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                  files_hint: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                },
+                required: ['id', 'title', 'description', 'agent_role', 'phase'],
+              },
+            },
+          },
+          required: ['feature', 'tasks'],
+        },
+      },
+    });
 
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("Failed to parse JSON from Gemini response");
-
-    return JSON.parse(jsonMatch[0]);
+    return JSON.parse(result.response.text());
   }
 
   async refineBlueprint(refinement: string, currentTasks: Task[], codebaseContext: string): Promise<any> {
@@ -87,35 +94,42 @@ RULES:
 - Preserve the "feature" name if the refinement is a tweak; update it only if the scope fundamentally changes.
 - Ensure phase numbers and dependencies remain consistent (no dangling references to deleted tasks).
 - New/modified tasks must have status "pending" and attempts 0.
-
-Output a strictly valid JSON object:
-{
-  "feature": "Feature name (same or updated)",
-  "tasks": [
-    {
-      "id": "T001",
-      "title": "Short title",
-      "description": "Detailed implementation instructions",
-      "agent_role": "coder" | "test_writer" | "docs" | "devops" | "architect" | "builder",
-      "phase": 1,
-      "dependencies": [],
-      "blockedBy": [],
-      "files_hint": ["path/to/file.ts"],
-      "status": "done" | "pending",
-      "attempts": 0
-    }
-  ]
-}
 `;
 
-    const result = await this.proModel.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
+    const result = await this.proModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: SchemaType.OBJECT,
+          properties: {
+            feature: { type: SchemaType.STRING },
+            tasks: {
+              type: SchemaType.ARRAY,
+              items: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  id: { type: SchemaType.STRING },
+                  title: { type: SchemaType.STRING },
+                  description: { type: SchemaType.STRING },
+                  agent_role: { type: SchemaType.STRING },
+                  phase: { type: SchemaType.INTEGER },
+                  dependencies: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                  blockedBy: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                  files_hint: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
+                  status: { type: SchemaType.STRING },
+                  attempts: { type: SchemaType.INTEGER },
+                },
+                required: ['id', 'title', 'description', 'agent_role', 'phase', 'status'],
+              },
+            },
+          },
+          required: ['feature', 'tasks'],
+        },
+      },
+    });
 
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("Failed to parse JSON from Gemini refinement response");
-
-    return JSON.parse(jsonMatch[0]);
+    return JSON.parse(result.response.text());
   }
 
   async synthesizeMemory(feature: string, diffStat: string): Promise<string> {
@@ -159,21 +173,29 @@ Verdict Rules:
 2. Are there obvious bugs or architectural violations?
 3. Are tests included if required?
 
-Output strictly in this format:
-VERDICT: [PASS/FAIL]
-FEEDBACK: [Your detailed feedback here]
+Set verdict to "PASS" if the code meets all requirements, "FAIL" otherwise.
+Provide detailed feedback explaining your decision.
 `;
 
-    const result = await this.flashModel.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
+    const result = await this.flashModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: SchemaType.OBJECT,
+          properties: {
+            verdict: { type: SchemaType.STRING },
+            feedback: { type: SchemaType.STRING },
+          },
+          required: ['verdict', 'feedback'],
+        },
+      },
+    });
 
-    const verdictMatch = text.match(/VERDICT:\s*(PASS|FAIL)/i);
-    const feedbackMatch = text.match(/FEEDBACK:\s*([\s\S]*)/i);
-
+    const parsed = JSON.parse(result.response.text());
     return {
-      verdict: (verdictMatch?.[1].toUpperCase() as 'PASS' | 'FAIL') || 'FAIL',
-      feedback: feedbackMatch?.[1].trim() || "No feedback provided."
+      verdict: (parsed.verdict?.toUpperCase() === 'PASS' ? 'PASS' : 'FAIL') as 'PASS' | 'FAIL',
+      feedback: parsed.feedback || 'No feedback provided.',
     };
   }
 }
