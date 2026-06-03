@@ -22,32 +22,44 @@ Title: ${task.title}
 Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
 `;
+// Proactive context injection: read files_hint contents so the worker
+// doesn't spend tool calls reading files it was already told to modify.
+// We skip files that are likely already in projectContext (like package.json)
+// to avoid redundancy, unless they are the primary target.
+const fileContents: string[] = [];
+for (const hint of task.files_hint) {
+  if (projectContext?.includes(`--- ${hint} ---`)) continue; 
 
-    // Proactive context injection: read files_hint contents so the worker
-    // doesn't spend tool calls reading files it was already told to modify
-    const fileContents: string[] = [];
-    for (const hint of task.files_hint) {
-      try {
-        const filePath = path.join(worktreePath, hint);
-        const content = await fs.readFile(filePath, 'utf-8');
-        fileContents.push(`--- ${hint} ---\n${content.slice(0, 4000)}`);
-      } catch {}
-    }
-    if (fileContents.length > 0) {
-      prompt += `
+  try {
+    const filePath = path.join(worktreePath, hint);
+    const content = await fs.readFile(filePath, 'utf-8');
+    // Limit to 4000 chars to keep context manageable
+    fileContents.push(`--- ${hint} ---\n${content.slice(0, 4000)}${content.length > 4000 ? '\n... (truncated)' : ''}`);
+  } catch {}
+}
+if (fileContents.length > 0) {
+  prompt += `
 EXISTING FILE CONTENTS (files you may need to modify):
 ${fileContents.join('\n\n')}
 `;
-    }
+}
 
-    if (projectContext) {
-      prompt += `
+if (projectContext) {
+  prompt += `
 Project Context:
 ${projectContext}
 `;
-    }
+}
 
-    prompt += `
+prompt += `
+ADVICE:
+- Start by exploring the codebase if you need more context.
+- ALWAYS create a plan before you start writing code.
+- If this is a "test_writer" role, focus ONLY on creating robust tests (unit/integration).
+- If this is a "coder" role, focus on implementing the logic to pass the tests.
+`;
+
+prompt += `
 RULES:
 - NEVER commit node_modules/, dist/, .env, or build artifacts. They belong in .gitignore.
 - If you run npm install or any package manager, the dependencies are for runtime only — do NOT stage node_modules.

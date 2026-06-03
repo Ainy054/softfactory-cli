@@ -31,8 +31,11 @@ ${featureHistory || 'None — this is the first feature for this project.'}
 Rules:
 - Assign phase numbers so independent tasks share the same phase (they run in parallel).
 - Use dependencies/blockedBy to express ordering within a phase.
+- **TDD PREFERENCE**: For complex logic, create a "test_writer" task (phase N) and a "coder" task (phase N+1) that depends on the tests.
+- **DEVOPS FIRST**: ALWAYS include a task with agent_role "devops" that creates a Dockerfile and docker-compose.yml. Place it in **Phase 1** so the environment is ready for other tasks.
 - Ensure tasks are granular, parallelizable where possible, and include file hints.
-- ALWAYS include a task with agent_role "devops" that creates a Dockerfile and docker-compose.yml for the project. Place it in a late phase (after the main code tasks). The docker-compose.yml must build the app and include a healthcheck or a command that verifies the app starts successfully.
+- **TASK SIZE**: Each task should produce no more than ~300 lines of code. If a feature area (e.g. "API endpoints") would produce more, split it into multiple tasks by domain (e.g. "auth endpoints", "user endpoints", "product endpoints"). Smaller tasks retry cheaper and parallelize better.
+- **FILE PARTITIONING**: Avoid having two tasks in the same phase modify the same file. Split by file or directory boundary to prevent merge conflicts.
 `;
 
     const result = await this.proModel.generateContent({
@@ -92,10 +95,10 @@ RULES:
 - Tasks with status "done" MUST be kept exactly as-is (id, title, description, phase, dependencies). Their code is already merged — you cannot undo them.
 - Tasks with status "pending", "failed", or "rejected" CAN be modified, deleted, or replaced.
 - You MAY add new tasks with new IDs (continue the T00X numbering sequence).
+- **TDD PREFERENCE**: For new logic, prefer creating a "test_writer" task and a "coder" task that depends on it.
+- **DEVOPS**: Ensure a devops task exists in an early phase (Phase 1) that creates Dockerfile and docker-compose.yml.
 - Preserve the "feature" name if the refinement is a tweak; update it only if the scope fundamentally changes.
 - Ensure phase numbers and dependencies remain consistent (no dangling references to deleted tasks).
-- New/modified tasks must have status "pending" and attempts 0.
-- Ensure a devops task exists that creates Dockerfile and docker-compose.yml. If one already exists, keep it. If not, add one in a late phase.
 `;
 
     const result = await this.proModel.generateContent({
