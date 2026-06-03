@@ -154,6 +154,9 @@ export class Factory extends EventEmitter {
         },
       });
 
+      // Commit changes in worktree so diff is visible for inspection
+      await this.worktreeManager.commitWorktree(task.id);
+
       this.log(`Inspection: Reviewing ${task.id}`);
       const diff = await this.getDiff(branchName);
       const review = await this.gemini.inspectTask(task, diff, handoff.summary);

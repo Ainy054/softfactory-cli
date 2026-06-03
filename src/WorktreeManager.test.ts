@@ -48,14 +48,15 @@ describe('WorktreeManager', () => {
     await manager.cleanup('T001', 'line/T001');
   });
 
-  it('should merge changes from worktree', async () => {
+  it('should commit and merge changes from worktree', async () => {
     const defaultBranch = await manager.getDefaultBranch();
     const worktreePath = await manager.create('T002', 'line/T002');
 
     // Make a change in the worktree
     await fs.writeFile(path.join(worktreePath, 'new-file.txt'), 'hello');
 
-    // Merge back
+    // Commit in worktree first, then merge
+    await manager.commitWorktree('T002');
     await manager.merge('T002', 'line/T002', defaultBranch);
 
     // Verify the file exists on the main branch

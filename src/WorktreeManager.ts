@@ -37,16 +37,31 @@ export class WorktreeManager {
     return worktreePath;
   }
 
-  async merge(taskId: string, branchName: string, targetBranch: string) {
+  async commitWorktree(taskId: string) {
     const worktreePath = path.join(this.worktreeBase, taskId);
 
-    // Stage and commit in the worktree
+    // Ensure .softfactory is ignored in worktree commits to avoid merge conflicts
+    const gitignorePath = path.join(worktreePath, '.gitignore');
+    try {
+      const existing = await fs.readFile(gitignorePath, 'utf-8');
+      if (!existing.includes('.softfactory/')) {
+        await fs.appendFile(gitignorePath, '\n.softfactory/\n');
+      }
+    } catch {
+      await fs.writeFile(gitignorePath, '.softfactory/\n');
+    }
+
     await execa('git', ['add', '.'], { cwd: worktreePath });
     try {
       await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
     } catch {
       // No changes to commit — that's okay
     }
+  }
+
+  async merge(taskId: string, branchName: string, targetBranch: string) {
+    // Abort any in-progress merge first
+    await execa('git', ['merge', '--abort'], { cwd: this.baseDir, reject: false });
 
     // Ensure we're on the target branch and merge
     await execa('git', ['checkout', targetBranch], { cwd: this.baseDir, reject: false });
