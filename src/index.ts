@@ -2,22 +2,55 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 
-const FLAGS = ['--no-tui', '--resume'];
+const FLAGS = ['--no-tui', '--resume', '--history'];
 
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
+  const args = process.argv.slice(2);
+  const historyMode = args.includes('--history');
+
+  if (historyMode) {
+    if (!apiKey) {
+      console.error('Error: GEMINI_API_KEY environment variable is required.');
+      process.exit(1);
+    }
+    const factory = new Factory(process.cwd(), apiKey, { streamToTerminal: true });
+    await factory.init();
+    const features = await factory.getHistory();
+    if (features.length === 0) {
+      console.log('No features built yet.');
+    } else {
+      console.log('Feature History:');
+      console.log('-'.repeat(80));
+      for (const f of features) {
+        const done = `${f.tasks_done}/${f.task_count}`;
+        console.log(`  ${f.feature_id.padEnd(20)} ${f.status.padEnd(10)} ${done.padEnd(6)} ${f.feature}`);
+      }
+    }
+    process.exit(0);
+  }
+
   if (!apiKey) {
     console.error('Error: GEMINI_API_KEY environment variable is required.');
     process.exit(1);
   }
 
-  const args = process.argv.slice(2);
   const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
   const resumeMode = args.includes('--resume');
-  const requirement = args.filter(a => !FLAGS.includes(a)).join(' ');
+
+  let resumeFeatureId: string | undefined;
+  if (resumeMode) {
+    const resumeIdx = args.indexOf('--resume');
+    const nextArg = args[resumeIdx + 1];
+    if (nextArg && !nextArg.startsWith('--') && nextArg.startsWith('f-')) {
+      resumeFeatureId = nextArg;
+    }
+  }
+
+  const requirement = args.filter(a => !FLAGS.includes(a) && a !== resumeFeatureId).join(' ');
 
   if (!resumeMode && !requirement) {
-    console.error('Usage: softfactory [--no-tui] [--resume] <requirement>');
+    console.error('Usage: softfactory [--no-tui] [--resume [feature-id]] [--history] <requirement>');
     process.exit(1);
   }
 
@@ -28,7 +61,7 @@ async function main() {
 
   if (noTui) {
     if (resumeMode) {
-      await factory.resume();
+      await factory.resume(resumeFeatureId);
     } else {
       await factory.build(requirement);
     }
@@ -38,7 +71,7 @@ async function main() {
     const { App } = await import('./components/App.js');
 
     const { waitUntilExit } = render(
-      React.createElement(App, { factory, requirement, resumeMode })
+      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId })
     );
     await waitUntilExit();
   }

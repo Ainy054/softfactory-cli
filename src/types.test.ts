@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { TaskSchema, FactoryStateSchema, HandoffSchema } from './types.js';
+import { TaskSchema, FactoryStateSchema, HandoffSchema, FeatureHistoryEntrySchema } from './types.js';
 
 describe('TaskSchema', () => {
   it('should parse a valid task', () => {
@@ -114,6 +114,57 @@ describe('FactoryStateSchema', () => {
         tasks: [],
       });
     });
+  });
+
+  it('should default feature_id to empty string for backward compat', () => {
+    const result = FactoryStateSchema.parse({
+      feature: 'Old Feature',
+      status: 'completed',
+      created_at: '2026-01-01T00:00:00Z',
+      last_updated: '2026-01-01T00:00:00Z',
+      tasks: [],
+    });
+    assert.equal(result.feature_id, '');
+  });
+
+  it('should preserve explicit feature_id', () => {
+    const result = FactoryStateSchema.parse({
+      feature_id: 'f-20260603120000',
+      feature: 'New Feature',
+      status: 'active',
+      created_at: '2026-06-03T12:00:00Z',
+      last_updated: '2026-06-03T12:00:00Z',
+      tasks: [],
+    });
+    assert.equal(result.feature_id, 'f-20260603120000');
+  });
+});
+
+describe('FeatureHistoryEntrySchema', () => {
+  it('should parse a valid history entry', () => {
+    const result = FeatureHistoryEntrySchema.parse({
+      feature_id: 'f-20260603120000',
+      feature: 'Test Feature',
+      status: 'completed',
+      created_at: '2026-06-03T12:00:00Z',
+      completed_at: '2026-06-03T13:00:00Z',
+      task_count: 5,
+      tasks_done: 5,
+    });
+    assert.equal(result.feature_id, 'f-20260603120000');
+    assert.equal(result.tasks_done, 5);
+  });
+
+  it('should allow optional completed_at', () => {
+    const result = FeatureHistoryEntrySchema.parse({
+      feature_id: 'f-20260603120000',
+      feature: 'In Progress',
+      status: 'active',
+      created_at: '2026-06-03T12:00:00Z',
+      task_count: 3,
+      tasks_done: 1,
+    });
+    assert.equal(result.completed_at, undefined);
   });
 });
 

@@ -18,6 +18,7 @@ export const TaskSchema = z.object({
 export type Task = z.infer<typeof TaskSchema>;
 
 export const FactoryStateSchema = z.object({
+  feature_id: z.string().default(''),
   feature: z.string(),
   status: z.enum(['planning', 'active', 'completed', 'failed']),
   created_at: z.string(),
@@ -27,6 +28,18 @@ export const FactoryStateSchema = z.object({
 });
 
 export type FactoryState = z.infer<typeof FactoryStateSchema>;
+
+export const FeatureHistoryEntrySchema = z.object({
+  feature_id: z.string(),
+  feature: z.string(),
+  status: z.string(),
+  created_at: z.string(),
+  completed_at: z.string().optional(),
+  task_count: z.number(),
+  tasks_done: z.number(),
+});
+
+export type FeatureHistoryEntry = z.infer<typeof FeatureHistoryEntrySchema>;
 
 export const HandoffSchema = z.object({
   task_id: z.string(),

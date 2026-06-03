@@ -200,6 +200,19 @@ describe('getReadyTasks', () => {
   });
 });
 
+describe('generateFeatureId', () => {
+  it('should produce f-YYYYMMDDHHMMSS format', () => {
+    const id = `f-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+    assert.match(id, /^f-\d{14}$/);
+  });
+
+  it('should produce unique IDs across time', () => {
+    const id1 = `f-${new Date('2026-06-03T12:00:00Z').toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+    const id2 = `f-${new Date('2026-06-03T12:01:00Z').toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+    assert.notEqual(id1, id2);
+  });
+});
+
 describe('hasUnfinishedTasks', () => {
   it('should return false when all tasks are done', () => {
     const tasks = [

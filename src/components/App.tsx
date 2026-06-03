@@ -11,6 +11,7 @@ interface AppProps {
   factory: Factory;
   requirement: string;
   resumeMode?: boolean;
+  resumeFeatureId?: string;
 }
 
 interface AppState {
@@ -65,7 +66,7 @@ const initialState: AppState = {
   done: false,
 };
 
-export function App({ factory, requirement, resumeMode }: AppProps) {
+export function App({ factory, requirement, resumeMode, resumeFeatureId }: AppProps) {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -92,7 +93,7 @@ export function App({ factory, requirement, resumeMode }: AppProps) {
     factory.on('phase:start', handleEvent);
     factory.on('build:complete', handleEvent);
 
-    const run = resumeMode ? factory.resume() : factory.build(requirement);
+    const run = resumeMode ? factory.resume(resumeFeatureId) : factory.build(requirement);
     run.catch(err => {
       dispatch({ type: 'error', message: err.message });
     });

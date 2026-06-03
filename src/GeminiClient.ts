@@ -12,7 +12,7 @@ export class GeminiClient {
     this.flashModel = this.genAI.getGenerativeModel({ model: flashModelName });
   }
 
-  async generateBlueprint(requirement: string, codebaseContext: string, memoryPatterns: string): Promise<any> {
+  async generateBlueprint(requirement: string, codebaseContext: string, memoryPatterns: string, featureHistory?: string): Promise<any> {
     const prompt = `
 You are the SoftFactory Blueprint Architect.
 Your task is to analyze a requirement and a codebase context to produce a structured task plan.
@@ -24,6 +24,9 @@ ${codebaseContext}
 
 Memory Patterns (Learned from previous runs):
 ${memoryPatterns}
+
+Previously Built Features:
+${featureHistory || 'None — this is the first feature for this project.'}
 
 Output a strictly valid JSON object following this schema:
 {
@@ -56,6 +59,31 @@ Rules:
     if (!jsonMatch) throw new Error("Failed to parse JSON from Gemini response");
 
     return JSON.parse(jsonMatch[0]);
+  }
+
+  async synthesizeMemory(feature: string, diffStat: string): Promise<string> {
+    const prompt = `
+You are the SoftFactory Memory Synthesizer.
+A feature has been successfully built. Extract the key architectural patterns and decisions worth remembering for future builds.
+
+Feature: ${feature}
+
+Changes (git diff --stat):
+${diffStat}
+
+Extract and return a concise markdown summary covering:
+- Key architectural decisions made (tech stack choices, patterns used)
+- Important file paths and their purposes
+- Conventions established (naming, structure, testing approach)
+- Integration points that future features should be aware of
+
+Keep it under 20 lines. Focus on what would help a future Architect plan the NEXT feature.
+Do NOT include generic advice — only project-specific patterns.
+`;
+
+    const result = await this.flashModel.generateContent(prompt);
+    const response = await result.response;
+    return response.text().trim();
   }
 
   async inspectTask(task: Task, diff: string, handoffSummary: string): Promise<{ verdict: 'PASS' | 'FAIL', feedback: string }> {

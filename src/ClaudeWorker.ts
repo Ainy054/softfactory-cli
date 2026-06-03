@@ -90,25 +90,32 @@ You have full tool access in this worktree. Begin.
       });
     }
 
+    let exitCode: number | null | undefined = null;
     try {
-      await proc;
-    } catch (e) {
-      onOutput?.(`Claude execution error for ${task.id}`);
+      const result = await proc;
+      exitCode = result.exitCode;
+    } catch (e: any) {
+      exitCode = e.exitCode ?? 1;
+      onOutput?.(`Claude exited with code ${exitCode} for ${task.id}`);
     }
 
-    // Poll for handoff file (up to 30 seconds)
-    let attempts = 0;
-    while (attempts < 30) {
+    // Try reading handoff immediately — the file should exist after process exit
+    try {
+      const content = await fs.readFile(handoffPath, 'utf-8');
+      const json = JSON.parse(content);
+      return HandoffSchema.parse(json);
+    } catch {}
+
+    // Brief retry window (5s) for filesystem flush delays
+    for (let i = 0; i < 5; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
       try {
         const content = await fs.readFile(handoffPath, 'utf-8');
         const json = JSON.parse(content);
         return HandoffSchema.parse(json);
-      } catch {
-        attempts++;
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
+      } catch {}
     }
 
-    throw new Error(`Handoff file not found at ${handoffPath} after task completion.`);
+    throw new Error(`Worker exited (code ${exitCode}) without writing handoff file for ${task.id}.`);
   }
 }

@@ -13,6 +13,7 @@ export class WorktreeManager {
 
   async init() {
     await fs.mkdir(this.worktreeBase, { recursive: true });
+    await execa('git', ['worktree', 'prune'], { cwd: this.baseDir, reject: false });
   }
 
   async getDefaultBranch(): Promise<string> {

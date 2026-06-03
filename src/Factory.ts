@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { FactoryState, FactoryStateSchema, Task, TaskResult, FactoryEvent } from './types.js';
+import { FactoryState, FactoryStateSchema, Task, TaskResult, FactoryEvent, FeatureHistoryEntry } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
 import { GeminiClient } from './GeminiClient.js';
 import { ClaudeWorker } from './ClaudeWorker.js';
@@ -10,11 +10,15 @@ import { execa } from 'execa';
 export class Factory extends EventEmitter {
   private state!: FactoryState;
   private statePath: string;
+  private historyPath: string;
+  private archiveDir: string;
+  private memoryPath: string;
   private worktreeManager: WorktreeManager;
   private gemini: GeminiClient;
   private worker: ClaudeWorker;
   private defaultBranch = 'master';
   private streamToTerminal: boolean;
+  private buildStartCommit: string | undefined;
 
   constructor(
     private baseDir: string,
@@ -32,6 +36,9 @@ export class Factory extends EventEmitter {
       streamToTerminal = false,
     } = options;
     this.statePath = path.join(baseDir, '.softfactory', 'factory.json');
+    this.historyPath = path.join(baseDir, '.softfactory', 'history.json');
+    this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
+    this.memoryPath = path.join(baseDir, '.softfactory', 'FACTORY_MEMORY.md');
     this.worktreeManager = new WorktreeManager(baseDir);
     this.gemini = new GeminiClient(apiKey, proModel, flashModel);
     this.worker = new ClaudeWorker();
@@ -40,6 +47,7 @@ export class Factory extends EventEmitter {
 
   async init() {
     await fs.mkdir(path.join(this.baseDir, '.softfactory'), { recursive: true });
+    await fs.mkdir(this.archiveDir, { recursive: true });
     await this.worktreeManager.init();
 
     this.defaultBranch = await this.worktreeManager.getDefaultBranch();
@@ -48,7 +56,10 @@ export class Factory extends EventEmitter {
       const content = await fs.readFile(this.statePath, 'utf-8');
       this.state = FactoryStateSchema.parse(JSON.parse(content));
 
-      // Reset any 'active' tasks to 'pending' as they were interrupted
+      if (!this.state.feature_id) {
+        this.state.feature_id = this.generateFeatureId();
+      }
+
       for (const task of this.state.tasks) {
         if (task.status === 'active') {
           task.status = 'pending';
@@ -62,13 +73,27 @@ export class Factory extends EventEmitter {
     return this.state;
   }
 
-  async resume() {
+  async resume(featureId?: string) {
+    if (featureId) {
+      const archivePath = path.join(this.archiveDir, `${featureId}.json`);
+      if (await this.exists(archivePath)) {
+        const content = await fs.readFile(archivePath, 'utf-8');
+        this.state = FactoryStateSchema.parse(JSON.parse(content));
+        await this.saveState();
+        await fs.unlink(archivePath);
+        this.log(`Restored archived feature: ${this.state.feature}`);
+      } else {
+        this.log(`Feature ${featureId} not found in archive.`);
+        return;
+      }
+    }
+
     if (!this.state) {
       this.log('No previous build state found. Nothing to resume.');
       return;
     }
 
-    // Validate "done" tasks — check that their merge commits actually exist in git
+    this.buildStartCommit = await this.getCurrentCommit();
     await this.validateDoneTasks();
 
     const failed = this.state.tasks.filter(t => t.status === 'failed' || t.status === 'rejected');
@@ -135,28 +160,45 @@ export class Factory extends EventEmitter {
   }
 
   async build(requirement: string) {
-    this.log(`Starting build for: ${requirement}`);
-
-    // Stage 1: Blueprint
-    if (!this.state || this.state.status === 'planning') {
-      const codebaseContext = await this.getRepoContext();
-      const memoryPatterns = await this.getMemoryPatterns();
-
-      const blueprint = await this.gemini.generateBlueprint(requirement, codebaseContext, memoryPatterns);
-
-      this.state = {
-        feature: blueprint.feature,
-        status: 'active',
-        created_at: new Date().toISOString(),
-        last_updated: new Date().toISOString(),
-        tasks: blueprint.tasks.map((t: any) => ({ ...t, status: 'pending' as const, attempts: 0 })),
-        memory_patterns: []
-      };
-      await this.saveState();
+    if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
+      await this.archiveCurrentState();
+      this.state = undefined!;
     }
 
-    this.emitEvent({ type: 'state:update', state: this.state });
+    if (this.state && this.state.status === 'active') {
+      this.log(`Resuming in-progress feature: ${this.state.feature}`);
+      await this.validateDoneTasks();
+      this.emitEvent({ type: 'state:update', state: this.state });
+      await this.runWorkshopLoop();
+      return;
+    }
 
+    this.log(`Starting build for: ${requirement}`);
+    this.buildStartCommit = await this.getCurrentCommit();
+
+    const codebaseContext = await this.getRepoContext();
+    const memoryPatterns = await this.getMemoryPatterns();
+    const history = await this.getHistory();
+    const featureHistory = history.length > 0
+      ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
+      : '';
+
+    const blueprint = await this.gemini.generateBlueprint(requirement, codebaseContext, memoryPatterns, featureHistory);
+
+    const featureId = this.generateFeatureId();
+    this.state = {
+      feature_id: featureId,
+      feature: blueprint.feature,
+      status: 'active',
+      created_at: new Date().toISOString(),
+      last_updated: new Date().toISOString(),
+      tasks: blueprint.tasks.map((t: any) => ({ ...t, status: 'pending' as const, attempts: 0 })),
+      memory_patterns: []
+    };
+    await this.saveState();
+    await this.updateHistory('active');
+
+    this.emitEvent({ type: 'state:update', state: this.state });
     await this.runWorkshopLoop();
   }
 
@@ -206,6 +248,11 @@ export class Factory extends EventEmitter {
     const doneTasks = this.state.tasks.filter(t => t.status === 'done');
     this.state.status = failedTasks.length > 0 ? 'failed' : 'completed';
     await this.saveState();
+    await this.updateHistory(this.state.status);
+
+    if (this.state.status === 'completed') {
+      await this.synthesizeMemory();
+    }
 
     this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
     if (failedTasks.length > 0) {
@@ -283,6 +330,104 @@ export class Factory extends EventEmitter {
       task.last_feedback = e.message;
       this.emitEvent({ type: 'task:fail', task, feedback: e.message });
       return null;
+    }
+  }
+
+  private generateFeatureId(): string {
+    const now = new Date();
+    const ts = now.toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+    return `f-${ts}`;
+  }
+
+  private async archiveCurrentState() {
+    const featureId = this.state.feature_id || this.generateFeatureId();
+    const archivePath = path.join(this.archiveDir, `${featureId}.json`);
+    await fs.copyFile(this.statePath, archivePath);
+    await this.updateHistory(this.state.status);
+    this.log(`Archived previous feature: ${this.state.feature} → ${featureId}`);
+  }
+
+  async getHistory(): Promise<FeatureHistoryEntry[]> {
+    try {
+      const content = await fs.readFile(this.historyPath, 'utf-8');
+      const data = JSON.parse(content);
+      return data.features || [];
+    } catch {
+      return [];
+    }
+  }
+
+  private async updateHistory(status: string) {
+    let features: FeatureHistoryEntry[] = [];
+    try {
+      const content = await fs.readFile(this.historyPath, 'utf-8');
+      features = JSON.parse(content).features || [];
+    } catch {}
+
+    const featureId = this.state.feature_id;
+    const entry: FeatureHistoryEntry = {
+      feature_id: featureId,
+      feature: this.state.feature,
+      status,
+      created_at: this.state.created_at,
+      completed_at: (status === 'completed' || status === 'failed') ? new Date().toISOString() : undefined,
+      task_count: this.state.tasks.length,
+      tasks_done: this.state.tasks.filter(t => t.status === 'done').length,
+    };
+
+    const idx = features.findIndex(f => f.feature_id === featureId);
+    if (idx >= 0) {
+      features[idx] = entry;
+    } else {
+      features.push(entry);
+    }
+
+    const tmpPath = this.historyPath + '.tmp';
+    await fs.writeFile(tmpPath, JSON.stringify({ features }, null, 2));
+    await fs.rename(tmpPath, this.historyPath);
+  }
+
+  private async getCurrentCommit(): Promise<string | undefined> {
+    try {
+      const { stdout } = await execa('git', ['rev-parse', 'HEAD'], { cwd: this.baseDir });
+      return stdout.trim();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async synthesizeMemory() {
+    try {
+      let diff = '';
+      if (this.buildStartCommit) {
+        const { stdout } = await execa(
+          'git', ['diff', '--stat', this.buildStartCommit, 'HEAD'],
+          { cwd: this.baseDir }
+        );
+        diff = stdout;
+      }
+
+      if (!diff.trim()) {
+        this.log('No diff available for memory synthesis — skipping.');
+        return;
+      }
+
+      this.log('Synthesizing memory from completed build...');
+      const memory = await this.gemini.synthesizeMemory(this.state.feature, diff);
+
+      if (memory.trim()) {
+        let existing = '';
+        try {
+          existing = await fs.readFile(this.memoryPath, 'utf-8');
+        } catch {}
+
+        const separator = existing ? '\n\n---\n\n' : '';
+        const header = `## ${this.state.feature} (${this.state.feature_id})\n`;
+        await fs.appendFile(this.memoryPath, `${separator}${header}${memory}\n`);
+        this.log('Memory saved to FACTORY_MEMORY.md');
+      }
+    } catch (e: any) {
+      this.log(`Memory synthesis failed (non-fatal): ${e.message}`);
     }
   }
 
@@ -376,7 +521,9 @@ export class Factory extends EventEmitter {
 
   private async saveState() {
     this.state.last_updated = new Date().toISOString();
-    await fs.writeFile(this.statePath, JSON.stringify(this.state, null, 2));
+    const tmpPath = this.statePath + '.tmp';
+    await fs.writeFile(tmpPath, JSON.stringify(this.state, null, 2));
+    await fs.rename(tmpPath, this.statePath);
     this.emitEvent({ type: 'state:update', state: this.state });
   }
 
