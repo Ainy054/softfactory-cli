@@ -61,6 +61,63 @@ Rules:
     return JSON.parse(jsonMatch[0]);
   }
 
+  async refineBlueprint(refinement: string, currentTasks: Task[], codebaseContext: string): Promise<any> {
+    const taskSummary = currentTasks.map(t =>
+      `  ${t.id} [${t.status}] phase:${t.phase} "${t.title}" — ${t.description.slice(0, 120)}` +
+      (t.dependencies.length ? ` deps:[${t.dependencies}]` : '') +
+      (t.blockedBy.length ? ` blocked:[${t.blockedBy}]` : '')
+    ).join('\n');
+
+    const prompt = `
+You are the SoftFactory Blueprint Architect performing a MID-FLIGHT REFINEMENT.
+The user wants to change direction on an in-progress build. You must modify the task plan.
+
+Refinement Request: ${refinement}
+
+Current Tasks:
+${taskSummary}
+
+Codebase Context:
+${codebaseContext}
+
+RULES:
+- Tasks with status "done" MUST be kept exactly as-is (id, title, description, phase, dependencies). Their code is already merged — you cannot undo them.
+- Tasks with status "pending", "failed", or "rejected" CAN be modified, deleted, or replaced.
+- You MAY add new tasks with new IDs (continue the T00X numbering sequence).
+- Preserve the "feature" name if the refinement is a tweak; update it only if the scope fundamentally changes.
+- Ensure phase numbers and dependencies remain consistent (no dangling references to deleted tasks).
+- New/modified tasks must have status "pending" and attempts 0.
+
+Output a strictly valid JSON object:
+{
+  "feature": "Feature name (same or updated)",
+  "tasks": [
+    {
+      "id": "T001",
+      "title": "Short title",
+      "description": "Detailed implementation instructions",
+      "agent_role": "coder" | "test_writer" | "docs" | "devops" | "architect" | "builder",
+      "phase": 1,
+      "dependencies": [],
+      "blockedBy": [],
+      "files_hint": ["path/to/file.ts"],
+      "status": "done" | "pending",
+      "attempts": 0
+    }
+  ]
+}
+`;
+
+    const result = await this.proModel.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("Failed to parse JSON from Gemini refinement response");
+
+    return JSON.parse(jsonMatch[0]);
+  }
+
   async synthesizeMemory(feature: string, diffStat: string): Promise<string> {
     const prompt = `
 You are the SoftFactory Memory Synthesizer.

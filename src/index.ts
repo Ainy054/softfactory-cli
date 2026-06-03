@@ -2,7 +2,7 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 
-const FLAGS = ['--no-tui', '--resume', '--history'];
+const FLAGS = ['--no-tui', '--resume', '--history', '--refine'];
 
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -37,6 +37,7 @@ async function main() {
 
   const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
   const resumeMode = args.includes('--resume');
+  const refineMode = args.includes('--refine');
 
   let resumeFeatureId: string | undefined;
   if (resumeMode) {
@@ -50,7 +51,13 @@ async function main() {
   const requirement = args.filter(a => !FLAGS.includes(a) && a !== resumeFeatureId).join(' ');
 
   if (!resumeMode && !requirement) {
-    console.error('Usage: softfactory [--no-tui] [--resume [feature-id]] [--history] <requirement>');
+    console.error('Usage: softfactory [--no-tui] [--resume [feature-id]] [--refine] [--history] <requirement>');
+    process.exit(1);
+  }
+
+  if (refineMode && !requirement) {
+    console.error('Error: --refine requires a refinement description.');
+    console.error('Example: softfactory --refine "use PostgreSQL instead of SQLite"');
     process.exit(1);
   }
 
@@ -62,6 +69,8 @@ async function main() {
   if (noTui) {
     if (resumeMode) {
       await factory.resume(resumeFeatureId);
+    } else if (refineMode) {
+      await factory.refine(requirement);
     } else {
       await factory.build(requirement);
     }
@@ -71,7 +80,7 @@ async function main() {
     const { App } = await import('./components/App.js');
 
     const { waitUntilExit } = render(
-      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId })
+      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId, refineMode })
     );
     await waitUntilExit();
   }

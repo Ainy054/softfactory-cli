@@ -73,6 +73,71 @@ export class Factory extends EventEmitter {
     return this.state;
   }
 
+  async refine(refinement: string) {
+    if (!this.state) {
+      this.log('No existing build to refine. Run a build first.');
+      return;
+    }
+
+    if (this.state.status === 'completed') {
+      this.log('Build already completed. Use a new build instead of --refine.');
+      return;
+    }
+
+    const doneTasks = this.state.tasks.filter(t => t.status === 'done');
+    const pendingOrFailed = this.state.tasks.filter(t => t.status !== 'done');
+
+    this.log(`Refining plan: "${refinement}"`);
+    this.log(`Preserving ${doneTasks.length} done task(s), ${pendingOrFailed.length} task(s) eligible for modification`);
+
+    const codebaseContext = await this.getRepoContext();
+    const refined = await this.gemini.refineBlueprint(refinement, this.state.tasks, codebaseContext);
+
+    const newTasks = refined.tasks.map((t: any) => ({
+      ...t,
+      status: t.status || 'pending',
+      attempts: t.status === 'done' ? (this.state.tasks.find(old => old.id === t.id)?.attempts ?? 0) : 0,
+      dependencies: t.dependencies || [],
+      blockedBy: t.blockedBy || [],
+      files_hint: t.files_hint || [],
+    }));
+
+    // Verify done tasks weren't tampered with
+    for (const done of doneTasks) {
+      const match = newTasks.find((t: any) => t.id === done.id);
+      if (!match || match.status !== 'done') {
+        this.log(`WARNING: Gemini tried to modify done task ${done.id} — restoring original`);
+        const idx = newTasks.findIndex((t: any) => t.id === done.id);
+        if (idx >= 0) {
+          newTasks[idx] = { ...done };
+        } else {
+          newTasks.push({ ...done });
+        }
+      }
+    }
+
+    const added = newTasks.filter((t: any) => !this.state.tasks.find(old => old.id === t.id));
+    const removed = this.state.tasks.filter(t => t.status !== 'done' && !newTasks.find((n: any) => n.id === t.id));
+    const modified = newTasks.filter((t: any) => {
+      const old = this.state.tasks.find(o => o.id === t.id);
+      return old && old.status !== 'done' && (old.title !== t.title || old.description !== t.description);
+    });
+
+    if (added.length) this.log(`Added ${added.length} task(s): ${added.map((t: any) => t.id).join(', ')}`);
+    if (removed.length) this.log(`Removed ${removed.length} task(s): ${removed.map(t => t.id).join(', ')}`);
+    if (modified.length) this.log(`Modified ${modified.length} task(s): ${modified.map((t: any) => t.id).join(', ')}`);
+
+    this.state.feature = refined.feature || this.state.feature;
+    this.state.tasks = newTasks;
+    this.state.status = 'active';
+    this.buildStartCommit = await this.getCurrentCommit();
+    await this.saveState();
+    await this.updateHistory('active');
+
+    this.emitEvent({ type: 'state:update', state: this.state });
+    await this.runWorkshopLoop();
+  }
+
   async resume(featureId?: string) {
     if (featureId) {
       const archivePath = path.join(this.archiveDir, `${featureId}.json`);
