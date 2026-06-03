@@ -2,6 +2,8 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 
+const FLAGS = ['--no-tui', '--resume'];
+
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -11,10 +13,11 @@ async function main() {
 
   const args = process.argv.slice(2);
   const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
-  const requirement = args.filter(a => a !== '--no-tui').join(' ');
+  const resumeMode = args.includes('--resume');
+  const requirement = args.filter(a => !FLAGS.includes(a)).join(' ');
 
-  if (!requirement) {
-    console.error('Usage: softfactory [--no-tui] <requirement>');
+  if (!resumeMode && !requirement) {
+    console.error('Usage: softfactory [--no-tui] [--resume] <requirement>');
     process.exit(1);
   }
 
@@ -24,19 +27,18 @@ async function main() {
   await factory.init();
 
   if (noTui) {
-    // Plain console output mode
-    factory.on('log', (msg: string) => {
-      // Already logged by Factory when streamToTerminal=true
-    });
-    await factory.build(requirement);
+    if (resumeMode) {
+      await factory.resume();
+    } else {
+      await factory.build(requirement);
+    }
   } else {
-    // TUI mode with Ink
     const { render } = await import('ink');
     const React = await import('react');
     const { App } = await import('./components/App.js');
 
     const { waitUntilExit } = render(
-      React.createElement(App, { factory, requirement })
+      React.createElement(App, { factory, requirement, resumeMode })
     );
     await waitUntilExit();
   }

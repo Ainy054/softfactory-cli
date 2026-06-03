@@ -62,6 +62,35 @@ export class Factory extends EventEmitter {
     return this.state;
   }
 
+  async resume() {
+    if (!this.state) {
+      this.log('No previous build state found. Nothing to resume.');
+      return;
+    }
+
+    const failed = this.state.tasks.filter(t => t.status === 'failed' || t.status === 'rejected');
+    if (failed.length === 0) {
+      this.log('No failed tasks to resume.');
+      return;
+    }
+
+    this.log(`Resuming build: ${this.state.feature}`);
+    this.log(`Resetting ${failed.length} failed/rejected task(s) for retry`);
+
+    for (const task of failed) {
+      task.status = 'pending';
+      task.attempts = 0;
+      task.last_feedback = undefined;
+    }
+
+    this.state.status = 'active';
+    await this.saveState();
+    this.emitEvent({ type: 'state:update', state: this.state });
+
+    // Run the workshop/inspection loop (skip blueprint stage)
+    await this.runWorkshopLoop();
+  }
+
   async build(requirement: string) {
     this.log(`Starting build for: ${requirement}`);
 
@@ -85,7 +114,10 @@ export class Factory extends EventEmitter {
 
     this.emitEvent({ type: 'state:update', state: this.state });
 
-    // Stage 2 & 3: Parallel Workshop & Inspection Loop
+    await this.runWorkshopLoop();
+  }
+
+  private async runWorkshopLoop() {
     while (this.hasUnfinishedTasks()) {
       const readyTasks = this.getReadyTasks();
       if (readyTasks.length === 0) {
@@ -97,7 +129,6 @@ export class Factory extends EventEmitter {
       this.emitEvent({ type: 'phase:start', phase: currentPhase });
       this.log(`Phase ${currentPhase}: Running ${readyTasks.length} task(s) in parallel`);
 
-      // Execute all ready tasks in parallel
       const results = await Promise.allSettled(
         readyTasks.map(task => this.executeAndInspect(task))
       );
@@ -120,7 +151,6 @@ export class Factory extends EventEmitter {
         }
       }
 
-      // Cleanup all worktrees from this batch
       for (const task of readyTasks) {
         const branchName = `line/${task.id}`;
         await this.worktreeManager.cleanup(task.id, branchName);

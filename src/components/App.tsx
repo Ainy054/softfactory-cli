@@ -10,6 +10,7 @@ import { WorkerOutput } from './WorkerOutput.js';
 interface AppProps {
   factory: Factory;
   requirement: string;
+  resumeMode?: boolean;
 }
 
 interface AppState {
@@ -64,7 +65,7 @@ const initialState: AppState = {
   done: false,
 };
 
-export function App({ factory, requirement }: AppProps) {
+export function App({ factory, requirement, resumeMode }: AppProps) {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -91,7 +92,8 @@ export function App({ factory, requirement }: AppProps) {
     factory.on('phase:start', handleEvent);
     factory.on('build:complete', handleEvent);
 
-    factory.build(requirement).catch(err => {
+    const run = resumeMode ? factory.resume() : factory.build(requirement);
+    run.catch(err => {
       dispatch({ type: 'error', message: err.message });
     });
 
