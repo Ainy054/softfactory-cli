@@ -1,0 +1,4 @@
+.softfactory/
+node_modules/
+dist/
+.env
