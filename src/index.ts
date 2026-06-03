@@ -2,7 +2,7 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 
-const FLAGS = ['--no-tui', '--resume', '--history', '--refine'];
+const FLAGS = ['--no-tui', '--resume', '--history', '--refine', '--no-docker'];
 
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -38,6 +38,7 @@ async function main() {
   const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
   const resumeMode = args.includes('--resume');
   const refineMode = args.includes('--refine');
+  const noDocker = args.includes('--no-docker');
 
   let resumeFeatureId: string | undefined;
   if (resumeMode) {
@@ -51,7 +52,7 @@ async function main() {
   const requirement = args.filter(a => !FLAGS.includes(a) && a !== resumeFeatureId).join(' ');
 
   if (!resumeMode && !requirement) {
-    console.error('Usage: softfactory [--no-tui] [--resume [feature-id]] [--refine] [--history] <requirement>');
+    console.error('Usage: softfactory [--no-tui] [--no-docker] [--resume [feature-id]] [--refine] [--history] <requirement>');
     process.exit(1);
   }
 
@@ -63,6 +64,7 @@ async function main() {
 
   const factory = new Factory(process.cwd(), apiKey, {
     streamToTerminal: noTui,
+    useDocker: !noDocker,
   });
   await factory.init();
 

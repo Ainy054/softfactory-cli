@@ -32,6 +32,7 @@ Rules:
 - Assign phase numbers so independent tasks share the same phase (they run in parallel).
 - Use dependencies/blockedBy to express ordering within a phase.
 - Ensure tasks are granular, parallelizable where possible, and include file hints.
+- ALWAYS include a task with agent_role "devops" that creates a Dockerfile and docker-compose.yml for the project. Place it in a late phase (after the main code tasks). The docker-compose.yml must build the app and include a healthcheck or a command that verifies the app starts successfully.
 `;
 
     const result = await this.proModel.generateContent({
@@ -94,6 +95,7 @@ RULES:
 - Preserve the "feature" name if the refinement is a tweak; update it only if the scope fundamentally changes.
 - Ensure phase numbers and dependencies remain consistent (no dangling references to deleted tasks).
 - New/modified tasks must have status "pending" and attempts 0.
+- Ensure a devops task exists that creates Dockerfile and docker-compose.yml. If one already exists, keep it. If not, add one in a late phase.
 `;
 
     const result = await this.proModel.generateContent({

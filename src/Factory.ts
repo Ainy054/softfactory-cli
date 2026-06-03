@@ -5,6 +5,7 @@ import { FactoryState, FactoryStateSchema, Task, TaskResult, FactoryEvent, Featu
 import { WorktreeManager } from './WorktreeManager.js';
 import { GeminiClient } from './GeminiClient.js';
 import { ClaudeWorker } from './ClaudeWorker.js';
+import { DockerVerifier } from './DockerVerifier.js';
 import { execa } from 'execa';
 
 export class Factory extends EventEmitter {
@@ -16,8 +17,10 @@ export class Factory extends EventEmitter {
   private worktreeManager: WorktreeManager;
   private gemini: GeminiClient;
   private worker: ClaudeWorker;
+  private dockerVerifier: DockerVerifier | null = null;
   private defaultBranch = 'master';
   private streamToTerminal: boolean;
+  private useDocker: boolean;
   private buildStartCommit: string | undefined;
 
   constructor(
@@ -27,6 +30,7 @@ export class Factory extends EventEmitter {
       proModel?: string;
       flashModel?: string;
       streamToTerminal?: boolean;
+      useDocker?: boolean;
     } = {}
   ) {
     super();
@@ -34,7 +38,9 @@ export class Factory extends EventEmitter {
       proModel = 'gemini-3.1-pro-preview',
       flashModel = 'gemini-3.5-flash',
       streamToTerminal = false,
+      useDocker = true,
     } = options;
+    this.useDocker = useDocker;
     this.statePath = path.join(baseDir, '.softfactory', 'factory.json');
     this.historyPath = path.join(baseDir, '.softfactory', 'history.json');
     this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
@@ -51,6 +57,16 @@ export class Factory extends EventEmitter {
     await this.worktreeManager.init();
 
     this.defaultBranch = await this.worktreeManager.getDefaultBranch();
+
+    if (this.useDocker) {
+      const verifier = new DockerVerifier();
+      if (await verifier.detect()) {
+        this.dockerVerifier = verifier;
+        this.log('Docker verification enabled');
+      } else {
+        this.log('Docker not available — skipping post-build verification');
+      }
+    }
 
     if (await this.exists(this.statePath)) {
       const content = await fs.readFile(this.statePath, 'utf-8');
@@ -316,6 +332,7 @@ export class Factory extends EventEmitter {
     await this.updateHistory(this.state.status);
 
     if (this.state.status === 'completed') {
+      await this.runDockerVerification();
       await this.synthesizeMemory();
     }
 
@@ -458,6 +475,32 @@ export class Factory extends EventEmitter {
       return stdout.trim();
     } catch {
       return undefined;
+    }
+  }
+
+  private async runDockerVerification() {
+    if (!this.dockerVerifier) return;
+
+    const composePath = path.join(this.baseDir, 'docker-compose.yml');
+    const composeAltPath = path.join(this.baseDir, 'compose.yml');
+    const hasCompose = await this.exists(composePath) || await this.exists(composeAltPath);
+
+    if (!hasCompose) {
+      this.log('No docker-compose.yml found — skipping Docker verification');
+      return;
+    }
+
+    this.log('Running Docker verification...');
+    const result = await this.dockerVerifier.verify(this.baseDir);
+
+    if (result.passed) {
+      this.log('Docker verification PASSED — app builds and starts successfully');
+    } else {
+      this.log('Docker verification FAILED — app does not build or start correctly');
+      this.log(result.logs.slice(-500));
+      this.state.status = 'failed';
+      await this.saveState();
+      await this.updateHistory('failed');
     }
   }
 
