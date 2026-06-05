@@ -177,6 +177,15 @@ export class Factory extends EventEmitter {
     this.buildStartCommit = await this.getCurrentCommit();
     await this.validateDoneTasks();
 
+    if (this.state.status === 'planned') {
+      this.log(`Executing planned feature: ${this.state.feature}`);
+      this.state.status = 'active';
+      await this.saveState();
+      this.emitEvent({ type: 'state:update', state: this.state });
+      await this.runWorkshopLoop();
+      return;
+    }
+
     const failed = this.state.tasks.filter(t => t.status === 'failed' || t.status === 'rejected');
     if (failed.length === 0) {
       this.log('No failed tasks to resume.');
@@ -240,15 +249,69 @@ export class Factory extends EventEmitter {
     }
   }
 
-  async build(requirement: string) {
+  async plan(requirement: string) {
     if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
       await this.archiveCurrentState();
       this.state = undefined!;
     }
 
     if (this.state && this.state.status === 'active') {
-      this.log(`Resuming in-progress feature: ${this.state.feature}`);
+      this.log(`Existing in-progress feature found: ${this.state.feature}`);
+      this.log('Use --resume to continue it, or wait for it to complete/fail before planning a new one.');
+      return;
+    }
+
+    this.log(`Generating plan for: ${requirement}`);
+
+    const codebaseContext = await this.getRepoContext();
+    const memoryPatterns = await this.getMemoryPatterns();
+    const history = await this.getHistory();
+    const featureHistory = history.length > 0
+      ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
+      : '';
+
+    const blueprint = await this.gemini.generateBlueprint(requirement, codebaseContext, memoryPatterns, featureHistory);
+
+    const featureId = this.generateFeatureId();
+    this.state = {
+      feature_id: featureId,
+      feature: blueprint.feature,
+      status: 'planned',
+      created_at: new Date().toISOString(),
+      last_updated: new Date().toISOString(),
+      tasks: blueprint.tasks.map((t: any) => ({ ...t, status: 'pending' as const, attempts: 0 })),
+      memory_patterns: []
+    };
+    await this.saveState();
+    await this.updateHistory('planned');
+
+    this.emitEvent({ type: 'state:update', state: this.state });
+    this.emitEvent({ type: 'build:complete', status: 'planned', feature: this.state.feature });
+
+    this.log(`Plan saved with ${this.state.tasks.length} task(s):`);
+    for (const task of this.state.tasks) {
+      const deps = [...task.dependencies, ...task.blockedBy];
+      const depStr = deps.length > 0 ? ` (depends: ${deps.join(', ')})` : '';
+      this.log(`  [P${task.phase}] ${task.id}: ${task.title}${depStr}`);
+      this.log(`         ${task.description.slice(0, 120)}${task.description.length > 120 ? '...' : ''}`);
+      if (task.files_hint.length > 0) {
+        this.log(`         files: ${task.files_hint.join(', ')}`);
+      }
+    }
+    this.log(`\nTo execute this plan: softfactory --resume`);
+  }
+
+  async build(requirement: string) {
+    if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
+      await this.archiveCurrentState();
+      this.state = undefined!;
+    }
+
+    if (this.state && (this.state.status === 'active' || this.state.status === 'planned')) {
+      this.log(`Resuming ${this.state.status === 'planned' ? 'planned' : 'in-progress'} feature: ${this.state.feature}`);
+      this.state.status = 'active';
       await this.validateDoneTasks();
+      await this.saveState();
       this.emitEvent({ type: 'state:update', state: this.state });
       await this.runWorkshopLoop();
       return;

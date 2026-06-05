@@ -2,7 +2,7 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 
-const FLAGS = ['--no-tui', '--resume', '--history', '--refine', '--no-docker'];
+const FLAGS = ['--no-tui', '--resume', '--history', '--refine', '--no-docker', '--plan'];
 
 async function main() {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -38,6 +38,7 @@ async function main() {
   const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
   const resumeMode = args.includes('--resume');
   const refineMode = args.includes('--refine');
+  const planMode = args.includes('--plan');
   const noDocker = args.includes('--no-docker');
 
   let resumeFeatureId: string | undefined;
@@ -52,13 +53,19 @@ async function main() {
   const requirement = args.filter(a => !FLAGS.includes(a) && a !== resumeFeatureId).join(' ');
 
   if (!resumeMode && !requirement) {
-    console.error('Usage: softfactory [--no-tui] [--no-docker] [--resume [feature-id]] [--refine] [--history] <requirement>');
+    console.error('Usage: softfactory [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--refine] [--history] <requirement>');
     process.exit(1);
   }
 
   if (refineMode && !requirement) {
     console.error('Error: --refine requires a refinement description.');
     console.error('Example: softfactory --refine "use PostgreSQL instead of SQLite"');
+    process.exit(1);
+  }
+
+  if (planMode && !requirement) {
+    console.error('Error: --plan requires a requirement description.');
+    console.error('Example: softfactory --plan "Add user authentication with JWT"');
     process.exit(1);
   }
 
@@ -73,6 +80,8 @@ async function main() {
       await factory.resume(resumeFeatureId);
     } else if (refineMode) {
       await factory.refine(requirement);
+    } else if (planMode) {
+      await factory.plan(requirement);
     } else {
       await factory.build(requirement);
     }
@@ -82,7 +91,7 @@ async function main() {
     const { App } = await import('./components/App.js');
 
     const { waitUntilExit } = render(
-      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId, refineMode })
+      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId, refineMode, planMode })
     );
     await waitUntilExit();
   }

@@ -20,7 +20,7 @@ export type Task = z.infer<typeof TaskSchema>;
 export const FactoryStateSchema = z.object({
   feature_id: z.string().default(''),
   feature: z.string(),
-  status: z.enum(['planning', 'active', 'completed', 'failed']),
+  status: z.enum(['planning', 'planned', 'active', 'completed', 'failed']),
   created_at: z.string(),
   last_updated: z.string(),
   tasks: z.array(TaskSchema),
@@ -64,4 +64,4 @@ export type FactoryEvent =
   | { type: 'state:update'; state: FactoryState }
   | { type: 'worker:output'; taskId: string; line: string }
   | { type: 'phase:start'; phase: number }
-  | { type: 'build:complete'; status: 'completed' | 'failed'; feature: string };
+  | { type: 'build:complete'; status: 'completed' | 'failed' | 'planned'; feature: string };
