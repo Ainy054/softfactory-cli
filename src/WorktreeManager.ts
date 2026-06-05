@@ -68,15 +68,30 @@ export class WorktreeManager {
 
     await execa('git', ['add', '.'], { cwd: worktreePath });
 
-    // Check if there's anything to commit
     const { stdout: status } = await execa('git', ['status', '--porcelain'], { cwd: worktreePath });
-    if (!status.trim()) {
-      return { committed: false, filesChanged: 0 };
+    if (status.trim()) {
+      const filesChanged = status.trim().split('\n').length;
+      await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
+      return { committed: true, filesChanged };
     }
 
-    const filesChanged = status.trim().split('\n').length;
-    await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
-    return { committed: true, filesChanged };
+    // Worker may have committed its own changes (common with --dangerously-skip-permissions).
+    // Check if the worktree branch has commits ahead of the base.
+    const defaultBranch = await this.getDefaultBranch();
+    const { stdout: aheadCount } = await execa(
+      'git', ['rev-list', '--count', `${defaultBranch}..HEAD`],
+      { cwd: worktreePath }
+    );
+    if (parseInt(aheadCount.trim(), 10) > 0) {
+      const { stdout: diffStat } = await execa(
+        'git', ['diff', '--stat', `${defaultBranch}..HEAD`],
+        { cwd: worktreePath }
+      );
+      const filesChanged = diffStat.trim().split('\n').filter(l => l.includes('|')).length || 1;
+      return { committed: true, filesChanged };
+    }
+
+    return { committed: false, filesChanged: 0 };
   }
 
   async hasCommitsAhead(branchName: string, targetBranch: string): Promise<boolean> {

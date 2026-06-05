@@ -22,6 +22,7 @@ export class Factory extends EventEmitter {
   private streamToTerminal: boolean;
   private useDocker: boolean;
   private buildStartCommit: string | undefined;
+  private saveLock: Promise<void> = Promise.resolve();
 
   constructor(
     private baseDir: string,
@@ -358,8 +359,25 @@ export class Factory extends EventEmitter {
       this.emitEvent({ type: 'phase:start', phase: currentPhase });
       this.log(`Phase ${currentPhase}: Running ${readyTasks.length} task(s) in parallel`);
 
+      // Pre-create worktrees sequentially (git uses a lock file, concurrent creates race)
+      const worktreeMap = new Map<string, string>();
+      for (const task of readyTasks) {
+        const branchName = `line/${task.id}`;
+        try {
+          const worktreePath = await this.worktreeManager.create(task.id, branchName);
+          worktreeMap.set(task.id, worktreePath);
+        } catch (e: any) {
+          this.log(`Failed to create worktree for ${task.id}: ${e.message}`);
+          task.status = 'failed';
+          task.attempts++;
+          task.last_feedback = `Worktree creation failed: ${e.message}`;
+        }
+      }
+
       const results = await Promise.allSettled(
-        readyTasks.map(task => this.executeAndInspect(task))
+        readyTasks
+          .filter(task => worktreeMap.has(task.id))
+          .map(task => this.executeAndInspect(task, worktreeMap.get(task.id)!))
       );
 
       // Merge passed tasks sequentially (git isn't concurrent-safe)
@@ -410,14 +428,14 @@ export class Factory extends EventEmitter {
     }
   }
 
-  private async executeAndInspect(task: Task): Promise<TaskResult | null> {
+  private async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<TaskResult | null> {
     this.log(`Workshop: Running ${task.id} - ${task.title}`);
     task.status = 'active';
     this.emitEvent({ type: 'task:start', task });
     await this.saveState();
 
     const branchName = `line/${task.id}`;
-    const worktreePath = await this.worktreeManager.create(task.id, branchName);
+    const worktreePath = preCreatedWorktree || await this.worktreeManager.create(task.id, branchName);
 
     try {
       const projectContext = await this.getProjectContext(worktreePath);
@@ -691,11 +709,14 @@ export class Factory extends EventEmitter {
   }
 
   private async saveState() {
-    this.state.last_updated = new Date().toISOString();
-    const tmpPath = this.statePath + '.tmp';
-    await fs.writeFile(tmpPath, JSON.stringify(this.state, null, 2));
-    await fs.rename(tmpPath, this.statePath);
-    this.emitEvent({ type: 'state:update', state: this.state });
+    this.saveLock = this.saveLock.then(async () => {
+      this.state.last_updated = new Date().toISOString();
+      const tmpPath = this.statePath + '.tmp';
+      await fs.writeFile(tmpPath, JSON.stringify(this.state, null, 2));
+      await fs.rename(tmpPath, this.statePath);
+      this.emitEvent({ type: 'state:update', state: this.state });
+    });
+    await this.saveLock;
   }
 
   private hasUnfinishedTasks() {

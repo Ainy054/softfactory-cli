@@ -12,7 +12,7 @@ export const TaskSchema = z.object({
   status: z.enum(['pending', 'active', 'done', 'failed', 'rejected']).default('pending'),
   worktree_branch: z.string().optional(),
   attempts: z.number().default(0),
-  last_feedback: z.string().optional(),
+  last_feedback: z.string().nullish(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
