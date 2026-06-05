@@ -54,7 +54,7 @@ Rules:
                   id: { type: SchemaType.STRING },
                   title: { type: SchemaType.STRING },
                   description: { type: SchemaType.STRING },
-                  agent_role: { type: SchemaType.STRING },
+                  agent_role: { type: SchemaType.STRING, format: 'enum', enum: ['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder'] },
                   phase: { type: SchemaType.INTEGER },
                   dependencies: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
                   blockedBy: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
