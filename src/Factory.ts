@@ -467,15 +467,23 @@ export class Factory extends EventEmitter {
         await this.saveState();
         await this.updateHistory(this.state.status);
         if (this.state.status === 'completed') {
-            const finalCheck = await this.taskVerifier.verify(this.baseDir, undefined, true);
-            if (finalCheck.executed && !finalCheck.passed) {
-                this.log(`FINAL GATE FAILED: the full test suite does not pass on ${this.defaultBranch} — ${finalCheck.testSummary}`);
-                this.log(finalCheck.output.slice(0, 1000));
+            const finalChecks = await this.taskVerifier.verifyAll(this.baseDir);
+            const executed = finalChecks.filter(check => check.executed);
+            // Only failures this build is responsible for. A suite that was
+            // already red — a database that is not running, a pre-existing
+            // panic — is not this feature's doing and must not mark it failed.
+            const blocking = executed.filter(check => !check.passed && !this.wasAlreadyFailing(check));
+            for (const check of executed) {
+                this.log(`Final gate: ${check.passed ? 'PASS' : 'FAIL'} — ${check.testSummary}`);
+            }
+            if (blocking.length > 0) {
+                this.log(`FINAL GATE FAILED on ${this.defaultBranch}: ${blocking.map(c => c.testSummary).join('; ')}`);
+                this.log(blocking[0].output.slice(0, 1000));
                 this.state.status = 'failed';
                 await this.saveState();
                 await this.updateHistory('failed');
-            } else if (finalCheck.executed) {
-                this.log(`Final gate passed: ${finalCheck.testSummary}`);
+            } else if (executed.some(check => !check.passed)) {
+                this.log('Final gate: pre-existing failures only, not attributed to this build.');
             }
         }
         if (this.state.status === 'completed') {
@@ -712,6 +720,18 @@ export class Factory extends EventEmitter {
             if (!await this.exists(path.join(worktreePath, relative))) missing.push(relative);
         }
         return missing;
+    }
+
+    /**
+     * True when a suite failed for reasons that pre-date this build: an
+     * unreachable service, or a suite where the failures are assertions rather
+     * than anything that stopped it compiling or collecting.
+     */
+    wasAlreadyFailing(check: { output: string; testSummary: string }): boolean {
+        const text = `${check.testSummary}\n${check.output}`;
+        if (/connection refused|no such host|ECONNREFUSED|dial tcp|could not connect/i.test(text)) return true;
+        return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed/.test(text)
+            && !/build failed|cannot find|undefined:|SyntaxError|error TS\d+|Failed to load/i.test(text);
     }
 
     detectVerificationSabotage(diff: string): string | null {

@@ -87,6 +87,7 @@ Planning rules:
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria must be observable outcomes. verification must contain concrete commands or inspection checks.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
+- The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
 
 Repository Context:

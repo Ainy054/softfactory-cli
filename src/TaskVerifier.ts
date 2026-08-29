@@ -45,6 +45,30 @@ export class TaskVerifier {
     }
   }
 
+  /**
+   * Runs every ecosystem the project actually has. verify() dispatches to a
+   * single one, chosen from the task's files_hint — fine per task, wrong for a
+   * whole-project gate: a frontend-only feature was marked failed by Go tests
+   * that were never run against it and were already broken.
+   */
+  async verifyAll(projectPath: string): Promise<VerifierResult[]> {
+    const results: VerifierResult[] = [];
+    const seen = new Set<string>();
+    for (const probe of [
+      { hint: 'frontend/x.tsx', key: 'node' },
+      { hint: 'backend/x.go', key: 'go' },
+    ]) {
+      const result = await this.verify(projectPath, { files_hint: [probe.hint] } as Task, true);
+      const id = `${probe.key}:${result.testSummary}`;
+      if (result.executed && !seen.has(id)) {
+        seen.add(id);
+        results.push(result);
+      }
+    }
+    if (results.length === 0) results.push(await this.verify(projectPath, undefined, true));
+    return results;
+  }
+
   async verify(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {
     const isGoProject = await this.exists(path.join(worktreePath, 'go.mod')) ||
       await this.exists(path.join(worktreePath, 'backend', 'go.mod'));
