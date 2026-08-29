@@ -102,6 +102,34 @@ User Requirement:
 ${input.requirement}`;
 }
 
+/**
+ * CodexPlanner gets the shape from --output-schema and AgyPlanner states it in
+ * its own prompt. A planner with neither must be told, or `format: "json"` just
+ * guarantees well-formed JSON of the wrong shape.
+ */
+const SCHEMA_INSTRUCTION = `
+Return ONLY a JSON object with exactly these keys:
+{
+  "feature": "short feature name",
+  "requirements_covered": ["each ## or ### heading from the requirement, copied verbatim"],
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "short title",
+      "description": "what the worker must do",
+      "agent_role": "coder" | "test_writer" | "docs" | "devops" | "architect" | "builder",
+      "phase": 1,
+      "dependencies": [],
+      "blockedBy": [],
+      "files_hint": ["path/to/file.ts"],
+      "creates_files": ["path/to/new-file.ts"],
+      "acceptance_criteria": ["at least one observable outcome"],
+      "verification": ["at least one concrete command or check"]
+    }
+  ]
+}
+Every field is required on every task. Do not wrap the object in any other key.`;
+
 export class CodexPlanner implements IPlanner {
   provider: PlannerProvider = 'openai';
   constructor(private model = '') {}
@@ -176,28 +204,43 @@ export class LocalPlanner implements IPlanner {
   constructor(private model = 'qwen2.5-coder:14b', private host = 'http://127.0.0.1:11434') {}
 
   async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8 * 60_000);
-    try {
-      const response = await fetch(`${this.host}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model: this.model,
-          prompt: buildPlanningPrompt(input),
-          format: 'json',
-          stream: false,
-          options: { temperature: 0.1, num_ctx: 8192 },
-        }),
-      });
-      if (!response.ok) throw new Error(`Local planner Ollama error: ${response.status} ${response.statusText}`);
-      const data = await response.json() as { response?: string };
-      if (!data.response) throw new Error('Local planner returned an empty response.');
-      return validateBlueprint(extractJson(data.response), input);
-    } finally {
-      clearTimeout(timer);
+    const run = async (prompt: string): Promise<unknown> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8 * 60_000);
+      try {
+        const response = await fetch(`${this.host}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model: this.model,
+            prompt,
+            format: 'json',
+            stream: false,
+            options: { temperature: 0.1, num_ctx: 8192 },
+          }),
+        });
+        if (!response.ok) throw new Error(`Local planner Ollama error: ${response.status} ${response.statusText}`);
+        const data = await response.json() as { response?: string };
+        if (!data.response) throw new Error('Local planner returned an empty response.');
+        return extractJson(data.response);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    let draft = await run(`${buildPlanningPrompt(input)}\n${SCHEMA_INSTRUCTION}`);
+    // A local model rarely gets the whole shape right first time; give it the
+    // same repair budget the Codex planner has instead of failing the build.
+    for (let repair = 0; repair <= 2; repair++) {
+      try {
+        return validateBlueprint(draft, input);
+      } catch (error: any) {
+        if (repair === 2) throw error;
+        draft = await run(`Your previous plan was rejected.\n\nErrors:\n${error.message}\n\nRequirement:\n${input.requirement}\n${SCHEMA_INSTRUCTION}`);
+      }
     }
+    throw new Error('Local planner repair loop ended unexpectedly.');
   }
 }
 
