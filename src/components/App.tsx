@@ -1,4 +1,4 @@
-import React, { useReducer, useEffect, useCallback } from 'react';
+import React, { useReducer, useEffect, useCallback, useRef } from 'react';
 import { Box, Text, useApp } from 'ink';
 import { Factory } from '../Factory.js';
 import { Task, FactoryState, FactoryEvent } from '../types.js';
@@ -6,12 +6,15 @@ import { Header } from './Header.js';
 import { PhaseProgress } from './PhaseProgress.js';
 import { TaskList } from './TaskList.js';
 import { WorkerOutput } from './WorkerOutput.js';
+import { appendWorkerLog, normalizeWorkerOutput } from '../workerOutput.js';
+import { startFactoryRun } from '../runMode.js';
 
 interface AppProps {
   factory: Factory;
   requirement: string;
   resumeMode?: boolean;
   resumeFeatureId?: string;
+  retryBlocked?: boolean;
   refineMode?: boolean;
   planMode?: boolean;
 }
@@ -45,7 +48,7 @@ function reducer(state: AppState, action: Action): AppState {
     case 'worker:output':
       return {
         ...state,
-        workerLogs: [...state.workerLogs, { taskId: action.taskId, line: action.line }],
+        workerLogs: appendWorkerLog(state.workerLogs, { taskId: action.taskId, line: action.line }),
       };
     case 'phase:start':
       return { ...state, currentPhase: action.phase };
@@ -68,9 +71,10 @@ const initialState: AppState = {
   done: false,
 };
 
-export function App({ factory, requirement, resumeMode, resumeFeatureId, refineMode, planMode }: AppProps) {
+export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode }: AppProps) {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, initialState);
+  const hasStartedRef = useRef(false);
 
   const handleEvent = useCallback((event: FactoryEvent) => {
     switch (event.type) {
@@ -78,7 +82,9 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, refineM
         dispatch({ type: 'state:update', state: event.state });
         break;
       case 'worker:output':
-        dispatch({ type: 'worker:output', taskId: event.taskId, line: event.line });
+        for (const line of normalizeWorkerOutput(event.line)) {
+          dispatch({ type: 'worker:output', taskId: event.taskId, line });
+        }
         break;
       case 'phase:start':
         dispatch({ type: 'phase:start', phase: event.phase });
@@ -95,21 +101,21 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, refineM
     factory.on('phase:start', handleEvent);
     factory.on('build:complete', handleEvent);
 
-    const run = resumeMode
-      ? factory.resume(resumeFeatureId)
-      : refineMode
-        ? factory.refine(requirement)
-        : planMode
-          ? factory.plan(requirement)
-          : factory.build(requirement);
-    run.catch(err => {
-      dispatch({ type: 'error', message: err.message });
-    });
+    if (!hasStartedRef.current) {
+      hasStartedRef.current = true;
+      const run = startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode });
+      run.catch(err => {
+        dispatch({ type: 'error', message: err.message });
+      });
+    }
 
     return () => {
-      factory.removeAllListeners();
+      factory.off('state:update', handleEvent);
+      factory.off('worker:output', handleEvent);
+      factory.off('phase:start', handleEvent);
+      factory.off('build:complete', handleEvent);
     };
-  }, [factory, requirement, handleEvent]);
+  }, [factory, requirement, handleEvent, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode]);
 
   useEffect(() => {
     if (state.done) {

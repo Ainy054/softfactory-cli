@@ -35,7 +35,22 @@ export function TaskList({ tasks }: TaskListProps) {
       <Text bold dimColor>Tasks:</Text>
       {tasks.map(task => {
         const { icon, color } = STATUS_ICONS[task.status] || STATUS_ICONS.pending;
-        const retryInfo = task.attempts > 0 ? ` (attempt ${task.attempts + 1}/3)` : '';
+        let statusBadge: React.ReactNode = null;
+        if (task.status === 'active') {
+          if (task.attempts > 0) {
+            statusBadge = (
+              <Text color="yellow"> ⟳ [Iteration {task.attempts + 1} • Escalation {task.escalation_level || 0} • {task.model || 'worker'}]</Text>
+            );
+          } else {
+            statusBadge = (
+              <Text color="cyan"> ▶ [Running • {task.model || 'worker'}]</Text>
+            );
+          }
+        } else if (task.status === 'done') {
+          statusBadge = <Text color="green"> [Merged]</Text>;
+        } else if (task.status === 'failed') {
+          statusBadge = <Text color="red"> [Failed after {task.attempts} iterations]</Text>;
+        }
 
         return (
           <Box key={task.id}>
@@ -52,7 +67,7 @@ export function TaskList({ tasks }: TaskListProps) {
               {task.title}
             </Text>
             <Text dimColor> [{task.agent_role}]</Text>
-            {retryInfo && <Text color="yellow">{retryInfo}</Text>}
+            {statusBadge}
           </Box>
         );
       })}

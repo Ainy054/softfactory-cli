@@ -1,0 +1,137 @@
+import { Task } from './types.js';
+import { IWorker } from './IWorker.js';
+import { AgyWorker } from './AgyWorker.js';
+import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { ApiWorker } from './ApiWorker.js';
+import { CodexWorker } from './CodexWorker.js';
+
+export type WorkerStrategy = 'hybrid' | 'local' | 'cloud';
+export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic';
+
+export class WorkerRegistry {
+  private localWorker: IWorker;
+  private cloudWorker: IWorker;
+  private cloudProvider: CloudProvider;
+  private strategy: WorkerStrategy;
+  private localModel: string;
+  private cloudModel: string;
+  private frontierModel: string;
+  private lightLocalModel: string;
+  private heavyLocalModel: string;
+
+  constructor(
+    strategy: WorkerStrategy = 'hybrid',
+    localModel: string = 'auto',
+    cloudModel: string = 'Gemini 3.7 Flash (High)',
+    frontierModel: string = 'Gemini 3.1 Pro (High)',
+    lightLocalModel: string = 'qwen2.5-coder:7b',
+    heavyLocalModel: string = 'qwen2.5-coder:14b',
+    cloudProvider: CloudProvider = 'agy'
+  ) {
+    this.strategy = strategy;
+    this.localModel = localModel;
+    this.cloudModel = cloudModel;
+    this.frontierModel = frontierModel;
+    this.lightLocalModel = lightLocalModel;
+    this.heavyLocalModel = heavyLocalModel;
+    this.cloudProvider = cloudProvider;
+    this.localWorker = new LocalAgentWorker(localModel === 'auto' ? lightLocalModel : localModel);
+    this.cloudWorker = cloudProvider === 'agy' ? new AgyWorker(cloudModel)
+      : cloudProvider === 'openai' ? new CodexWorker(cloudModel)
+      : new ApiWorker(cloudProvider === 'openai-api' ? 'openai' : cloudProvider, cloudModel);
+  }
+
+  /**
+   * Size, not job title. Routing on agent_role sent a six-file devops task that
+   * had to author a new config to the smallest model, repeatedly.
+   */
+  isLightTask(task: Task): boolean {
+    const touched = new Set([...(task.files_hint || []), ...(task.creates_files || [])]);
+    if (touched.size > 2) return false;
+    if ((task.description?.length || 0) > 600) return false;
+    if ((task.acceptance_criteria?.length || 0) > 3) return false;
+    return touched.size <= 1 && (task.phase || 1) <= 2;
+  }
+
+  getCloudProvider(): CloudProvider {
+    return this.cloudProvider;
+  }
+
+  resolveLocalModel(task: Task, isRetry: boolean): string {
+    // If user explicitly provided a specific custom model (e.g. deepseek, qwen:3b, llama), honor it
+    if (this.localModel !== 'auto' && this.localModel !== 'tiered' && this.localModel !== this.lightLocalModel && this.localModel !== this.heavyLocalModel) {
+      return this.localModel;
+    }
+
+    // On retries, always escalate to the heavy local model (14B)
+    if (isRetry) {
+      return this.heavyLocalModel;
+    }
+
+    // On first attempt: light tasks get 7B (fast), heavy tasks get 14B (deep reasoning)
+    return this.isLightTask(task) ? this.lightLocalModel : this.heavyLocalModel;
+  }
+
+  async resolveWorker(task: Task): Promise<{ worker: IWorker; model: string; provider: string; escalated?: boolean }> {
+    // Prefer the explicit escalation tier, while honoring older persisted
+    // states that only recorded attempts as their escalation signal.
+    const escalation = Math.max(task.escalation_level || 0, task.attempts || 0);
+
+    // 1. Cloud-only Strategy:
+    if (this.strategy === 'cloud') {
+      const model = escalation >= 2 ? this.frontierModel : this.cloudModel;
+      return { worker: this.cloudWorker, model, provider: this.cloudProvider, escalated: escalation >= 2 };
+    }
+
+    // 2. Local-only Strategy (Strictly 100% Offline with 7B/14B Local Tiering):
+    if (this.strategy === 'local') {
+      const model = escalation > 0 ? this.heavyLocalModel : this.resolveLocalModel(task, false);
+      return {
+        worker: this.localWorker, provider: 'ollama',
+        model,
+        escalated: escalation > 0 && model === this.heavyLocalModel,
+      };
+    }
+
+    // 3. Hybrid Strategy (Local Tiered + Cloud Escalation Ladder):
+    if (task.agent_role === 'architect' || task.worker_type === 'cloud') {
+      const model = escalation >= 2 ? this.frontierModel : this.cloudModel;
+      return { worker: this.cloudWorker, model, provider: this.cloudProvider, escalated: escalation >= 2 };
+    }
+
+    // Escalation 0: Local Fast Model (7B for light tasks, 14B for heavy coding tasks)
+    if (escalation === 0) {
+      const localModel = this.resolveLocalModel(task, false);
+      const localAvailable = await this.localWorker.isAvailable(localModel);
+      if (localAvailable) {
+        return { worker: this.localWorker, model: localModel, provider: 'ollama' };
+      }
+      return { worker: this.cloudWorker, model: this.cloudModel, provider: this.cloudProvider };
+    }
+
+    // Escalation 1: Escalate to Heavy Local Model (14B)
+    if (escalation === 1) {
+      const localAvailable = await this.localWorker.isAvailable(this.heavyLocalModel);
+      if (localAvailable) {
+        return { worker: this.localWorker, model: this.heavyLocalModel, provider: 'ollama', escalated: true };
+      }
+      return { worker: this.cloudWorker, model: this.cloudModel, provider: this.cloudProvider, escalated: true };
+    }
+
+    // Escalation 2: Escalate to Fast Cloud Model (Gemini 3.7 Flash)
+    if (escalation === 2) {
+      const cloudAvailable = await this.cloudWorker.isAvailable();
+      if (cloudAvailable) {
+        return { worker: this.cloudWorker, model: this.cloudModel, provider: this.cloudProvider, escalated: true };
+      }
+      return { worker: this.localWorker, model: this.heavyLocalModel, provider: 'ollama', escalated: true };
+    }
+
+    // Escalation 3+: Escalate to Frontier Cloud Model (Gemini 3.1 Pro)
+    const cloudAvailable = await this.cloudWorker.isAvailable();
+    if (cloudAvailable) {
+      return { worker: this.cloudWorker, model: this.frontierModel, provider: this.cloudProvider, escalated: true };
+    }
+    return { worker: this.localWorker, model: this.heavyLocalModel, provider: 'ollama', escalated: true };
+  }
+}

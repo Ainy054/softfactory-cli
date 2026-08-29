@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const TaskSchema = z.object({
-  id: z.string(),
+  id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'Task IDs must be safe path components'),
   title: z.string(),
   description: z.string(),
   agent_role: z.enum(['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder']),
@@ -9,10 +9,18 @@ export const TaskSchema = z.object({
   dependencies: z.array(z.string()).default([]),
   blockedBy: z.array(z.string()).default([]),
   files_hint: z.array(z.string()).default([]),
-  status: z.enum(['pending', 'active', 'done', 'failed', 'rejected']).default('pending'),
+  creates_files: z.array(z.string()).default([]),
+  acceptance_criteria: z.array(z.string()).default([]),
+  verification: z.array(z.string()).default([]),
+  status: z.enum(['pending', 'active', 'done', 'failed', 'rejected', 'blocked']).default('pending'),
   worktree_branch: z.string().optional(),
   attempts: z.number().default(0),
+  escalation_level: z.number().default(0),
+  error_history: z.array(z.string()).default([]),
   last_feedback: z.string().nullish(),
+  model: z.string().optional(),
+  provider: z.string().optional(),
+  worker_type: z.enum(['local', 'cloud', 'auto']).default('auto'),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -21,6 +29,9 @@ export const FactoryStateSchema = z.object({
   feature_id: z.string().default(''),
   feature: z.string(),
   status: z.enum(['planning', 'planned', 'active', 'completed', 'failed']),
+  strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
+  cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic']).default('agy'),
+  planner_provider: z.enum(['openai', 'agy', 'local']).default('openai'),
   created_at: z.string(),
   last_updated: z.string(),
   tasks: z.array(TaskSchema),
@@ -28,6 +39,12 @@ export const FactoryStateSchema = z.object({
 });
 
 export type FactoryState = z.infer<typeof FactoryStateSchema>;
+
+export const LessonSchema = z.object({
+  id: z.string(), lesson: z.string().min(12).max(500), tags: z.array(z.string()).max(8), scope: z.enum(['project', 'language', 'path']).default('project'), confidence: z.number().min(0).max(1),
+  evidence: z.object({ taskId: z.string(), failure: z.string().max(500), resolution: z.string().max(500) }), createdAt: z.string(), lastUsedAt: z.string().optional(), useCount: z.number().default(0), status: z.enum(['active', 'superseded', 'rejected']).default('active'),
+});
+export type Lesson = z.infer<typeof LessonSchema>;
 
 export const FeatureHistoryEntrySchema = z.object({
   feature_id: z.string(),
@@ -58,9 +75,11 @@ export interface TaskResult {
 }
 
 export type FactoryEvent =
-  | { type: 'task:start'; task: Task }
+  | { type: 'task:start'; task: Task; worker: string; model: string }
   | { type: 'task:done'; task: Task }
   | { type: 'task:fail'; task: Task; feedback?: string }
+  | { type: 'verifier:start'; taskId: string }
+  | { type: 'verifier:done'; taskId: string; passed: boolean; testSummary: string; output: string }
   | { type: 'state:update'; state: FactoryState }
   | { type: 'worker:output'; taskId: string; line: string }
   | { type: 'phase:start'; phase: number }

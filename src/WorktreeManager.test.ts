@@ -83,4 +83,34 @@ describe('WorktreeManager', () => {
 
     await manager.cleanup('T003', 'line/T003');
   });
+
+  it('should hydrate untracked config and env files into the worktree', async () => {
+    // Create an untracked config.yaml in the root repo
+    await fs.writeFile(path.join(tmpDir, 'config.yaml'), 'database:\n  host: localhost\n');
+    await fs.writeFile(path.join(tmpDir, '.env'), 'APP_SECRET=12345\n');
+
+    const worktreePath = await manager.create('T004', 'line/T004');
+
+    // Check that config.yaml and .env were copied to the worktree
+    const configContent = await fs.readFile(path.join(worktreePath, 'config.yaml'), 'utf-8');
+    assert.equal(configContent, 'database:\n  host: localhost\n');
+
+    const envContent = await fs.readFile(path.join(worktreePath, '.env'), 'utf-8');
+    assert.equal(envContent, 'APP_SECRET=12345\n');
+
+    await manager.cleanup('T004', 'line/T004');
+  });
+
+  it('should preserve unrelated untracked files when merging', async () => {
+    const scratchPath = path.join(tmpDir, 'local-notes.txt');
+    await fs.writeFile(scratchPath, 'keep me');
+    const defaultBranch = await manager.getDefaultBranch();
+    const worktreePath = await manager.create('T005', 'line/T005');
+    await fs.writeFile(path.join(worktreePath, 'merged-file.txt'), 'merged');
+    await manager.commitWorktree('T005');
+    await manager.merge('T005', 'line/T005', defaultBranch);
+
+    assert.equal(await fs.readFile(scratchPath, 'utf-8'), 'keep me');
+    await manager.cleanup('T005', 'line/T005');
+  });
 });

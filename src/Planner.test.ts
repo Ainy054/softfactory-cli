@@ -1,0 +1,51 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { validateBlueprint, type PlanningInput } from './Planner.js';
+
+const input: PlanningInput = {
+  requirement: '## Command Palette\nFix it.\n## Quality gates\nRun tests.',
+  codebaseContext: '', memoryPatterns: '', featureHistory: '',
+  repositoryFiles: new Set(['src/App.tsx', 'src/App.test.tsx']),
+};
+
+const valid = {
+  feature: 'Palette repair',
+  requirements_covered: ['Command Palette', 'Quality gates'],
+  tasks: [{
+    id: 'T001', title: 'Repair palette', description: 'Repair the palette integration safely.',
+    agent_role: 'coder', phase: 1, dependencies: [], blockedBy: [],
+    files_hint: ['src/App.tsx'], creates_files: [],
+    acceptance_criteria: ['Ctrl+K opens the palette'], verification: ['npm test -- --run'],
+  }],
+};
+
+describe('planner semantic validation', () => {
+  it('accepts a grounded plan with complete coverage', () => {
+    assert.equal(validateBlueprint(valid, input).tasks.length, 1);
+  });
+
+  it('rejects invented files that are not declared new', () => {
+    const plan = structuredClone(valid);
+    plan.tasks[0].files_hint = ['src/useInvented.ts'];
+    assert.throws(() => validateBlueprint(plan, input), /nonexistent file/);
+  });
+
+  it('accepts an existing directory as a scoped file hint', () => {
+    const plan = structuredClone(valid);
+    plan.tasks[0].files_hint = ['src'];
+    assert.equal(validateBlueprint(plan, input).tasks[0].files_hint[0], 'src');
+  });
+
+  it('rejects omitted requirement areas', () => {
+    const plan = structuredClone(valid);
+    plan.requirements_covered = ['Command Palette'];
+    assert.throws(() => validateBlueprint(plan, input), /Quality gates/);
+  });
+
+  it('rejects dependency cycles and same-phase file conflicts', () => {
+    const plan = structuredClone(valid);
+    plan.tasks.push({ ...structuredClone(plan.tasks[0]), id: 'T002', dependencies: ['T001'] });
+    plan.tasks[0].dependencies = ['T002'];
+    assert.throws(() => validateBlueprint(plan, input), /dependency cycle|file conflict/);
+  });
+});

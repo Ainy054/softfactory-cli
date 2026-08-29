@@ -37,6 +37,18 @@ describe('TaskSchema', () => {
     });
   });
 
+  it('should reject task IDs that could escape a worktree path', () => {
+    assert.throws(() => {
+      TaskSchema.parse({
+        id: '../escape',
+        title: 'Unsafe task',
+        description: 'Should not parse',
+        agent_role: 'coder',
+        phase: 1,
+      });
+    });
+  });
+
   it('should accept all valid agent roles', () => {
     const roles = ['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder'] as const;
     for (const role of roles) {

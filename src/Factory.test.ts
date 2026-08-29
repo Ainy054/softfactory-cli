@@ -199,7 +199,6 @@ describe('getReadyTasks', () => {
     assert.equal(task.last_feedback, 'Remove node_modules');
   });
 });
-
 describe('generateFeatureId', () => {
   it('should produce f-YYYYMMDDHHMMSS format', () => {
     const id = `f-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
@@ -212,7 +211,6 @@ describe('generateFeatureId', () => {
     assert.notEqual(id1, id2);
   });
 });
-
 describe('hasUnfinishedTasks', () => {
   it('should return false when all tasks are done', () => {
     const tasks = [
@@ -254,5 +252,78 @@ describe('hasUnfinishedTasks', () => {
       makeTask({ id: 'T003', status: 'rejected' }),
     ];
     assert.equal(hasUnfinishedTasks(tasks), false);
+  });
+});
+
+describe('WorkerRegistry Escalation Ladder & Tiering', () => {
+  it('should escalate to frontier model for cloud strategy on attempt 2', async () => {
+    const { WorkerRegistry } = await import('./WorkerRegistry.js');
+    const registry = new WorkerRegistry('cloud', 'auto', 'Gemini 3.7 Flash (High)', 'Gemini 3.1 Pro (High)');
+
+    const task0 = makeTask({ id: 'T001', attempts: 0 });
+    const res0 = await registry.resolveWorker(task0);
+    assert.equal(res0.model, 'Gemini 3.7 Flash (High)');
+    assert.equal(res0.escalated, false);
+
+    const task2 = makeTask({ id: 'T001', attempts: 2 });
+    const res2 = await registry.resolveWorker(task2);
+    assert.equal(res2.model, 'Gemini 3.1 Pro (High)');
+    assert.equal(res2.escalated, true);
+  });
+
+  it('should use 7b for light tasks and 14b for heavy tasks in local strategy', async () => {
+    const { WorkerRegistry } = await import('./WorkerRegistry.js');
+    const registry = new WorkerRegistry('local', 'auto');
+
+    // Light task (devops)
+    const devopsTask = makeTask({ id: 'T001', agent_role: 'devops', phase: 1, attempts: 0 });
+    const resDevops = await registry.resolveWorker(devopsTask);
+    assert.equal(resDevops.model, 'qwen2.5-coder:7b');
+
+    // Light task (test_writer)
+    const testTask = makeTask({ id: 'T002', agent_role: 'test_writer', phase: 2, attempts: 0 });
+    const resTest = await registry.resolveWorker(testTask);
+    assert.equal(resTest.model, 'qwen2.5-coder:7b');
+
+    // Heavy task (coder with multi-file)
+    const coderTask = makeTask({
+      id: 'T005',
+      agent_role: 'coder',
+      phase: 3,
+      files_hint: ['backend/a.go', 'backend/b.go'],
+      attempts: 0,
+    });
+    const resCoder = await registry.resolveWorker(coderTask);
+    assert.equal(resCoder.model, 'qwen2.5-coder:14b');
+
+    // Retry of light task should escalate to 14b
+    const devopsRetry = makeTask({ id: 'T001', agent_role: 'devops', phase: 1, attempts: 1 });
+    const resRetry = await registry.resolveWorker(devopsRetry);
+    assert.equal(resRetry.model, 'qwen2.5-coder:14b');
+    assert.equal(resRetry.escalated, true);
+  });
+
+  it('should select the configured direct cloud provider', async () => {
+    const { WorkerRegistry } = await import('./WorkerRegistry.js');
+    const registry = new WorkerRegistry('cloud', 'auto', 'gpt-fast', 'gpt-pro', undefined, undefined, 'openai');
+    const result = await registry.resolveWorker(makeTask({ id: 'T009' }));
+    assert.equal(result.provider, 'openai');
+    assert.equal(result.worker.id, 'codex-cloud');
+    assert.equal(result.model, 'gpt-fast');
+    const escalated = await registry.resolveWorker(makeTask({ id: 'T010', attempts: 2 }));
+    assert.equal(escalated.model, 'gpt-pro');
+  });
+
+  it('should use Codex fast and frontier tiers in hybrid fallback', async () => {
+    const { WorkerRegistry } = await import('./WorkerRegistry.js');
+    const registry = new WorkerRegistry('hybrid', 'auto', 'gpt-fast', 'gpt-pro', undefined, undefined, 'openai');
+    // Make the routing assertion independent of credentials installed on the host.
+    (registry as any).cloudWorker.isAvailable = async () => true;
+    const fast = await registry.resolveWorker(makeTask({ id: 'T011', attempts: 2 }));
+    assert.equal(fast.provider, 'openai');
+    assert.equal(fast.model, 'gpt-fast');
+    const frontier = await registry.resolveWorker(makeTask({ id: 'T012', attempts: 3 }));
+    assert.equal(frontier.provider, 'openai');
+    assert.equal(frontier.model, 'gpt-pro');
   });
 });

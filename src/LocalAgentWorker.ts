@@ -1,0 +1,501 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { execa } from 'execa';
+import { Task, HandoffSchema, Handoff } from './types.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
+import { TaskVerifier } from './TaskVerifier.js';
+
+interface Message {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: any[];
+}
+
+export class LocalAgentWorker implements IWorker {
+  id = 'local-agent';
+  name = 'Local Agent Worker (Ollama Tools)';
+  private defaultModel: string;
+  private ollamaHost: string;
+  private readonly maxToolOutput = 6000;
+  private readonly maxFileRead = 24000;
+  private readonly verifier = new TaskVerifier();
+
+  constructor(defaultModel: string = 'qwen2.5-coder:7b', ollamaHost: string = 'http://127.0.0.1:11434') {
+    this.defaultModel = defaultModel;
+    this.ollamaHost = ollamaHost;
+  }
+
+  async isAvailable(model?: string): Promise<boolean> {
+    const status = await this.checkAvailability(model);
+    return status.reachable && status.modelPresent;
+  }
+
+  /**
+   * "Ollama is down" and "the model was never pulled" are different faults with
+   * different fixes. Collapsing both into a false forces the caller to guess,
+   * and the guess has historically been the wrong one.
+   */
+  async checkAvailability(model?: string): Promise<{ reachable: boolean; modelPresent: boolean; installed: string[] }> {
+    try {
+      const response = await fetch(`${this.ollamaHost}/api/tags`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return { reachable: false, modelPresent: false, installed: [] };
+      const data = await response.json() as any;
+      const installed: string[] = (data.models || []).map((entry: any) => entry.name).filter(Boolean);
+      return { reachable: true, modelPresent: !model || installed.includes(model), installed };
+    } catch {
+      return { reachable: false, modelPresent: false, installed: [] };
+    }
+  }
+
+  /**
+   * Escalating from 7B to 14B used to halve the context window, so the stronger
+   * model saw less. Keep one window for both and let low-memory machines lower
+   * it explicitly via SOFTFACTORY_LOCAL_NUM_CTX (4096 suits a 16 GB Mac).
+   */
+  getSafeContextWindow(_modelName: string): number {
+    const configured = Number(process.env.SOFTFACTORY_LOCAL_NUM_CTX);
+    if (Number.isFinite(configured) && configured >= 2048) return Math.floor(configured);
+    return 8192;
+  }
+
+  private buildSystemPrompt(task: Task, projectContext: string): string {
+    return `You are a precision autonomous software engineer working in an isolated Git worktree.
+Your goal is to implement the requested feature or fix the bug.
+
+CRITICAL INSTRUCTIONS:
+1. You have access to tools. ALWAYS use the provided tools to read files, modify files, and run tests.
+2. DO NOT output code blocks directly in your response expecting them to be saved. You MUST use the 'replace_content' or 'write_file' tools.
+3. When using 'replace_content', provide the EXACT target content you want to replace, including all whitespace.
+4. If tests are failing, read the test files, understand the requirements, and modify the code.
+5. When you are completely finished, call 'finish_task'.
+
+PROJECT CONTEXT:
+${projectContext}
+`;
+  }
+
+  async execute(task: Task, worktreePath: string, options?: WorkerOptions): Promise<Handoff> {
+    const onOutput = options?.onOutput || (() => {});
+    const model = options?.model || this.defaultModel;
+    const availability = await this.checkAvailability(model);
+    if (!availability.reachable) {
+      throw new WorkerEnvironmentError(`Ollama is not reachable at ${this.ollamaHost}. Start it (\`ollama serve\`, or launch the Ollama app) and resume. No task retry was consumed.`);
+    }
+    if (!availability.modelPresent) {
+      throw new Error(`Ollama is running but the model "${model}" is not installed. Install it with: ollama pull ${model}. Installed models: ${availability.installed.join(', ') || '(none)'}`);
+    }
+    
+    let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
+    if (task.last_feedback) {
+      userPrompt += `\nPREVIOUS ATTEMPT FAILED (Iteration ${task.attempts}):\n${task.last_feedback}\nEnsure you fix this.\n`;
+    }
+    if (task.files_hint && task.files_hint.length > 0) {
+      userPrompt += `\nRelevant files:\n${task.files_hint.join('\n')}\n`;
+    }
+
+    let messages: Message[] = [
+      { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '') },
+      { role: 'user', content: userPrompt }
+    ];
+
+    const tools = [
+      {
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read the contents of a file from the repository.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: { type: 'string', description: 'Path to the file to read, relative to the repository root' },
+              start_line: { type: 'integer', minimum: 1 },
+              end_line: { type: 'integer', minimum: 1 },
+            },
+            required: ['filepath']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replace_lines',
+          description: 'Replace an inclusive 1-based line range in a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: { type: 'string' },
+              start_line: { type: 'integer', minimum: 1 },
+              end_line: { type: 'integer', minimum: 1 },
+              replacement_content: { type: 'string' },
+            },
+            required: ['filepath', 'start_line', 'end_line', 'replacement_content'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'replace_content',
+          description: 'Replace a specific block of text in a file. The target_content must EXACTLY match the existing file content.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: { type: 'string' },
+              target_content: { type: 'string', description: 'The exact string to be replaced, including leading whitespace.' },
+              replacement_content: { type: 'string', description: 'The new content.' }
+            },
+            required: ['filepath', 'target_content', 'replacement_content']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'write_file',
+          description: 'Create a new file or completely overwrite an existing file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: { type: 'string' },
+              content: { type: 'string' }
+            },
+            required: ['filepath', 'content']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'run_command',
+          description: 'Run a shell command in the repository (e.g. tests or linters).',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' }
+            },
+            required: ['command']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'finish_task',
+          description: 'Call this tool when you have completed the task and verified tests pass.',
+          parameters: {
+            type: 'object',
+            properties: {
+              summary: { type: 'string', description: 'Summary of the changes made' },
+              test_summary: { type: 'string', description: 'Summary of the testing performed' },
+              status: { type: 'string', enum: ['success', 'failure'] }
+            },
+            required: ['summary', 'test_summary', 'status']
+          }
+        }
+      }
+    ];
+
+    const safeCtx = this.getSafeContextWindow(model);
+    onOutput(`[LocalAgent] Booting multi-step ReAct loop with ${model} (ctx: ${safeCtx})`);
+    if (!await this.probeToolSupport(model, tools, safeCtx)) {
+      throw new Error(`Ollama model "${model}" did not produce a parseable tool call; use a tool-capable model or the legacy worker.`);
+    }
+    
+    let handoffResult: Handoff | null = null;
+    const changedFiles = new Set<string>();
+    let sawToolCall = false;
+    let lastModelContent = '';
+    const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
+    await fs.mkdir(diagnosticsDir, { recursive: true });
+
+    for (let iteration = 0; iteration < 30; iteration++) {
+      try {
+        messages = this.compactMessages(messages, safeCtx);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), Number(process.env.SOFTFACTORY_LOCAL_TIMEOUT_MS) || 360000);
+        const response = await fetch(`${this.ollamaHost}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model,
+            messages,
+            tools,
+            stream: false,
+            options: { temperature: 0.1, num_ctx: safeCtx }
+          }),
+        });
+        clearTimeout(timeout);
+
+        if (!response.ok) {
+          throw new Error(`Ollama API error: ${response.statusText}`);
+        }
+
+        const data = await response.json() as any;
+        const msg = data.message || {};
+        lastModelContent = msg.content || '';
+        const toolCalls = this.extractToolCalls(msg);
+        
+        // Sometimes Ollama outputs content along with tool calls
+        if (msg.content) {
+            onOutput(`[LocalAgent] ${msg.content}`);
+        }
+        
+        messages.push({ ...msg, tool_calls: toolCalls });
+
+        if (toolCalls.length === 0) {
+          // Model returned plain text without calling a tool.
+          onOutput(`[LocalAgent] Model stopped without finishing. Reminding it...`);
+          messages.push({ role: 'user', content: 'You must call a tool. Either use read_file/replace_content to work, or finish_task to complete.' });
+          continue;
+        }
+
+        sawToolCall = true;
+        for (const call of toolCalls) {
+          const name = call.function.name;
+          const args = this.parseToolArguments(call.function.arguments);
+          let toolResult = '';
+
+          try {
+            if (name === 'read_file') {
+              onOutput(`[LocalAgent] 📖 Reading ${args.filepath}`);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, false);
+              await this.rejectSymlinkPath(worktreePath, fullPath);
+              const content = await fs.readFile(fullPath, 'utf-8');
+              const allLines = content.split(/\r?\n/);
+              const start = Number.isInteger(Number(args.start_line)) && Number(args.start_line) > 0 ? Number(args.start_line) : 1;
+              const end = Number.isInteger(Number(args.end_line)) && Number(args.end_line) >= start ? Math.min(Number(args.end_line), allLines.length) : Math.min(allLines.length, start + 199);
+              toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).join('\n')}`.slice(0, this.maxFileRead);
+            } else if (name === 'replace_lines') {
+              onOutput(`[LocalAgent] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              await this.rejectSymlinkPath(worktreePath, fullPath);
+              const content = await fs.readFile(fullPath, 'utf-8');
+              const lines = content.split(/\r?\n/);
+              const start = Number(args.start_line);
+              const end = Number(args.end_line);
+              if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > lines.length) {
+                throw new Error(`Invalid line range ${start}-${end}; file has ${lines.length} lines.`);
+              }
+              lines.splice(start - 1, end - start + 1, String(args.replacement_content));
+              await fs.writeFile(fullPath, lines.join('\n'), 'utf-8');
+              changedFiles.add(args.filepath);
+              toolResult = 'Lines successfully replaced.';
+            } else if (name === 'write_file') {
+              onOutput(`[LocalAgent] ✍️ Writing ${args.filepath}`);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              await this.rejectSymlinkPath(worktreePath, fullPath);
+              await fs.mkdir(path.dirname(fullPath), { recursive: true });
+              await fs.writeFile(fullPath, args.content, 'utf-8');
+              changedFiles.add(args.filepath);
+              toolResult = 'File successfully written.';
+            } else if (name === 'replace_content') {
+              onOutput(`[LocalAgent] ✂️ Editing ${args.filepath}`);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              await this.rejectSymlinkPath(worktreePath, fullPath);
+              const content = await fs.readFile(fullPath, 'utf-8');
+              if (content.includes(args.target_content)) {
+                const newContent = content.replace(args.target_content, args.replacement_content);
+                await fs.writeFile(fullPath, newContent, 'utf-8');
+                changedFiles.add(args.filepath);
+                toolResult = 'Content successfully replaced.';
+              } else {
+                toolResult = 'ERROR: target_content not found in file. Ensure exact whitespace match.';
+                onOutput(`[LocalAgent] ❌ target_content not found in ${args.filepath}`);
+              }
+            } else if (name === 'run_command') {
+              onOutput(`[LocalAgent] 🖥️ Running: ${args.command}`);
+              this.assertAllowedCommand(args.command);
+              try {
+                const [executable, ...commandArgs] = this.parseCommand(args.command);
+                const { stdout, stderr } = await execa(executable, commandArgs, { cwd: worktreePath, timeout: 30000, env: this.safeCommandEnv() });
+                toolResult = this.truncateToolResult(`STDOUT:\n${stdout}\nSTDERR:\n${stderr}`);
+              } catch (cmdErr: any) {
+                toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
+              }
+            } else if (name === 'finish_task') {
+              const verification = await this.verifier.verify(worktreePath, task);
+              if (!verification.passed) {
+                toolResult = this.truncateToolResult(`Cannot finish. Tests failed: ${verification.testSummary}\n${verification.output}`);
+                onOutput(`[LocalAgent] ❌ Finish rejected: ${verification.testSummary}`);
+              } else {
+                onOutput(`[LocalAgent] ✅ Task finished: ${args.status}`);
+                handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles) };
+                toolResult = 'Task completed and verification passed.';
+              }
+            } else {
+              toolResult = `Unknown tool: ${name}`;
+            }
+          } catch (e: any) {
+            toolResult = `Tool execution failed: ${e.message}`;
+            onOutput(`[LocalAgent] ❌ Tool error: ${e.message}`);
+          }
+
+          messages.push({
+            role: 'tool',
+            content: toolResult
+          } as any);
+          await this.recordToolCall(diagnosticsDir, task, name, toolResult);
+        }
+        
+        if (handoffResult) break;
+
+      } catch (e: any) {
+        onOutput(`[LocalAgent] Crash in ReAct loop: ${e.message}`);
+        break;
+      }
+    }
+
+    if (handoffResult) {
+      return handoffResult;
+    }
+
+    return {
+      task_id: task.id,
+      status: 'failure',
+      summary: sawToolCall
+        ? 'LocalAgent stopped before calling finish_task or completing verification.'
+        : `LocalAgent received no parseable tool calls from Ollama. Last response: ${lastModelContent.slice(0, 500)}`,
+      files_changed: Array.from(changedFiles)
+    };
+  }
+
+  private parseToolArguments(raw: unknown): any {
+    if (typeof raw === 'string') {
+      try { return JSON.parse(raw); } catch { throw new Error('Malformed tool arguments (expected JSON object).'); }
+    }
+    if (!raw || typeof raw !== 'object') throw new Error('Malformed tool arguments.');
+    return raw;
+  }
+
+  private extractToolCalls(message: any): any[] {
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) return message.tool_calls;
+    const content = typeof message.content === 'string' ? message.content : '';
+    const calls: any[] = [];
+    const pattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      try {
+        const parsed = JSON.parse(match[1]);
+        if (parsed?.name && parsed?.arguments !== undefined) {
+          calls.push({ function: { name: parsed.name, arguments: parsed.arguments } });
+        }
+      } catch { /* malformed model output is reported as no tool call */ }
+    }
+    if (calls.length === 0 && content.trim()) {
+      const candidates = [content.trim(), content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')];
+      for (const candidate of candidates) {
+        try {
+          const parsed = JSON.parse(candidate);
+          if (parsed?.name && parsed?.arguments !== undefined) {
+            calls.push({ function: { name: parsed.name, arguments: parsed.arguments } });
+            break;
+          }
+        } catch { /* ordinary assistant text */ }
+      }
+    }
+    return calls;
+  }
+
+  private async probeToolSupport(model: string, tools: any[], contextWindow: number): Promise<boolean> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    try {
+      const response = await fetch(`${this.ollamaHost}/api/chat`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Call read_file for probe.txt now.' }], tools: tools.slice(0, 1), stream: false, options: { temperature: 0, num_ctx: Math.min(contextWindow, 2048) } }),
+      });
+      if (!response.ok) return false;
+      const data = await response.json() as any;
+      return this.extractToolCalls(data.message || {}).length > 0;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private resolveToolPath(worktreePath: string, rawPath: unknown, task: Task, write: boolean): string {
+    if (typeof rawPath !== 'string' || !rawPath || path.isAbsolute(rawPath)) throw new Error('Path must be a non-empty relative path.');
+    const root = path.resolve(worktreePath);
+    const target = path.resolve(root, rawPath);
+    if (!target.startsWith(`${root}${path.sep}`)) throw new Error('Path escapes the task worktree.');
+    const allowed = new Set([...task.files_hint, ...task.creates_files]);
+    if (write && allowed.size > 0 && !allowed.has(rawPath)) throw new Error(`Write path is outside declared task scope: ${rawPath}`);
+    return target;
+  }
+
+  private async rejectSymlinkPath(rootPath: string, targetPath: string): Promise<void> {
+    const root = path.resolve(rootPath);
+    const relative = path.relative(root, targetPath);
+    let current = root;
+    for (const part of relative.split(path.sep)) {
+      if (!part) continue;
+      current = path.join(current, part);
+      try {
+        if ((await fs.lstat(current)).isSymbolicLink()) throw new Error('Symlink paths are not permitted.');
+      } catch (error: any) {
+        if (error?.code === 'ENOENT') break;
+        throw error;
+      }
+    }
+  }
+
+  private assertAllowedCommand(command: unknown): asserts command is string {
+    if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
+    if (/[;&|`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
+    const executable = command.trim().split(/\s+/, 1)[0];
+    const allowed = new Set(['npm', 'npx', 'pnpm', 'yarn', 'node', 'go', 'pytest', 'python', 'python3', 'cargo', 'git', 'tsc', 'eslint', 'vitest']);
+    if (!allowed.has(executable)) throw new Error(`Command is not allowlisted: ${executable}`);
+    // -e/-c were blocked but --eval and -p were not, and `git -c alias.x=!cmd`
+    // is a shell escape. This raises the bar against accidents; it is not a
+    // sandbox, and must not be relied on as one.
+    if (/(^|\s)-(?:e|c|p|-eval|-print|-command)\b/.test(command)) {
+      throw new Error('Inline interpreter execution is not permitted.');
+    }
+    if (executable === 'git' && /(^|\s)-c\s|alias\.|!\s*\w/.test(command)) {
+      throw new Error('git -c / alias execution is not permitted.');
+    }
+    if (executable === 'npx') throw new Error('npx is not permitted because it can download and execute arbitrary packages.');
+  }
+
+  private parseCommand(command: string): string[] {
+    const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+    return parts.map(part => part.replace(/^(["'])|\1$/g, ''));
+  }
+
+  private safeCommandEnv(): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (/TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|AUTH/i.test(key)) delete env[key];
+    }
+    return { ...env, CI: 'true' };
+  }
+
+  private truncateToolResult(result: string): string {
+    return result.length > this.maxToolOutput ? `${result.slice(0, this.maxToolOutput)}\n...[truncated]` : result;
+  }
+
+  private compactMessages(messages: Message[], contextWindow: number): Message[] {
+    const charBudget = Math.max(5000, Math.floor(contextWindow * 1.8));
+    const total = messages.reduce((sum, message) => sum + (message.content || '').length, 0);
+    if (total <= charBudget) return messages;
+    let start = Math.max(2, messages.length - 4);
+    while (start < messages.length && messages[start].role === 'tool') start++;
+    const recent = messages.slice(start).map(message => ({
+      ...message,
+      content: (message.content || '').length > 1000
+        ? `${(message.content || '').slice(0, 500)}\n...[older output compacted]...\n${(message.content || '').slice(-400)}`
+        : (message.content || ''),
+    }));
+    return [messages[0], messages[1], { role: 'system', content: 'Earlier tool output was compacted; re-read files or rerun focused checks as needed.' }, ...recent];
+  }
+
+  private async recordToolCall(diagnosticsDir: string, task: Task, tool: string, result: string): Promise<void> {
+    try {
+      await fs.appendFile(path.join(diagnosticsDir, 'tool-calls.jsonl'), JSON.stringify({
+        timestamp: new Date().toISOString(), task_id: task.id, tool, result: this.truncateToolResult(result),
+      }) + '\n');
+    } catch { /* diagnostics must not fail work */ }
+  }
+}

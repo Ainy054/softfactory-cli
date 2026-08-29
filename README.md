@@ -1,116 +1,113 @@
-# SoftFactory CLI
+# SoftFactory CLI (Hybrid `agy` + `Qwen` Edition)
 
-Multi-agent code generation factory. Give it a requirement in plain English — it decomposes it into tasks, executes them in parallel via AI agents, reviews the output, and merges the results.
+High-assurance multi-agent software delivery factory. Decomposes requirements into dependency-ordered phases, executes tasks in parallel inside isolated Git worktrees via **local Qwen (Ollama)** and **cloud Antigravity (`agy`)**, verifies code with automated in-worktree test runners, inspects diffs, and merges passing work.
 
 ## Architecture
 
 ```
 softfactory "add user authentication"
-        |
-   [BLUEPRINT]          Gemini Pro analyzes requirement + codebase
-        |                Outputs structured task plan with phases
-        v
-   [WORKSHOP]           Claude Code executes each task
-    T001  T002  T003     in isolated git worktrees (parallel per phase)
-     |     |     |
-   [INSPECTION]         Gemini Flash reviews each diff
-    PASS  PASS  FAIL     PASS -> merge, FAIL -> retry (max 3)
-     |     |     |
-   [MERGE]              Sequential merge of passed tasks
+        │
+   [BLUEPRINT]          Antigravity agy (Gemini 3.1 Pro High)
+        │                Outputs structured phase plan with graph safety
+        ▼
+   [WORKSHOP]           Hybrid Parallel Workers in isolated git worktrees
+   ┌─────────────────┬──────────────────┬─────────────────┐
+   │ T001 (devops)   │ T002 (coder)     │ T003 (tests)    │
+   │ Local Qwen 2.5  │ Local Qwen 2.5   │ Local Qwen 2.5  │  (Zero API cost)
+   └─────────────────┴──────────────────┴─────────────────┘
+        │                    │                   │
+   [AUTO-VERIFIER]      Runs language test suite in worktree (go test, npm test, pytest)
+        │
+   [INSPECTION]         Antigravity agy (Gemini 3.7 Flash) reviews diff + test output
+        │
+   [MERGE]              Sequential merge of verified tasks + FACTORY_MEMORY.md update
 ```
 
-**Three-stage pipeline:**
-1. **Blueprint** (Gemini Pro) — Analyzes your requirement and codebase context, generates a structured task plan with phases, dependencies, and agent roles
-2. **Workshop** (Claude Code) — Executes tasks in isolated git worktrees. Same-phase tasks run in parallel. Each worker writes a structured handoff file on completion
-3. **Inspection** (Gemini Flash) — Reviews each task's diff against its description. PASS merges to your branch, FAIL retries with feedback (up to 3 attempts)
+### Key Advantages:
+1. **Zero Pay-Per-Token Bills:** Routine coding and test writing run 100% locally on **`qwen2.5-coder:7b`** via Ollama.
+2. **Cloud Frontier Power via `agy`:** Blueprints and adversarial inspection utilize **Gemini 3.1 Pro** and **Gemini 3.7 Flash** via your Antigravity CLI without raw API keys or rate-limit lockouts.
+3. **Automated Verifier Gate:** Automated local test execution prevents broken builds from reaching the inspector stage.
+4. **Mechanical Graph Safety:** Tasks in the same phase with overlapping file hints are automatically serialized to eliminate merge conflicts.
+5. **P-85 State Persistence:** Resilient state and SIGINT/SIGTERM trap recovery.
+
+---
 
 ## Prerequisites
 
-- Node.js 20+
 - Git
-- `GEMINI_API_KEY` environment variable ([Get one](https://ai.google.dev/))
-- Claude Code CLI (`npx @anthropic-ai/claude-code` — installed automatically)
+- Antigravity CLI (`agy` installed and authenticated on PATH)
+- Ollama with `qwen2.5-coder:7b` (`ollama run qwen2.5-coder:7b`)
+- Node.js 20+
 
-## Installation
-
-```bash
-# Global install
-npm install -g softfactory-cli
-
-# Or run directly
-npx softfactory "your requirement"
-```
+---
 
 ## Usage
 
 ```bash
-# Interactive TUI mode (default when TTY)
-GEMINI_API_KEY=... softfactory "add REST API with user CRUD"
+# Default Hybrid Mode (Local Qwen for coders/tests + agy for Blueprint/Review)
+softfactory "add REST API with user CRUD"
 
-# Plain console output (CI/pipes, or force with flag)
-GEMINI_API_KEY=... softfactory --no-tui "add unit tests for auth module"
+# Force 100% Local (Ollama planner, worker, and verifier)
+softfactory --strategy=local --planner-provider=local "add unit tests for auth module"
+
+# Force Cloud-only via agy
+softfactory --strategy=cloud --cloud-model="Gemini 3.7 Flash (High)" "refactor ledger engine"
+
+# Use the authenticated Codex CLI and its configured default model
+softfactory --strategy=hybrid --cloud-provider=openai --resume
+
+# Or explicitly choose its fast and frontier tiers
+softfactory --strategy=cloud --cloud-provider=openai --cloud-model=<fast-model> --frontier-model=<pro-model> "refactor ledger engine"
+
+# Use the OpenAI Responses API directly (requires OPENAI_API_KEY)
+softfactory --strategy=cloud --cloud-provider=openai-api --cloud-model=gpt-5.4 "refactor ledger engine"
+
+# Use the Anthropic Messages API directly (requires ANTHROPIC_API_KEY)
+softfactory --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4 "refactor ledger engine"
+
+# Non-interactive / CI mode
+softfactory --no-tui "implement transaction reversal endpoint"
+
+# Resume an interrupted build
+softfactory --resume
 ```
 
-The TUI shows real-time progress: task status with spinners, phase progress bars, and live worker output.
+---
 
-## How It Works
+## CLI Flags
 
-1. You provide a natural language requirement
-2. Gemini Pro breaks it into granular, parallelizable tasks with phase ordering
-3. For each phase, all ready tasks launch simultaneously in isolated git worktrees
-4. Each Claude Code worker implements its task and writes a `handoff.json`
-5. Gemini Flash reviews the diff — PASS tasks merge, FAIL tasks retry
-6. Once all phases complete, the build is done
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--strategy` | Execution strategy (`hybrid`, `local`, `cloud`) | `hybrid` |
+| `--local-model` | Local model name for Ollama | `qwen2.5-coder:7b` |
+| `--planner-provider` | Blueprint planner (`openai`, `agy`, or offline `local`) | `openai` (local strategy defaults to `local`) |
+| `--cloud-model` | Cloud model name; optional for Codex CLI, which uses its configured default | `Gemini 3.7 Flash (High)` |
+| `--frontier-model` | Escalation model after repeated cloud-worker failures; optional for Codex CLI | `Gemini 3.1 Pro (High)` |
+| `--cloud-provider` | Cloud execution backend: `agy`, `openai` (Codex CLI), `openai-api`, or `anthropic` | `agy` |
+| `--no-tui` | Plain stdout console output without Ink TUI | Interactive default |
+| `--no-docker` | Skip post-build docker verification | Docker auto-detect |
+| `--plan` | Generate and save plan without immediate execution | `false` |
+| `--resume` | Resume active or planned feature build | `false` |
+| `--refine` | Modify an in-progress plan mid-flight | `false` |
+| `--history` | View history of completed features | `false` |
 
-**Task scheduling** respects:
-- Phase ordering (phase 1 completes before phase 2 starts)
-- Explicit dependencies (`dependencies` and `blockedBy` fields)
-- Retry limits (max 3 attempts per task)
-
-**State persistence**: All state is saved to `.softfactory/factory.json`. If interrupted, re-running the same command resumes from where it left off.
-
-## Configuration
-
-| Environment Variable | Required | Description |
-|---------------------|----------|-------------|
-| `GEMINI_API_KEY` | Yes | Google Generative AI API key |
-
-Model defaults (configurable in code):
-- Blueprint: `gemini-3.1-pro-preview`
-- Inspection: `gemini-3.5-flash`
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Run tests (42 tests across 8 suites)
-npm test
-
-# Type-check without emitting
-npx tsc --noEmit
-```
+---
 
 ## Project Structure
 
 ```
 src/
-  index.ts            CLI entry point (TUI/no-TUI routing)
-  Factory.ts          Main orchestrator (EventEmitter, parallel scheduling)
-  GeminiClient.ts     Gemini Pro (blueprint) + Flash (inspection)
-  ClaudeWorker.ts     Spawns Claude Code in worktrees
+  index.ts            CLI entry point & signal trap handlers
+  Factory.ts          Orchestrator (Phase DAG, P-85 pre-dispatch, worktree coordination)
+  GeminiClient.ts     AgyClient (Blueprint planning, refinement, memory & inspection)
+  IWorker.ts          Common Worker interface (execute & handoff)
+  WorkerRegistry.ts   Hybrid router (Local Qwen vs Cloud agy)
+  QwenWorker.ts       Local Ollama worker runner
+  AgyWorker.ts        Antigravity CLI cloud worker runner
+  TaskVerifier.ts     Automated in-worktree test runner (Go, Node, Python, Rust)
   WorktreeManager.ts  Git worktree lifecycle (create/merge/cleanup)
+  DockerVerifier.ts   Post-build container verification
   types.ts            Zod schemas (Task, FactoryState, Handoff)
-  components/
-    App.tsx            Top-level Ink app (state management via useReducer)
-    Header.tsx         Feature name + status badge
-    PhaseProgress.tsx  Phase progress bars
-    TaskList.tsx       Task list with status icons + spinner
-    WorkerOutput.tsx   Live worker output feed
 ```
 
 ## License
