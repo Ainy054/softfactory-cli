@@ -729,9 +729,14 @@ export class Factory extends EventEmitter {
      */
     wasAlreadyFailing(check: { output: string; testSummary: string }): boolean {
         const text = `${check.testSummary}\n${check.output}`;
+        // A suite that cannot start is never "pre-existing": T01 merged a
+        // vitest.config.ts that failed to load, and this heuristic read the
+        // resulting output as an ordinary red suite.
+        if (/Failed to load|Transform failed|esbuild|ERR_MODULE_NOT_FOUND|Cannot find (?:module|package)|SyntaxError|Unexpected token|error TS\d+|build failed|undefined:/i.test(text)) {
+            return false;
+        }
         if (/connection refused|no such host|ECONNREFUSED|dial tcp|could not connect/i.test(text)) return true;
-        return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed/.test(text)
-            && !/build failed|cannot find|undefined:|SyntaxError|error TS\d+|Failed to load/i.test(text);
+        return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed/.test(text);
     }
 
     detectVerificationSabotage(diff: string): string | null {

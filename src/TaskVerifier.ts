@@ -490,7 +490,7 @@ export class TaskVerifier {
    * before this task and are some other task's job.
    */
   private isPreExistingAssertionFailure(output: string): boolean {
-    if (/Failed to load|Cannot find (?:module|package|dependency)|SyntaxError|Transform failed|error TS\d+/i.test(output)) {
+    if (/Failed to load|Cannot find (?:module|package|dependency)|SyntaxError|Transform failed|esbuild|Unexpected token|ERR_MODULE_NOT_FOUND|error TS\d+/i.test(output)) {
       return false;
     }
     const files = output.match(/Test Files\s+(?:(\d+) failed[^\n]*?)?\|?\s*(\d+) passed/);

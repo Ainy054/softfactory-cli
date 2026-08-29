@@ -339,14 +339,14 @@ ${projectContext}
                 throw new Error(`Invalid line range ${start}-${end}; file has ${lines.length} lines.`);
               }
               lines.splice(start - 1, end - start + 1, String(args.replacement_content));
-              toolResult = await this.writeChecked(fullPath, args.filepath, lines.join('\n'), content, changedFiles, 'Lines successfully replaced.');
+              toolResult = await this.writeChecked(fullPath, args.filepath, lines.join('\n'), content, changedFiles, 'Lines successfully replaced.', worktreePath);
             } else if (name === 'write_file') {
               onOutput(`[LocalAgent] ✍️ Writing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               await fs.mkdir(path.dirname(fullPath), { recursive: true });
               const previous = await fs.readFile(fullPath, 'utf-8').catch(() => null);
-              toolResult = await this.writeChecked(fullPath, args.filepath, String(args.content), previous, changedFiles, 'File successfully written.');
+              toolResult = await this.writeChecked(fullPath, args.filepath, String(args.content), previous, changedFiles, 'File successfully written.', worktreePath);
             } else if (name === 'replace_content') {
               onOutput(`[LocalAgent] ✂️ Editing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
@@ -354,7 +354,7 @@ ${projectContext}
               const content = await fs.readFile(fullPath, 'utf-8');
               if (content.includes(args.target_content)) {
                 const newContent = content.replace(args.target_content, args.replacement_content);
-                toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.');
+                toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.', worktreePath);
               } else {
                 // Telling a small model to "match whitespace exactly" is telling
                 // it to retry the thing it just proved it cannot do: 14 of 15
@@ -504,9 +504,10 @@ ${projectContext}
     previous: string | null,
     changedFiles: Set<string>,
     successMessage: string,
+    worktreeRoot = '',
   ): Promise<string> {
     await fs.writeFile(fullPath, content, 'utf-8');
-    const invalid = this.structuralError(relativePath, content);
+    const invalid = await this.structuralError(worktreeRoot, relativePath, content);
     if (invalid) {
       if (previous === null) await fs.rm(fullPath, { force: true });
       else await fs.writeFile(fullPath, previous, 'utf-8');
@@ -516,15 +517,51 @@ ${projectContext}
     return successMessage;
   }
 
-  /** Non-null when the new content is structurally broken for its file type. */
-  private structuralError(relativePath: string, content: string): string | null {
-    if (!/\.json$/i.test(relativePath)) return null;
+  /**
+   * Non-null when the new content will not parse. Limiting this to JSON let a
+   * vitest.config.ts with four stray closing brackets merge to main, after
+   * which the whole frontend suite could no longer start.
+   */
+  private async structuralError(worktreeRoot: string, relativePath: string, content: string): Promise<string | null> {
     if (!content.trim()) return 'the file is empty';
+    if (/\.json$/i.test(relativePath)) {
+      try {
+        JSON.parse(content);
+        return null;
+      } catch (error: any) {
+        return `invalid JSON (${error.message})`;
+      }
+    }
+    if (!/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(relativePath)) return null;
+    return this.scriptSyntaxError(worktreeRoot, relativePath, content);
+  }
+
+  /**
+   * Parses with the project's own esbuild. Absent one we cannot judge, and
+   * refusing every edit would be worse than allowing them, so we allow.
+   */
+  private async scriptSyntaxError(worktreeRoot: string, relativePath: string, content: string): Promise<string | null> {
+    if (!worktreeRoot) return null;
+    const dirs = [path.dirname(relativePath), '.', 'frontend', 'backend'];
+    let binary: string | null = null;
+    for (const dir of dirs) {
+      const candidate = path.join(worktreeRoot, dir, 'node_modules', '.bin', 'esbuild');
+      try {
+        await fs.access(candidate);
+        binary = candidate;
+        break;
+      } catch { /* keep looking */ }
+    }
+    if (!binary) return null;
+    const loader = /\.(tsx|jsx)$/i.test(relativePath) ? 'tsx' : /\.tsx?$/i.test(relativePath) ? 'ts' : 'js';
     try {
-      JSON.parse(content);
+      await execa(binary, [`--loader=${loader}`], { input: content, timeout: 20000 });
       return null;
     } catch (error: any) {
-      return `invalid JSON (${error.message})`;
+      const message = String(error.stderr || error.stdout || error.message).split('\n')
+        .filter((line: string) => line.trim()).slice(0, 4).join(' ');
+      if (/ENOENT|not found|timed out/i.test(message)) return null;
+      return `it no longer parses (${message.slice(0, 300)})`;
     }
   }
 
