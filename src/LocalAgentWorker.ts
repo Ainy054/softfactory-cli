@@ -18,7 +18,10 @@ export class LocalAgentWorker implements IWorker {
   private defaultModel: string;
   private ollamaHost: string;
   static readonly REPEAT_WARN = 3;
-  static readonly REPEAT_ABORT = 5;
+  static readonly REPEAT_ABORT = 5;          // identical calls back to back
+  static readonly REPEAT_TOTAL_ABORT = 8;    // identical calls anywhere in the attempt
+  static readonly CYCLE_WINDOW = 6;          // rolling window for A/B/A/B oscillation
+  static readonly CYCLE_DISTINCT = 2;
   private readonly maxToolOutput = 6000;
   private readonly maxFileRead = 24000;
   private readonly verifier = new TaskVerifier();
@@ -219,6 +222,7 @@ ${projectContext}
     const callCounts = new Map<string, number>();
     let lastFingerprint: string | null = null;
     let repeatedCall: string | null = null;
+    const recentCalls: string[] = [];
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
 
@@ -270,22 +274,35 @@ ${projectContext}
           const args = this.parseToolArguments(call.function.arguments);
           let toolResult = '';
 
-          // Consecutive, not cumulative: read -> edit -> read -> edit is normal
-          // progress, and counting every repeat over a whole attempt aborted
-          // workers that were still getting somewhere.
+          // Three shapes of stall, and each hides from the other two checks.
+          // Consecutive alone missed an A/B/A/B npm-install oscillation (12
+          // rounds, max consecutive run of 1). Cumulative alone aborted workers
+          // that were legitimately re-reading between edits.
           const fingerprint = `${name}:${JSON.stringify(args)}`;
-          const seen = (lastFingerprint === fingerprint ? (callCounts.get(fingerprint) || 0) : 0) + 1;
-          callCounts.clear();
-          callCounts.set(fingerprint, seen);
+          const consecutive = (lastFingerprint === fingerprint ? (callCounts.get(`c:${fingerprint}`) || 0) : 0) + 1;
+          const total = (callCounts.get(`t:${fingerprint}`) || 0) + 1;
+          callCounts.set(`c:${fingerprint}`, consecutive);
+          callCounts.set(`t:${fingerprint}`, total);
           lastFingerprint = fingerprint;
-          if (seen >= LocalAgentWorker.REPEAT_ABORT) {
+          recentCalls.push(fingerprint);
+          if (recentCalls.length > LocalAgentWorker.CYCLE_WINDOW) recentCalls.shift();
+
+          const cycling = recentCalls.length === LocalAgentWorker.CYCLE_WINDOW
+            && new Set(recentCalls).size <= LocalAgentWorker.CYCLE_DISTINCT;
+          const seen = Math.max(consecutive, cycling ? LocalAgentWorker.REPEAT_ABORT : 0);
+          if (seen >= LocalAgentWorker.REPEAT_ABORT || total >= LocalAgentWorker.REPEAT_TOTAL_ABORT) {
             repeatedCall = fingerprint;
-            onOutput(`[LocalAgent] ⛔ Aborting: '${name}' repeated ${seen} times with identical arguments and no progress.`);
+            const why = cycling
+              ? `the last ${LocalAgentWorker.CYCLE_WINDOW} calls cycled between ${new Set(recentCalls).size} actions`
+              : consecutive >= LocalAgentWorker.REPEAT_ABORT
+                ? `'${name}' repeated ${consecutive} times in a row`
+                : `'${name}' called ${total} times with identical arguments`;
+            onOutput(`[LocalAgent] ⛔ Aborting: ${why} with no progress.`);
             break;
           }
-          if (seen >= LocalAgentWorker.REPEAT_WARN) {
-            onOutput(`[LocalAgent] ↻ '${name}' repeated ${seen}x — refusing to re-run it.`);
-            messages.push({ role: 'tool', content: `You have already called ${name} with these exact arguments ${seen} times and the result is earlier in this conversation. Do not call it again. Either make an edit with write_file/replace_lines/replace_content, read a different file or line range, or call finish_task.` } as any);
+          if (consecutive >= LocalAgentWorker.REPEAT_WARN) {
+            onOutput(`[LocalAgent] ↻ '${name}' repeated ${consecutive}x — refusing to re-run it.`);
+            messages.push({ role: 'tool', content: `You have already called ${name} with these exact arguments ${consecutive} times and the result is earlier in this conversation. Do not call it again. Either make an edit with write_file/replace_lines/replace_content, read a different file or line range, or call finish_task.` } as any);
             continue;
           }
 
@@ -387,7 +404,7 @@ ${projectContext}
       task_id: task.id,
       status: 'failure',
       summary: repeatedCall
-        ? `LocalAgent stalled: it repeated the same tool call (${repeatedCall.slice(0, 120)}) ${LocalAgentWorker.REPEAT_ABORT} times without making an edit.`
+        ? `LocalAgent stalled in a loop around ${repeatedCall.slice(0, 120)} without making progress. Try a different approach.`
         : sawToolCall
         ? 'LocalAgent stopped before calling finish_task or completing verification.'
         : `LocalAgent received no parseable tool calls from Ollama. Last response: ${lastModelContent.slice(0, 500)}`,
