@@ -34,10 +34,17 @@ describe('isLightTask routes on task shape, not agent_role', () => {
 });
 
 describe('local context window', () => {
-  it('no longer shrinks when escalating from 7B to 14B', () => {
-    const w = new LocalAgentWorker();
-    assert.equal(w.getSafeContextWindow('qwen2.5-coder:14b'), w.getSafeContextWindow('qwen2.5-coder:7b'));
-    assert.ok(w.getSafeContextWindow('qwen2.5-coder:14b') >= 8192);
+  it('keeps a large model inside RAM on a small host', () => {
+    // A 14B at 8192 is ~10 GB resident. On a 16 GB machine that swaps and the
+    // worker stops completing turns entirely — observed live, 0 tool calls in
+    // 5 minutes where the 7B was landing one every few seconds.
+    const w: any = new LocalAgentWorker();
+    const totalGb = os.totalmem() / 1024 ** 3;
+    const expected = totalGb < 32 ? 4096 : 8192;
+    assert.equal(w.getSafeContextWindow('qwen2.5-coder:14b'), expected);
+  });
+  it('never shrinks the window for a small model', () => {
+    assert.equal(new LocalAgentWorker().getSafeContextWindow('qwen2.5-coder:7b'), 8192);
   });
   it('honours SOFTFACTORY_LOCAL_NUM_CTX for low-memory machines', () => {
     process.env.SOFTFACTORY_LOCAL_NUM_CTX = '4096';

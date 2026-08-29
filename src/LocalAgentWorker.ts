@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import { execa } from 'execa';
 import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
@@ -48,13 +49,18 @@ export class LocalAgentWorker implements IWorker {
   }
 
   /**
-   * Escalating from 7B to 14B used to halve the context window, so the stronger
-   * model saw less. Keep one window for both and let low-memory machines lower
-   * it explicitly via SOFTFACTORY_LOCAL_NUM_CTX (4096 suits a 16 GB Mac).
+   * Size the window against the host, not the model's name. A 14B at 8192 is
+   * ~10 GB resident: on a 16 GB machine that swaps and a single turn stops
+   * completing at all, which is what the original hard-coded 4096 was guarding
+   * against. Keep that guard, but scope it to machines that actually need it so
+   * escalating to a stronger model is not a silent context downgrade elsewhere.
    */
-  getSafeContextWindow(_modelName: string): number {
+  getSafeContextWindow(modelName: string): number {
     const configured = Number(process.env.SOFTFACTORY_LOCAL_NUM_CTX);
     if (Number.isFinite(configured) && configured >= 2048) return Math.floor(configured);
+    const totalGb = os.totalmem() / 1024 ** 3;
+    const isLargeModel = /(?:1[0-9]|[2-9][0-9])b\b/i.test(modelName);
+    if (isLargeModel && totalGb < 32) return 4096;
     return 8192;
   }
 
