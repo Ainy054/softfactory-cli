@@ -403,7 +403,7 @@ export class Factory extends EventEmitter {
             for (const task of readyTasks) {
                 const branchName = `line/${task.id}`;
                 try {
-                    const worktreePath = await this.worktreeManager.create(task.id, branchName);
+                    const worktreePath = await this.worktreeManager.create(task.id, branchName, task.attempts > 0);
                     worktreeMap.set(task.id, worktreePath);
                 }
                 catch (e) {
@@ -437,7 +437,11 @@ export class Factory extends EventEmitter {
             }
             for (const task of readyTasks) {
                 const branchName = `line/${task.id}`;
-                await this.worktreeManager.cleanup(task.id, branchName);
+                // Keep the branch while the task still has retries left, so the
+                // next attempt continues from this one instead of from HEAD.
+                const willRetry = (task.status === 'failed' || task.status === 'pending')
+                    && task.attempts < Factory.MAX_TASK_ATTEMPTS;
+                await this.worktreeManager.cleanup(task.id, branchName, willRetry);
             }
             await this.saveState();
             if (environmentFault) {
@@ -516,7 +520,7 @@ export class Factory extends EventEmitter {
             this.emitEvent({ type: 'task:fail', task, feedback: task.last_feedback });
         };
         const branchName = `line/${task.id}`;
-        const worktreePath = preCreatedWorktree || await this.worktreeManager.create(task.id, branchName);
+        const worktreePath = preCreatedWorktree || await this.worktreeManager.create(task.id, branchName, task.attempts > 0);
         try {
             const { worker, model, provider, escalated } = await this.workerRegistry.resolveWorker(task);
             task.model = model;

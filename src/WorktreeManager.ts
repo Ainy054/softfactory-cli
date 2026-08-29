@@ -33,18 +33,38 @@ export class WorktreeManager {
     return 'master';
   }
 
-  async create(taskId: string, branchName: string): Promise<string> {
-    const worktreePath = path.join(this.worktreeBase, taskId);
+  /** True when a branch exists, i.e. a previous attempt left committed work. */
+  async branchExists(branchName: string): Promise<boolean> {
+    const { exitCode } = await execa('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`],
+      { cwd: this.baseDir, reject: false });
+    return exitCode === 0;
+  }
 
-    // Ensure no existing worktree or branch conflict
+  /**
+   * `resume` keeps a previous attempt's commits so a retry builds on them.
+   * Discarding them made every retry start from zero with only a 4,000-char
+   * feedback string, so a task needing more than one attempt's work could
+   * never converge.
+   */
+  async create(taskId: string, branchName: string, resume = false): Promise<string> {
+    const worktreePath = path.join(this.worktreeBase, taskId);
+    const reuse = resume && await this.branchExists(branchName);
+
+    // Ensure no existing worktree conflict
     await execa('git', ['worktree', 'remove', '-f', worktreePath], { cwd: this.baseDir, reject: false });
     await execa('git', ['worktree', 'prune'], { cwd: this.baseDir, reject: false });
-    await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir, reject: false });
+    if (!reuse) {
+      await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir, reject: false });
+    }
 
-    try {
-      await execa('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: this.baseDir });
-    } catch {
+    if (reuse) {
       await execa('git', ['worktree', 'add', worktreePath, branchName], { cwd: this.baseDir });
+    } else {
+      try {
+        await execa('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: this.baseDir });
+      } catch {
+        await execa('git', ['worktree', 'add', worktreePath, branchName], { cwd: this.baseDir });
+      }
     }
 
     // Hydrate untracked configs, env files, and templates
@@ -197,13 +217,16 @@ export class WorktreeManager {
     return stdout || stderr;
   }
 
-  async cleanup(taskId: string, branchName: string) {
+  /** `keepBranch` preserves a failed attempt's commits for the next retry. */
+  async cleanup(taskId: string, branchName: string, keepBranch = false) {
     const worktreePath = path.join(this.worktreeBase, taskId);
 
     try {
       await execa('git', ['worktree', 'remove', '-f', worktreePath], { cwd: this.baseDir });
       await execa('git', ['worktree', 'prune'], { cwd: this.baseDir });
-      await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir });
+      if (!keepBranch) {
+        await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir });
+      }
     } catch (e) {
       // Cleanup is best-effort
     }
