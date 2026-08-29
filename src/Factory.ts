@@ -52,7 +52,12 @@ export class Factory extends EventEmitter {
             : plannerProvider === 'local'
                 ? new LocalPlanner(plannerModel || (localModel === 'auto' ? 'qwen2.5-coder:14b' : localModel))
                 : new AgyPlanner(this.gemini);
-        this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, undefined, undefined, cloudProvider);
+        // An explicit --local-model must pin every local tier. Passing undefined
+        // left the light/heavy tiers on their hardcoded qwen defaults, so the
+        // chosen model was honoured on a task's first attempt and silently
+        // replaced by qwen2.5-coder:14b on every retry.
+        const pinnedLocal = localModel && localModel !== 'auto' && localModel !== 'tiered' ? localModel : undefined;
+        this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
         this.taskVerifier = new TaskVerifier();
         this.lessons = new LessonManager(baseDir);
         this.streamToTerminal = streamToTerminal;
