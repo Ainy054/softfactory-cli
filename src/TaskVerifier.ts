@@ -9,12 +9,20 @@ export interface ProjectTestConfig {
   neverTolerateFailures: string[];
 }
 
+export interface SuiteCounts {
+  filesFailed: number;
+  filesPassed: number;
+  testsFailed: number;
+  testsPassed: number;
+}
+
 export interface VerifierResult {
   executed: boolean;
   passed: boolean;
   testSummary: string;
   output: string;
   isCompileError?: boolean;
+  counts?: SuiteCounts;
 }
 
 export class TaskVerifier {
@@ -70,6 +78,13 @@ export class TaskVerifier {
   }
 
   async verify(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {
+    const result = await this.runVerification(worktreePath, task, fullSuite);
+    return result.executed && !result.counts
+      ? { ...result, counts: this.parseCounts(result.output) }
+      : result;
+  }
+
+  private async runVerification(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {
     const isGoProject = await this.exists(path.join(worktreePath, 'go.mod')) ||
       await this.exists(path.join(worktreePath, 'backend', 'go.mod'));
     const isNodeProject = await this.exists(path.join(worktreePath, 'package.json')) ||
@@ -514,6 +529,29 @@ export class TaskVerifier {
       if (entries.some(e => /\.(test|spec)\.(tsx?|jsx?)$/.test(e))) dirs.add(dir);
     }
     return [...dirs];
+  }
+
+  /**
+   * Pass/fail tallies scraped from runner output. "Does it pass" is too coarse
+   * a gate for a project that is already red: a task took the suite from
+   * 21 failed / 22 passed to 68 failed / 33 passed and merged, because both
+   * states are simply "failing".
+   */
+  parseCounts(output: string): SuiteCounts | undefined {
+    const files = output.match(/Test Files\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
+    const tests = output.match(/\n\s*Tests\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
+    if (files || tests) {
+      return {
+        filesFailed: Number(files?.[1] || 0), filesPassed: Number(files?.[2] || 0),
+        testsFailed: Number(tests?.[1] || 0), testsPassed: Number(tests?.[2] || 0),
+      };
+    }
+    const goFail = (output.match(/^--- FAIL:/gm) || []).length;
+    const goPass = (output.match(/^--- PASS:/gm) || []).length + (output.match(/^ok\s+\S+/gm) || []).length;
+    if (goFail || goPass) {
+      return { filesFailed: 0, filesPassed: 0, testsFailed: goFail, testsPassed: goPass };
+    }
+    return undefined;
   }
 
   private configCache = new Map<string, ProjectTestConfig>();

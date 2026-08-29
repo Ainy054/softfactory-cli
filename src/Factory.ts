@@ -33,6 +33,8 @@ export class Factory extends EventEmitter {
     buildStartCommit: string | undefined;
     saveLock = Promise.resolve();
     environmentFault: string | undefined;
+    /** Suite health on the base branch, so a task can be judged against it. */
+    baseline: import('./TaskVerifier.js').SuiteCounts | undefined;
     constructor(baseDir, apiKey, options: any = {}) {
         super();
         this.baseDir = baseDir;
@@ -375,6 +377,7 @@ export class Factory extends EventEmitter {
         await this.runWorkshopLoop();
     }
     async runWorkshopLoop() {
+        if (!this.baseline) await this.captureBaseline();
         while (this.hasUnfinishedTasks()) {
             const readyCandidates = this.getReadyTasks();
             if (readyCandidates.length === 0) {
@@ -624,6 +627,17 @@ export class Factory extends EventEmitter {
                 return null;
             }
             const verifierResult = await this.taskVerifier.verify(worktreePath, task, task.agent_role === 'builder');
+            // "Passing" is the wrong question for an already-red project. Ask
+            // instead whether this change made it worse: three merges here took
+            // the suite from 21 failures to 68 while every gate stayed green,
+            // because failing-before and failing-after look identical.
+            const regression = this.detectRegression(verifierResult);
+            if (regression) {
+                this.log(`REGRESSION: ${task.id} — ${regression}`);
+                processFailure(`This change makes the test suite worse: ${regression}. Fix it rather than adding to it.`);
+                await this.recordAttempt(task, 'regression', regression);
+                return null;
+            }
             this.emitEvent({
                 type: 'verifier:done',
                 taskId: task.id,
@@ -737,6 +751,48 @@ export class Factory extends EventEmitter {
         }
         if (/connection refused|no such host|ECONNREFUSED|dial tcp|could not connect/i.test(text)) return true;
         return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed/.test(text);
+    }
+
+    /**
+     * Non-null when this task's run is measurably worse than the baseline.
+     * More failures, or fewer passes, or a suite that suddenly collects far
+     * more files than the branch it started from.
+     */
+    detectRegression(result: { counts?: import('./TaskVerifier.js').SuiteCounts }): string | null {
+        const before = this.baseline;
+        const after = result.counts;
+        if (!before || !after) return null;
+        if (after.testsFailed > before.testsFailed) {
+            return `failing tests went from ${before.testsFailed} to ${after.testsFailed}`;
+        }
+        if (after.filesFailed > before.filesFailed) {
+            return `failing test files went from ${before.filesFailed} to ${after.filesFailed}`;
+        }
+        if (before.testsPassed > 0 && after.testsPassed < before.testsPassed) {
+            return `passing tests dropped from ${before.testsPassed} to ${after.testsPassed}`;
+        }
+        const beforeTotal = before.filesFailed + before.filesPassed;
+        const afterTotal = after.filesFailed + after.filesPassed;
+        if (beforeTotal > 0 && afterTotal > beforeTotal * 1.5) {
+            return `the suite now collects ${afterTotal} files where the baseline collected ${beforeTotal}`;
+        }
+        return null;
+    }
+
+    async captureBaseline() {
+        try {
+            const results = await this.taskVerifier.verifyAll(this.baseDir);
+            const counted = results.filter(r => r.counts);
+            if (counted.length === 0) return;
+            const totals = counted.reduce((acc, r) => ({
+                filesFailed: acc.filesFailed + r.counts!.filesFailed,
+                filesPassed: acc.filesPassed + r.counts!.filesPassed,
+                testsFailed: acc.testsFailed + r.counts!.testsFailed,
+                testsPassed: acc.testsPassed + r.counts!.testsPassed,
+            }), { filesFailed: 0, filesPassed: 0, testsFailed: 0, testsPassed: 0 });
+            this.baseline = totals;
+            this.log(`Baseline on ${this.defaultBranch}: ${totals.testsFailed} failing / ${totals.testsPassed} passing tests, ${totals.filesFailed} failing files`);
+        } catch { /* no baseline: the gate simply does not fire */ }
     }
 
     detectVerificationSabotage(diff: string): string | null {
