@@ -1,6 +1,7 @@
 import { execa } from 'execa';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import net from 'node:net';
 
 export interface VerifyResult {
   passed: boolean;
@@ -92,6 +93,18 @@ export class DockerVerifier {
 
     const logs: string[] = [];
 
+    // One Docker daemon is shared with every other project on the machine.
+    // Starting every service in a compose file without checking is how a
+    // verification run takes down a port another project is already serving.
+    const conflicts = await this.conflictingPorts(projectDir, composeFile);
+    if (conflicts.length > 0) {
+      return {
+        passed: false,
+        logs: `Docker verification skipped: host port(s) ${conflicts.join(', ')} are already in use by something else on this machine. `
+          + 'Starting this compose stack would collide with it. Free the ports, or run with --no-docker.',
+      };
+    }
+
     try {
       // Build
       logs.push('=== Docker Build ===');
@@ -150,6 +163,49 @@ export class DockerVerifier {
           { cwd: projectDir, timeout: 30000 });
       } catch {}
     }
+  }
+
+  /** Published host ports in the compose file that something is already serving. */
+  async conflictingPorts(projectDir: string, composeFile: string): Promise<number[]> {
+    const ports = await this.publishedPorts(projectDir, composeFile);
+    const taken: number[] = [];
+    for (const port of ports) {
+      if (await this.isPortInUse(port)) taken.push(port);
+    }
+    return taken;
+  }
+
+  /** Ask docker to resolve the file; fall back to reading it if that fails. */
+  private async publishedPorts(projectDir: string, composeFile: string): Promise<number[]> {
+    const ports = new Set<number>();
+    try {
+      const { stdout } = await execa('docker', ['compose', '-f', composeFile, 'config', '--format', 'json'],
+        { cwd: projectDir, timeout: 15000 });
+      for (const service of Object.values(JSON.parse(stdout).services || {}) as any[]) {
+        for (const entry of service.ports || []) {
+          const published = Number(entry?.published ?? entry);
+          if (Number.isInteger(published) && published > 0) ports.add(published);
+        }
+      }
+      return [...ports];
+    } catch { /* older docker, or an unresolvable file */ }
+
+    try {
+      const raw = await fs.readFile(composeFile, 'utf-8');
+      for (const match of raw.matchAll(/^\s*-\s*["']?(?:\d+\.\d+\.\d+\.\d+:)?(\d+):\d+/gm)) {
+        ports.add(Number(match[1]));
+      }
+    } catch { /* unreadable: assume no ports rather than blocking */ }
+    return [...ports];
+  }
+
+  private isPortInUse(port: number): Promise<boolean> {
+    return new Promise(resolve => {
+      const server = net.createServer();
+      server.once('error', (error: any) => resolve(error?.code === 'EADDRINUSE'));
+      server.once('listening', () => server.close(() => resolve(false)));
+      server.listen(port, '127.0.0.1');
+    });
   }
 
   private async getComposeFile(projectDir: string): Promise<string | null> {
