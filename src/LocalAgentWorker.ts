@@ -17,6 +17,8 @@ export class LocalAgentWorker implements IWorker {
   name = 'Local Agent Worker (Ollama Tools)';
   private defaultModel: string;
   private ollamaHost: string;
+  static readonly REPEAT_WARN = 3;
+  static readonly REPEAT_ABORT = 5;
   private readonly maxToolOutput = 6000;
   private readonly maxFileRead = 24000;
   private readonly verifier = new TaskVerifier();
@@ -211,6 +213,11 @@ ${projectContext}
     const changedFiles = new Set<string>();
     let sawToolCall = false;
     let lastModelContent = '';
+    // A degenerate ReAct loop repeats one identical call until the iteration cap.
+    // Observed: 30 byte-identical read_file calls per attempt, three attempts
+    // running, zero writes. Detect it and stop instead of burning the budget.
+    const callCounts = new Map<string, number>();
+    let repeatedCall: string | null = null;
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
 
@@ -261,6 +268,20 @@ ${projectContext}
           const name = call.function.name;
           const args = this.parseToolArguments(call.function.arguments);
           let toolResult = '';
+
+          const fingerprint = `${name}:${JSON.stringify(args)}`;
+          const seen = (callCounts.get(fingerprint) || 0) + 1;
+          callCounts.set(fingerprint, seen);
+          if (seen >= LocalAgentWorker.REPEAT_ABORT) {
+            repeatedCall = fingerprint;
+            onOutput(`[LocalAgent] ⛔ Aborting: '${name}' repeated ${seen} times with identical arguments and no progress.`);
+            break;
+          }
+          if (seen >= LocalAgentWorker.REPEAT_WARN) {
+            onOutput(`[LocalAgent] ↻ '${name}' repeated ${seen}x — refusing to re-run it.`);
+            messages.push({ role: 'tool', content: `You have already called ${name} with these exact arguments ${seen} times and the result is earlier in this conversation. Do not call it again. Either make an edit with write_file/replace_lines/replace_content, read a different file or line range, or call finish_task.` } as any);
+            continue;
+          }
 
           try {
             if (name === 'read_file') {
@@ -344,6 +365,7 @@ ${projectContext}
           await this.recordToolCall(diagnosticsDir, task, name, toolResult);
         }
         
+        if (repeatedCall) break;
         if (handoffResult) break;
 
       } catch (e: any) {
@@ -359,7 +381,9 @@ ${projectContext}
     return {
       task_id: task.id,
       status: 'failure',
-      summary: sawToolCall
+      summary: repeatedCall
+        ? `LocalAgent stalled: it repeated the same tool call (${repeatedCall.slice(0, 120)}) ${LocalAgentWorker.REPEAT_ABORT} times without making an edit.`
+        : sawToolCall
         ? 'LocalAgent stopped before calling finish_task or completing verification.'
         : `LocalAgent received no parseable tool calls from Ollama. Last response: ${lastModelContent.slice(0, 500)}`,
       files_changed: Array.from(changedFiles)
@@ -486,15 +510,36 @@ ${projectContext}
     const charBudget = Math.max(5000, Math.floor(contextWindow * 1.8));
     const total = messages.reduce((sum, message) => sum + (message.content || '').length, 0);
     if (total <= charBudget) return messages;
+
+    // The head was previously exempt from compaction, which made it the one
+    // message that could silently exceed the whole window. Budget it like any
+    // other, generously but finitely.
+    const headBudget = Math.floor(charBudget * 0.4);
+    const head = messages.slice(0, 2).map(message => {
+      const content = message.content || '';
+      return content.length > headBudget
+        ? { ...message, content: `${content.slice(0, headBudget)}\n...[context truncated — use read_file for anything not shown]` }
+        : message;
+    });
+
     let start = Math.max(2, messages.length - 4);
     while (start < messages.length && messages[start].role === 'tool') start++;
-    const recent = messages.slice(start).map(message => ({
-      ...message,
-      content: (message.content || '').length > 1000
-        ? `${(message.content || '').slice(0, 500)}\n...[older output compacted]...\n${(message.content || '').slice(-400)}`
-        : (message.content || ''),
-    }));
-    return [messages[0], messages[1], { role: 'system', content: 'Earlier tool output was compacted; re-read files or rerun focused checks as needed.' }, ...recent];
+
+    // The final tool result is what the model just asked for. Compacting it
+    // before the model has ever seen it is what produced the read_file livelock:
+    // the answer vanished, so the model asked the same question again.
+    const lastIndex = messages.length - 1;
+    const recent = messages.slice(start).map((message, offset) => {
+      const content = message.content || '';
+      const isNewestToolResult = start + offset === lastIndex && message.role === 'tool';
+      const limit = isNewestToolResult ? Math.floor(charBudget * 0.5) : 1000;
+      if (content.length <= limit) return { ...message, content };
+      return isNewestToolResult
+        ? { ...message, content: `${content.slice(0, limit)}\n...[truncated — read a specific line range to see more]` }
+        : { ...message, content: `${content.slice(0, 500)}\n...[older output compacted]...\n${content.slice(-400)}` };
+    });
+
+    return [...head, { role: 'system' as const, content: 'Earlier tool output was compacted; re-read files or rerun focused checks as needed.' }, ...recent];
   }
 
   private async recordToolCall(diagnosticsDir: string, task: Task, tool: string, result: string): Promise<void> {

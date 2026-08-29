@@ -534,7 +534,7 @@ export class Factory extends EventEmitter {
                 this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Analyzing previous failure...` });
             }
             await this.saveState();
-            const projectContext = await this.getProjectContext(worktreePath);
+            const projectContext = await this.getProjectContext(worktreePath, task);
             const preparation = await this.taskVerifier.prepare(worktreePath, task);
             if (!preparation.ok) {
                 processFailure(`Environment preparation failed: ${preparation.message || 'unknown setup error'}`);
@@ -828,28 +828,41 @@ export class Factory extends EventEmitter {
         });
         return eligible;
     }
-    async getProjectContext(worktreePath) {
+    static readonly MAX_PROJECT_CONTEXT_CHARS = 2000;
+    /**
+     * This lands verbatim in the worker's system prompt, which compaction is not
+     * allowed to shrink. A bare `git ls-files` put 648 paths / 25,712 chars there
+     * — twice a 4096-token window on its own — so the model could never retain a
+     * file it had just read and looped on read_file until the iteration cap.
+     * Send the neighbourhood of the task's own files, hard-capped.
+     */
+    async getProjectContext(worktreePath, task?: { files_hint?: string[]; creates_files?: string[] }) {
         const parts: string[] = [];
-        // Include .gitignore
-        try {
-            const gitignore = await fs.readFile(path.join(worktreePath, '.gitignore'), 'utf-8');
-            parts.push(`.gitignore:\n${gitignore}`);
-        }
-        catch { }
-        // Include file listing
+        let tracked: string[] = [];
         try {
             const { stdout } = await execa('git', ['ls-files'], { cwd: worktreePath });
-            if (stdout.trim())
-                parts.push(`Tracked files:\n${stdout}`);
+            tracked = stdout.split('\n').filter(Boolean);
         }
         catch { }
-        // Include package.json if it exists
+        if (tracked.length) {
+            const targets = [...(task?.files_hint || []), ...(task?.creates_files || [])];
+            const dirs = new Set(targets.map(f => path.dirname(f)));
+            const relevant = dirs.size > 0
+                ? tracked.filter(f => dirs.has(path.dirname(f)))
+                : tracked;
+            const shown = relevant.slice(0, 60);
+            const omitted = tracked.length - shown.length;
+            parts.push(`Files near this task (${shown.length} of ${tracked.length} tracked${omitted > 0 ? `; ${omitted} not listed — use read_file on any path you need` : ''}):\n${shown.join('\n')}`);
+        }
         try {
             const pkg = await fs.readFile(path.join(worktreePath, 'package.json'), 'utf-8');
-            parts.push(`package.json:\n${pkg}`);
+            parts.push(`package.json:\n${pkg.slice(0, 800)}`);
         }
         catch { }
-        return parts.join('\n\n');
+        const context = parts.join('\n\n');
+        return context.length > Factory.MAX_PROJECT_CONTEXT_CHARS
+            ? `${context.slice(0, Factory.MAX_PROJECT_CONTEXT_CHARS)}\n...[project context truncated]`
+            : context;
     }
     async getRepositoryFiles(): Promise<string[]> {
         const { stdout } = await execa('git', ['ls-files'], { cwd: this.baseDir });
