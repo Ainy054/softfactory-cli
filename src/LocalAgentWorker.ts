@@ -305,17 +305,14 @@ ${projectContext}
                 throw new Error(`Invalid line range ${start}-${end}; file has ${lines.length} lines.`);
               }
               lines.splice(start - 1, end - start + 1, String(args.replacement_content));
-              await fs.writeFile(fullPath, lines.join('\n'), 'utf-8');
-              changedFiles.add(args.filepath);
-              toolResult = 'Lines successfully replaced.';
+              toolResult = await this.writeChecked(fullPath, args.filepath, lines.join('\n'), content, changedFiles, 'Lines successfully replaced.');
             } else if (name === 'write_file') {
               onOutput(`[LocalAgent] ✍️ Writing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               await fs.mkdir(path.dirname(fullPath), { recursive: true });
-              await fs.writeFile(fullPath, args.content, 'utf-8');
-              changedFiles.add(args.filepath);
-              toolResult = 'File successfully written.';
+              const previous = await fs.readFile(fullPath, 'utf-8').catch(() => null);
+              toolResult = await this.writeChecked(fullPath, args.filepath, String(args.content), previous, changedFiles, 'File successfully written.');
             } else if (name === 'replace_content') {
               onOutput(`[LocalAgent] ✂️ Editing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
@@ -323,9 +320,7 @@ ${projectContext}
               const content = await fs.readFile(fullPath, 'utf-8');
               if (content.includes(args.target_content)) {
                 const newContent = content.replace(args.target_content, args.replacement_content);
-                await fs.writeFile(fullPath, newContent, 'utf-8');
-                changedFiles.add(args.filepath);
-                toolResult = 'Content successfully replaced.';
+                toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.');
               } else {
                 toolResult = 'ERROR: target_content not found in file. Ensure exact whitespace match.';
                 onOutput(`[LocalAgent] ❌ target_content not found in ${args.filepath}`);
@@ -388,6 +383,43 @@ ${projectContext}
         : `LocalAgent received no parseable tool calls from Ollama. Last response: ${lastModelContent.slice(0, 500)}`,
       files_changed: Array.from(changedFiles)
     };
+  }
+
+  /**
+   * Writes an edit, then checks the file is still parseable. A dropped comma in
+   * package.json used to be committed, and every later attempt then died in
+   * `npm ci` before a model could be asked to repair it. Reject the edit at the
+   * point of damage instead.
+   */
+  private async writeChecked(
+    fullPath: string,
+    relativePath: string,
+    content: string,
+    previous: string | null,
+    changedFiles: Set<string>,
+    successMessage: string,
+  ): Promise<string> {
+    await fs.writeFile(fullPath, content, 'utf-8');
+    const invalid = this.structuralError(relativePath, content);
+    if (invalid) {
+      if (previous === null) await fs.rm(fullPath, { force: true });
+      else await fs.writeFile(fullPath, previous, 'utf-8');
+      return `ERROR: edit rejected and reverted — ${relativePath} would no longer be valid: ${invalid}. Re-read the file and make a corrected edit.`;
+    }
+    changedFiles.add(relativePath);
+    return successMessage;
+  }
+
+  /** Non-null when the new content is structurally broken for its file type. */
+  private structuralError(relativePath: string, content: string): string | null {
+    if (!/\.json$/i.test(relativePath)) return null;
+    if (!content.trim()) return 'the file is empty';
+    try {
+      JSON.parse(content);
+      return null;
+    } catch (error: any) {
+      return `invalid JSON (${error.message})`;
+    }
   }
 
   private parseToolArguments(raw: unknown): any {

@@ -541,9 +541,14 @@ export class Factory extends EventEmitter {
             const projectContext = await this.getProjectContext(worktreePath, task);
             const preparation = await this.taskVerifier.prepare(worktreePath, task);
             if (!preparation.ok) {
-                processFailure(`Environment preparation failed: ${preparation.message || 'unknown setup error'}`);
-                await this.recordAttempt(task, 'environment', preparation.message || 'setup failed');
-                return null;
+                // Usually a file an earlier attempt broke. Ending the attempt here
+                // means no model ever sees the error, so the damage is permanent
+                // and each remaining retry dies in setup within a second. Hand it
+                // to the worker as the first thing to fix instead.
+                const setupError = preparation.message || 'unknown setup error';
+                this.log(`ENVIRONMENT: ${task.id} — setup failed, asking the worker to repair it: ${setupError.slice(0, 200)}`);
+                await this.recordAttempt(task, 'environment', setupError);
+                task.last_feedback = `Environment setup is failing and you must fix this before anything else:\n${setupError}\n\n${task.last_feedback || ''}`.slice(0, 4000);
             }
             const handoff = await worker.execute(task, worktreePath, {
                 streamToTerminal: this.streamToTerminal,
