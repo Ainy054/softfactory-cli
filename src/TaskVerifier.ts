@@ -150,13 +150,47 @@ export class TaskVerifier {
       } catch {}
     }
 
+    if (await this.hasTestFiles(worktreePath)) {
+      return {
+        executed: false,
+        passed: false,
+        testSummary: 'The project contains test files but no runner could be detected. Nothing was verified.',
+        output: '',
+      };
+    }
     return {
       executed: false,
       passed: true,
-      testSummary: 'No automated test runner detected for this project',
+      testSummary: 'No automated test runner detected and no test files found',
       output: '',
     };
   }
+
+  /** Cheap check for whether this project has tests at all, tracked or not. */
+  private async hasTestFiles(rootDir: string): Promise<boolean> {
+    const cached = this.testFileCache.get(rootDir);
+    if (cached !== undefined) return cached;
+    const pattern = /(\.|_)(test|spec)\.(tsx?|jsx?|py|go|rs)$|_test\.go$/i;
+    const skip = new Set(['node_modules', '.git', 'dist', 'build', 'vendor', 'target', '.next', 'coverage']);
+    const walk = async (dir: string, depth: number): Promise<boolean> => {
+      if (depth > 6) return false;
+      const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (skip.has(entry.name)) continue;
+          if (await walk(path.join(dir, entry.name), depth + 1)) return true;
+        } else if (pattern.test(entry.name)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const found = await walk(rootDir, 0);
+    this.testFileCache.set(rootDir, found);
+    return found;
+  }
+
+  private testFileCache = new Map<string, boolean>();
 
   private async verifyNode(worktreePath: string, task: Task | undefined, testEnv: NodeJS.ProcessEnv, fullSuite = false): Promise<VerifierResult> {
     const isFrontendHint = task?.files_hint.some(f => f.startsWith('frontend/'));
@@ -252,14 +286,26 @@ export class TaskVerifier {
         };
       }
 
-      return { executed: false, passed: true, testSummary: 'No npm test script configured', output: '' };
+      // "No runner configured" is only benign when the project genuinely has no
+      // tests. godo's T1 renamed `test` to `test:unit`, which made verification
+      // vacuous, and the task that was supposed to fix the test setup passed by
+      // deleting its entry point and merged.
+      if (await this.hasTestFiles(nodeDir)) {
+        return {
+          executed: false,
+          passed: false,
+          testSummary: 'No "test" script in package.json, but the project contains test files. Verification cannot run.',
+          output: 'Restore a "test" script that runs the unit suite.',
+        };
+      }
+      return { executed: false, passed: true, testSummary: 'No npm test script configured and no test files found', output: '' };
     } catch (e: any) {
       if (e.exitCode === 127 || (e.message && e.message.includes('command not found'))) {
         return {
           executed: false,
-          passed: true,
-          testSummary: 'Node/TS: test runner binary not installed locally (skipping npm test)',
-          output: '',
+          passed: false,
+          testSummary: 'Node/TS: the test runner binary is not installed, so nothing was verified',
+          output: (e.stderr || e.stdout || e.message || '').slice(0, 2000),
         };
       }
 

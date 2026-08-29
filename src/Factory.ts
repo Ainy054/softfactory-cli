@@ -618,6 +618,17 @@ export class Factory extends EventEmitter {
                 processFailure('Changes were committed but diff against target branch is empty. This is likely a git state desync.');
                 return null;
             }
+            // A task must not be able to pass by removing the thing that checks
+            // it. godo's T1 renamed the `test` script to `test:unit`, which made
+            // verification report "no test script configured -> pass", and it
+            // merged with its acceptance criteria unmet.
+            const sabotage = this.detectVerificationSabotage(diff);
+            if (sabotage) {
+                this.log(`REJECTED: ${task.id} — ${sabotage}`);
+                processFailure(`This change disables the project's own verification: ${sabotage}. Fix the underlying problem instead of removing the check.`);
+                await this.recordAttempt(task, 'verification_sabotage', sabotage);
+                return null;
+            }
             this.log(`Inspection: Reviewing ${task.id}`);
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector reviewing diff...` });
             // Local mode must remain offline: the automated verifier is the
@@ -669,6 +680,24 @@ export class Factory extends EventEmitter {
             await this.recordAttempt(task, 'worker_error', e.message);
             return null;
         }
+    }
+    /**
+     * Non-null when a diff removes a project's ability to verify itself:
+     * deleting the `test` script, or emptying a test file.
+     */
+    detectVerificationSabotage(diff: string): string | null {
+        const removedTestScript = /^-\s*"test"\s*:/m.test(diff);
+        const addedTestScript = /^\+\s*"test"\s*:/m.test(diff);
+        if (removedTestScript && !addedTestScript) {
+            return 'the "test" script was removed from package.json';
+        }
+        const deletedTestFiles = [...diff.matchAll(/^deleted file mode .*\n(?:.*\n)*?^--- a\/(\S+)/gm)]
+            .map(match => match[1])
+            .filter(file => /(\.|_)(test|spec)\.[a-z]+$|_test\.go$/i.test(file));
+        if (deletedTestFiles.length > 0) {
+            return `test files were deleted: ${deletedTestFiles.slice(0, 5).join(', ')}`;
+        }
+        return null;
     }
     async recordAttempt(task, category, detail) {
         try {
