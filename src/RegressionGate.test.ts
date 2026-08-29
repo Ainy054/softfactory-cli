@@ -73,3 +73,36 @@ describe('a task may not make the suite worse', () => {
     assert.equal(f.detectRegression({}), null);
   });
 });
+
+// Real vitest output is coloured and enormous; its summary is the last line.
+const E = String.fromCharCode(27);
+const ANSI_TAIL = ` ${E}[2m Test Files ${E}[22m ${E}[31m43 failed${E}[39m ${E}[90m(43)${E}[39m\n`
+  + `      ${E}[2m Tests ${E}[22m ${E}[31m388 failed${E}[39m ${E}[90m(388)${E}[39m\n`
+  + `   ${E}[2m Duration ${E}[22m 7.47s\n`;
+
+describe('counts survive real runner output', () => {
+  const v = new TaskVerifier();
+
+  it('reads a coloured vitest summary', () => {
+    // Without stripping ANSI this parsed as 0/0/0/0 and the gate went inert.
+    assert.deepEqual(v.parseCounts(ANSI_TAIL),
+      { filesFailed: 43, filesPassed: 0, testsFailed: 388, testsPassed: 0 });
+  });
+
+  it('keeps the tail when trimming, because that is where the summary is', () => {
+    // Measured on godo: the summary begins at char 117,586 of 117,780.
+    const huge = 'noise\n'.repeat(20000) + ANSI_TAIL;
+    const clipped = v.clip(huge);
+    assert.ok(clipped.length < 5000, 'must actually trim');
+    assert.equal(v.parseCounts(clipped)?.filesFailed, 43, 'the summary must survive trimming');
+  });
+
+  it('keeps the head too, where compile errors appear', () => {
+    const huge = 'error TS2345: Argument of type\n' + 'noise\n'.repeat(20000) + ANSI_TAIL;
+    assert.match(v.clip(huge), /error TS2345/);
+  });
+
+  it('a short output is returned untouched', () => {
+    assert.equal(v.clip('brief'), 'brief');
+  });
+});

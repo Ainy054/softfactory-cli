@@ -49,7 +49,7 @@ export class TaskVerifier {
       });
       return { ok: true };
     } catch (e: any) {
-      return { ok: false, message: (e.stderr || e.stdout || e.message || 'npm ci failed').slice(0, 2000) };
+      return { ok: false, message: (e.stderr || e.stdout || e.message || 'npm ci failed') };
     }
   }
 
@@ -134,7 +134,7 @@ export class TaskVerifier {
           executed: true,
           passed: true,
           testSummary: 'pytest suite passed',
-          output: (stdout || stderr).slice(0, 2000),
+          output: this.clip(stdout || stderr),
         };
       } catch (e: any) {
         if (e.exitCode !== undefined) {
@@ -142,7 +142,7 @@ export class TaskVerifier {
             executed: true,
             passed: false,
             testSummary: 'pytest failure',
-            output: (e.stdout || e.stderr || e.message).slice(0, 2000),
+            output: this.clip(e.stdout || e.stderr || e.message),
           };
         }
       }
@@ -160,14 +160,14 @@ export class TaskVerifier {
           executed: true,
           passed: true,
           testSummary: 'cargo test passed',
-          output: (stdout || stderr).slice(0, 2000),
+          output: this.clip(stdout || stderr),
         };
       } catch (e: any) {
         return {
           executed: true,
           passed: false,
           testSummary: 'cargo test failure',
-          output: (e.stdout || e.stderr || e.message).slice(0, 2000),
+          output: this.clip(e.stdout || e.stderr || e.message),
         };
       }
     }
@@ -184,7 +184,7 @@ export class TaskVerifier {
           executed: true,
           passed: true,
           testSummary: 'make test passed',
-          output: (stdout || stderr).slice(0, 2000),
+          output: this.clip(stdout || stderr),
         };
       } catch {}
     }
@@ -312,7 +312,7 @@ export class TaskVerifier {
               executed: true,
               passed: true,
               testSummary: 'Task touches no test directory; suite compiles and collects. Pre-existing assertion failures were not attributed to this task.',
-              output: out.slice(0, 2000),
+              output: this.clip(out),
             };
           }
           throw runError;
@@ -321,7 +321,7 @@ export class TaskVerifier {
           executed: true,
           passed: true,
           testSummary: 'Node/TS test suite passed',
-          output: (stdout || stderr || 'npm test passed').slice(0, 2000),
+          output: this.clip(stdout || stderr || 'npm test passed'),
         };
       }
 
@@ -344,7 +344,7 @@ export class TaskVerifier {
           executed: false,
           passed: false,
           testSummary: 'Node/TS: the test runner binary is not installed, so nothing was verified',
-          output: (e.stderr || e.stdout || e.message || '').slice(0, 2000),
+          output: (e.stderr || e.stdout || e.message || ''),
         };
       }
 
@@ -352,7 +352,7 @@ export class TaskVerifier {
         executed: true,
         passed: false,
         testSummary: 'npm test failure',
-        output: (e.stdout || e.stderr || e.message).slice(0, 2000),
+        output: this.clip(e.stdout || e.stderr || e.message),
       };
     }
   }
@@ -372,13 +372,13 @@ export class TaskVerifier {
         timeout: 90000,
       });
     } catch (e: any) {
-      const out = (e.stdout || e.stderr || e.message).slice(0, 2000);
+      const out = this.clip(e.stdout || e.stderr || e.message);
       return {
         executed: true,
         passed: false,
         isCompileError: true,
         testSummary: 'Go compilation/vet failure',
-        output: out,
+        output: this.clip(out),
       };
     }
 
@@ -404,10 +404,10 @@ export class TaskVerifier {
           executed: true,
           passed: true,
           testSummary: `Go unit tests passed (${packages.join(', ')})`,
-          output: out.slice(0, 2000),
+          output: this.clip(out),
         };
       } catch (e: any) {
-        const out = (e.stdout || e.stderr || e.message).slice(0, 2000);
+        const out = this.clip(e.stdout || e.stderr || e.message);
 
         // Check if failure is only due to missing offline database (port 5433 connection refused)
         // when our targeted tests passed or when running a pure unit task
@@ -422,7 +422,7 @@ export class TaskVerifier {
             executed: true,
             passed: true,
             testSummary: `Go unit tests passed (ignoring offline DB integration failures in unrelated tests)`,
-            output: out,
+            output: this.clip(out),
           };
         }
 
@@ -430,7 +430,7 @@ export class TaskVerifier {
           executed: true,
           passed: false,
           testSummary: `Go test failure in ${packages.join(', ')}`,
-          output: out,
+          output: this.clip(out),
         };
       }
     }
@@ -447,14 +447,14 @@ export class TaskVerifier {
         executed: true,
         passed: true,
         testSummary: 'Go unit & package tests passed',
-        output: out.slice(0, 2000),
+        output: this.clip(out),
       };
     } catch (e: any) {
       return {
         executed: true,
         passed: false,
         testSummary: 'Go test failure',
-        output: (e.stdout || e.stderr || e.message).slice(0, 2000),
+        output: this.clip(e.stdout || e.stderr || e.message),
       };
     }
   }
@@ -537,7 +537,25 @@ export class TaskVerifier {
    * 21 failed / 22 passed to 68 failed / 33 passed and merged, because both
    * states are simply "failing".
    */
-  parseCounts(output: string): SuiteCounts | undefined {
+  /**
+   * Keeps the head (where compile errors appear) and the tail (where every
+   * runner prints its tally). Truncating to the first 2,000 characters meant
+   * vitest's summary — at character 117,586 of 117,780 — was never visible, so
+   * parseCounts always returned undefined and the regression gate was silently
+   * inert while three broken merges went through it.
+   */
+  clip(output: string, limit = 4000): string {
+    const text = String(output ?? '');
+    if (text.length <= limit) return text;
+    const head = Math.floor(limit * 0.4);
+    return `${text.slice(0, head)}\n...[trimmed]...\n${text.slice(-(limit - head))}`;
+  }
+
+  parseCounts(raw: string): SuiteCounts | undefined {
+    // Vitest colours its summary, so the line reads
+    // "\u001b[2m Test Files \u001b[22m \u001b[31m43 failed" and \s+ never
+    // matches across the escape codes.
+    const output = String(raw ?? '').replace(/\u001b\[[0-9;]*m/g, '');
     const files = output.match(/Test Files\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
     const tests = output.match(/\n\s*Tests\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
     if (files || tests) {
