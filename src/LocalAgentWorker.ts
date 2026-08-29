@@ -604,11 +604,13 @@ ${projectContext}
 
   private async probeToolSupport(model: string, tools: any[], contextWindow: number): Promise<boolean> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
+    // A thinking model spends tokens before its first tool call; 20s at 2048
+    // tokens rejected gemma4:12b, which emits perfectly good tool_calls.
+    const timer = setTimeout(() => controller.abort(), 90000);
     try {
       const response = await fetch(`${this.ollamaHost}/api/chat`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Call read_file for probe.txt now.' }], tools: tools.slice(0, 1), stream: false, options: { temperature: 0, num_ctx: Math.min(contextWindow, 2048) } }),
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Call read_file for probe.txt now.' }], tools: tools.slice(0, 1), stream: false, options: { temperature: 0, num_ctx: contextWindow } }),
       });
       if (!response.ok) return false;
       const data = await response.json() as any;
