@@ -36,6 +36,8 @@ export interface PlanningInput {
   memoryPatterns: string;
   featureHistory: string;
   repositoryFiles: Set<string>;
+  /** Who will execute these tasks. A 7B/14B needs far smaller units than a frontier model. */
+  workerCapability?: 'local' | 'cloud';
 }
 
 export interface IPlanner {
@@ -83,6 +85,14 @@ Planning rules:
 - Never transfer behavior from one component or domain to another.
 - Reference an existing path only when it appears in Repository Context. Put justified new paths in both files_hint and creates_files.
 - Prefer cohesive tasks over many sequential tasks editing the same file. Keep each task under roughly 300 changed lines.
+${input.workerCapability === 'local' ? `
+LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not a frontier model:
+- At most 2 files in files_hint per task, counting creates_files. Split anything larger.
+- One concern per task. Do not bundle unrelated changes (a config split, a new lint config and dependency metadata are three tasks, not one).
+- At most 3 acceptance_criteria per task, each checkable by running one command.
+- Keep description under 250 characters. A long brief is a task that should have been split.
+- Sequencing is cheap; a large task is not. Prefer more, smaller, dependency-ordered tasks.
+` : ''}
 - Put tests before dependent implementation where useful. Put the final cross-cutting quality gate in the last phase.
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria must be observable outcomes. verification must contain concrete commands or inspection checks.

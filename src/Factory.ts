@@ -303,7 +303,7 @@ export class Factory extends EventEmitter {
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'local' ? 'local' : 'cloud' });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -355,7 +355,7 @@ export class Factory extends EventEmitter {
         const featureHistory = history.length > 0
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'local' ? 'local' : 'cloud' });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
