@@ -69,7 +69,7 @@ export class LocalAgentWorker implements IWorker {
     return 8192;
   }
 
-  private buildSystemPrompt(task: Task, projectContext: string): string {
+  private buildSystemPrompt(task: Task, projectContext: string, projectRoots: string[] = []): string {
     return `You are a precision autonomous software engineer working in an isolated Git worktree.
 Your goal is to implement the requested feature or fix the bug.
 
@@ -79,6 +79,8 @@ CRITICAL INSTRUCTIONS:
 3. When using 'replace_content', provide the EXACT target content you want to replace, including all whitespace.
 4. If tests are failing, read the test files, understand the requirements, and modify the code.
 5. When you are completely finished, call 'finish_task'.
+6. Shell operators (&&, ;, |) are NOT available. To run a command inside a subproject, pass run_command's working_dir, e.g. {"command": "npm test", "working_dir": "frontend"}.
+${projectRoots.length ? `\nPACKAGE ROOTS (run commands with the matching working_dir):\n${projectRoots.map(r => `- ${r}`).join('\n')}` : ''}
 
 PROJECT CONTEXT:
 ${projectContext}
@@ -105,7 +107,7 @@ ${projectContext}
     }
 
     let messages: Message[] = [
-      { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '') },
+      { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
       { role: 'user', content: userPrompt }
     ];
 
@@ -178,11 +180,12 @@ ${projectContext}
         type: 'function',
         function: {
           name: 'run_command',
-          description: 'Run a shell command in the repository (e.g. tests or linters).',
+          description: 'Run a command (tests, linters). Shell operators are not available, so use working_dir to run inside a subproject rather than chaining with cd.',
           parameters: {
             type: 'object',
             properties: {
-              command: { type: 'string' }
+              command: { type: 'string' },
+              working_dir: { type: 'string', description: 'Directory to run in, relative to the repository root (e.g. "frontend"). Defaults to the root.' }
             },
             required: ['command']
           }
@@ -357,7 +360,12 @@ ${projectContext}
               this.assertAllowedCommand(args.command);
               try {
                 const [executable, ...commandArgs] = this.parseCommand(args.command);
-                const { stdout, stderr } = await execa(executable, commandArgs, { cwd: worktreePath, timeout: 30000, env: this.safeCommandEnv() });
+                // `cd x && y` is blocked by the allowlist, so without this a
+                // monorepo worker could never run the project's own tests: godo
+                // keeps package.json in frontend/, and every `npm test` at the
+                // worktree root died with ENOENT.
+                const cwd = this.resolveWorkingDir(worktreePath, args.working_dir);
+                const { stdout, stderr } = await execa(executable, commandArgs, { cwd, timeout: 30000, env: this.safeCommandEnv() });
                 toolResult = this.truncateToolResult(`STDOUT:\n${stdout}\nSTDERR:\n${stderr}`);
               } catch (cmdErr: any) {
                 toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
@@ -422,6 +430,32 @@ ${projectContext}
    * Turns a failed exact-match edit into something actionable: the numbered
    * lines around the model's best guess, and an explicit push to replace_lines.
    */
+  /** A subdirectory of the worktree to run a command in. Never outside it. */
+  private resolveWorkingDir(worktreePath: string, raw: unknown): string {
+    const root = path.resolve(worktreePath);
+    if (raw === undefined || raw === null || raw === '') return root;
+    if (typeof raw !== 'string' || path.isAbsolute(raw)) throw new Error('working_dir must be a relative path inside the repository.');
+    const target = path.resolve(root, raw);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) throw new Error('working_dir escapes the task worktree.');
+    return target;
+  }
+
+  /** Directories holding a package manifest, so the model knows where to run things. */
+  private async projectRoots(worktreePath: string): Promise<string[]> {
+    const roots: string[] = [];
+    const candidates = ['.', 'frontend', 'backend', 'web', 'client', 'server', 'app', 'api'];
+    for (const dir of candidates) {
+      for (const manifest of ['package.json', 'go.mod', 'pyproject.toml', 'Cargo.toml']) {
+        try {
+          await fs.access(path.join(worktreePath, dir, manifest));
+          roots.push(`${dir === '.' ? '(root)' : dir} -> ${manifest}`);
+          break;
+        } catch { /* not here */ }
+      }
+    }
+    return roots;
+  }
+
   private matchFailureGuidance(filepath: string, content: string, target: string): string {
     const lines = content.split(/\r?\n/);
     const needle = (target.split(/\r?\n/).find(line => line.trim().length > 3) || '').trim();
