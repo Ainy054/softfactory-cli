@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { Lesson, LessonSchema, Task } from './types.js';
 export class LessonManager {
@@ -21,5 +22,18 @@ export class LessonManager {
     return (await this.read()).filter(l => l.status === 'active').sort((a, b) => b.confidence - a.confidence).slice(0, limit).map(l => `- ${l.lesson}`).join('\n') || 'No verified lessons yet.';
   }
   private async read(): Promise<Lesson[]> { try { return JSON.parse(await fs.readFile(this.path, 'utf8')).lessons.map((l: unknown) => LessonSchema.parse(l)); } catch { return []; } }
-  private async write(lessons: Lesson[]): Promise<void> { const tmp = `${this.path}.tmp`; await fs.writeFile(tmp, JSON.stringify({ lessons }, null, 2)); await fs.rename(tmp, this.path); }
+  /**
+   * A fixed .tmp name races: four workers in one phase share this file, and one
+   * renaming it out from under another produced ENOENT mid-run. Give each write
+   * its own temp file, and never let a lesson write fail a task.
+   */
+  private async write(lessons: Lesson[]): Promise<void> {
+    const tmp = `${this.path}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify({ lessons }, null, 2));
+      await fs.rename(tmp, this.path);
+    } catch {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    }
+  }
 }
