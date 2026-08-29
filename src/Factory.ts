@@ -603,6 +603,18 @@ export class Factory extends EventEmitter {
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Running verification tests...` });
             // A 'builder' task is the plan's quality gate; scoping it to its own
             // files_hint is what let a broken suite ship as 12/12 completed.
+            // Check for a disabled gate before running the gate. Otherwise a task
+            // that deleted the test script is told "no test script configured",
+            // which reads like a project misconfiguration rather than something
+            // it just did.
+            const earlyDiff = await this.getDiff(branchName);
+            const sabotage = this.detectVerificationSabotage(earlyDiff);
+            if (sabotage) {
+                this.log(`REJECTED: ${task.id} — ${sabotage}`);
+                processFailure(`This change disables the project's own verification: ${sabotage}. Restore it and fix the underlying problem instead.`);
+                await this.recordAttempt(task, 'verification_sabotage', sabotage);
+                return null;
+            }
             const verifierResult = await this.taskVerifier.verify(worktreePath, task, task.agent_role === 'builder');
             this.emitEvent({
                 type: 'verifier:done',
@@ -635,13 +647,6 @@ export class Factory extends EventEmitter {
             // it. godo's T1 renamed the `test` script to `test:unit`, which made
             // verification report "no test script configured -> pass", and it
             // merged with its acceptance criteria unmet.
-            const sabotage = this.detectVerificationSabotage(diff);
-            if (sabotage) {
-                this.log(`REJECTED: ${task.id} — ${sabotage}`);
-                processFailure(`This change disables the project's own verification: ${sabotage}. Fix the underlying problem instead of removing the check.`);
-                await this.recordAttempt(task, 'verification_sabotage', sabotage);
-                return null;
-            }
             this.log(`Inspection: Reviewing ${task.id}`);
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector reviewing diff...` });
             // Local mode must remain offline: the automated verifier is the

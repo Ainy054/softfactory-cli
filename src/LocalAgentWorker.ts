@@ -217,6 +217,7 @@ ${projectContext}
     // Observed: 30 byte-identical read_file calls per attempt, three attempts
     // running, zero writes. Detect it and stop instead of burning the budget.
     const callCounts = new Map<string, number>();
+    let lastFingerprint: string | null = null;
     let repeatedCall: string | null = null;
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
@@ -269,9 +270,14 @@ ${projectContext}
           const args = this.parseToolArguments(call.function.arguments);
           let toolResult = '';
 
+          // Consecutive, not cumulative: read -> edit -> read -> edit is normal
+          // progress, and counting every repeat over a whole attempt aborted
+          // workers that were still getting somewhere.
           const fingerprint = `${name}:${JSON.stringify(args)}`;
-          const seen = (callCounts.get(fingerprint) || 0) + 1;
+          const seen = (lastFingerprint === fingerprint ? (callCounts.get(fingerprint) || 0) : 0) + 1;
+          callCounts.clear();
           callCounts.set(fingerprint, seen);
+          lastFingerprint = fingerprint;
           if (seen >= LocalAgentWorker.REPEAT_ABORT) {
             repeatedCall = fingerprint;
             onOutput(`[LocalAgent] ⛔ Aborting: '${name}' repeated ${seen} times with identical arguments and no progress.`);
@@ -322,8 +328,12 @@ ${projectContext}
                 const newContent = content.replace(args.target_content, args.replacement_content);
                 toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.');
               } else {
-                toolResult = 'ERROR: target_content not found in file. Ensure exact whitespace match.';
-                onOutput(`[LocalAgent] ❌ target_content not found in ${args.filepath}`);
+                // Telling a small model to "match whitespace exactly" is telling
+                // it to retry the thing it just proved it cannot do: 14 of 15
+                // edits failed this way in a row while replace_lines went
+                // unused. Hand it line numbers and point at that tool instead.
+                toolResult = this.matchFailureGuidance(args.filepath, content, String(args.target_content ?? ''));
+                onOutput(`[LocalAgent] ❌ target_content not found in ${args.filepath} — suggesting replace_lines`);
               }
             } else if (name === 'run_command') {
               onOutput(`[LocalAgent] 🖥️ Running: ${args.command}`);
@@ -357,7 +367,7 @@ ${projectContext}
             role: 'tool',
             content: toolResult
           } as any);
-          await this.recordToolCall(diagnosticsDir, task, name, toolResult);
+          await this.recordToolCall(diagnosticsDir, task, name, toolResult, args);
         }
         
         if (repeatedCall) break;
@@ -391,6 +401,32 @@ ${projectContext}
    * `npm ci` before a model could be asked to repair it. Reject the edit at the
    * point of damage instead.
    */
+  /**
+   * Turns a failed exact-match edit into something actionable: the numbered
+   * lines around the model's best guess, and an explicit push to replace_lines.
+   */
+  private matchFailureGuidance(filepath: string, content: string, target: string): string {
+    const lines = content.split(/\r?\n/);
+    const needle = (target.split(/\r?\n/).find(line => line.trim().length > 3) || '').trim();
+    let anchor = needle ? lines.findIndex(line => line.includes(needle)) : -1;
+    if (anchor === -1 && needle.length > 8) {
+      const loose = needle.replace(/\s+/g, '');
+      anchor = lines.findIndex(line => line.replace(/\s+/g, '').includes(loose));
+    }
+    const numbered = (from: number, to: number) => lines.slice(from, to)
+      .map((line, i) => `${String(from + i + 1).padStart(4)}| ${line}`).join('\n');
+
+    if (anchor === -1) {
+      return `ERROR: that exact text is not in ${filepath}. Do not retry an exact-text match. `
+        + `Use replace_lines with start_line and end_line instead. Current file:\n${numbered(0, Math.min(lines.length, 80))}`;
+    }
+    const from = Math.max(0, anchor - 4);
+    const to = Math.min(lines.length, anchor + 6);
+    return `ERROR: that exact text is not in ${filepath}, but similar text is at line ${anchor + 1}. `
+      + `Do not retry an exact-text match — whitespace will differ. Call replace_lines with start_line/end_line `
+      + `covering the lines you want to change:\n${numbered(from, to)}`;
+  }
+
   private async writeChecked(
     fullPath: string,
     relativePath: string,
@@ -574,10 +610,12 @@ ${projectContext}
     return [...head, { role: 'system' as const, content: 'Earlier tool output was compacted; re-read files or rerun focused checks as needed.' }, ...recent];
   }
 
-  private async recordToolCall(diagnosticsDir: string, task: Task, tool: string, result: string): Promise<void> {
+  private async recordToolCall(diagnosticsDir: string, task: Task, tool: string, result: string, args?: any): Promise<void> {
     try {
       await fs.appendFile(path.join(diagnosticsDir, 'tool-calls.jsonl'), JSON.stringify({
         timestamp: new Date().toISOString(), task_id: task.id, tool, result: this.truncateToolResult(result),
+        // Without the arguments, a failing edit cannot be diagnosed afterwards.
+        args: args ? JSON.parse(JSON.stringify(args, (_k, v) => typeof v === 'string' && v.length > 600 ? `${v.slice(0, 600)}...[truncated]` : v)) : undefined,
       }) + '\n');
     } catch { /* diagnostics must not fail work */ }
   }
