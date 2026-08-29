@@ -72,3 +72,52 @@ describe('stall detection catches all three shapes', () => {
     assert.ok(W.CYCLE_DISTINCT < W.CYCLE_WINDOW);
   });
 });
+
+/** Mirrors the progress rule: calls since the last successful edit. */
+function runProgressDetector(calls: Array<{ tool: string; ok?: boolean }>): number | null {
+  let since = 0;
+  for (let i = 0; i < calls.length; i++) {
+    const c = calls[i];
+    const mutated = ['write_file', 'replace_content', 'replace_lines'].includes(c.tool) && c.ok !== false;
+    if (mutated || c.tool === 'finish_task') since = 0;
+    else if (++since >= W.NO_PROGRESS_ABORT) return i;
+  }
+  return null;
+}
+
+const read = (f: string) => ({ tool: 'read_file', file: f });
+
+describe('progress-based stall detection catches shapes the pattern checks miss', () => {
+  it('catches the 4-file read cycle that walked past CYCLE_DISTINCT=2', () => {
+    // The live stall: vitest.config -> playwright.config -> setup -> package.json,
+    // repeating. Six full rounds, 27 calls, zero edits, and every pattern check
+    // saw nothing: consecutive 1, distinct-in-window 4, cumulative under 8.
+    const cycle = ['a', 'b', 'c', 'd'].map(read);
+    const calls = Array.from({ length: 8 }, () => cycle).flat();
+    const at = runProgressDetector(calls);
+    assert.equal(at, W.NO_PROGRESS_ABORT - 1, 'must stop after 10 fruitless calls');
+  });
+
+  it('catches a read/run_command loop with no edits', () => {
+    const calls = Array.from({ length: 6 }, () => [read('pkg'), { tool: 'run_command' }]).flat();
+    assert.notEqual(runProgressDetector(calls), null);
+  });
+
+  it('does not fire while edits are landing', () => {
+    // The healthy run: ~4 calls per successful edit, 155 calls, 37 edits.
+    const calls = Array.from({ length: 20 }, () =>
+      [read('a'), read('b'), { tool: 'run_command' }, { tool: 'replace_lines' }]).flat();
+    assert.equal(runProgressDetector(calls), null);
+  });
+
+  it('counts a rejected edit as no progress', () => {
+    // A model retrying an edit that keeps failing is not making progress.
+    const calls = Array.from({ length: 12 }, () => ({ tool: 'replace_content', ok: false }));
+    assert.equal(runProgressDetector(calls), W.NO_PROGRESS_ABORT - 1);
+  });
+
+  it('allows a long read-in before the first edit', () => {
+    const calls = [...Array.from({ length: 9 }, (_, i) => read(`f${i}`)), { tool: 'write_file' }];
+    assert.equal(runProgressDetector(calls), null);
+  });
+});

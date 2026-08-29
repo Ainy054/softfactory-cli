@@ -22,6 +22,7 @@ export class LocalAgentWorker implements IWorker {
   static readonly REPEAT_TOTAL_ABORT = 8;    // identical calls anywhere in the attempt
   static readonly CYCLE_WINDOW = 6;          // rolling window for A/B/A/B oscillation
   static readonly CYCLE_DISTINCT = 2;
+  static readonly NO_PROGRESS_ABORT = 10;    // tool calls with no successful edit
   private readonly maxToolOutput = 6000;
   private readonly maxFileRead = 24000;
   private readonly verifier = new TaskVerifier();
@@ -226,6 +227,13 @@ ${projectContext}
     let lastFingerprint: string | null = null;
     let repeatedCall: string | null = null;
     const recentCalls: string[] = [];
+    // The pattern checks above each catch one stall shape, and three times a
+    // new shape walked past the tuning of the last: 30 identical reads, then an
+    // A/B install oscillation, then a 4-file read cycle. The invariant is not
+    // "calls repeat" but "nothing is changing", so count calls since the last
+    // successful edit and stop on that regardless of what the calls look like.
+    let callsSinceProgress = 0;
+    let stalledWithoutProgress = false;
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
 
@@ -388,6 +396,15 @@ ${projectContext}
             onOutput(`[LocalAgent] ❌ Tool error: ${e.message}`);
           }
 
+          const mutated = ['write_file', 'replace_content', 'replace_lines'].includes(name)
+            && !toolResult.startsWith('ERROR');
+          if (mutated || name === 'finish_task') {
+            callsSinceProgress = 0;
+          } else if (++callsSinceProgress >= LocalAgentWorker.NO_PROGRESS_ABORT) {
+            stalledWithoutProgress = true;
+            onOutput(`[LocalAgent] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
+          }
+
           messages.push({
             role: 'tool',
             content: toolResult
@@ -395,7 +412,7 @@ ${projectContext}
           await this.recordToolCall(diagnosticsDir, task, name, toolResult, args);
         }
         
-        if (repeatedCall) break;
+        if (repeatedCall || stalledWithoutProgress) break;
         if (handoffResult) break;
 
       } catch (e: any) {
@@ -411,7 +428,9 @@ ${projectContext}
     return {
       task_id: task.id,
       status: 'failure',
-      summary: repeatedCall
+      summary: stalledWithoutProgress
+        ? `LocalAgent made ${LocalAgentWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
+        : repeatedCall
         ? `LocalAgent stalled in a loop around ${repeatedCall.slice(0, 120)} without making progress. Try a different approach.`
         : sawToolCall
         ? 'LocalAgent stopped before calling finish_task or completing verification.'
