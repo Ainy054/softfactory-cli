@@ -652,12 +652,22 @@ ${projectContext}
     if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
     if (/[;&|`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
     const executable = command.trim().split(/\s+/, 1)[0];
+    // Read-only inspection. A worker naturally reaches for these to orient
+    // itself, and refusing them burned whole turns on `ls -R` and `grep -r`
+    // with no working alternative, unlike `cd` which working_dir replaced.
+    const readOnly = new Set(['ls', 'cat', 'grep', 'egrep', 'rg', 'find', 'head', 'tail', 'wc', 'pwd', 'file', 'stat']);
     const allowed = new Set(['npm', 'npx', 'pnpm', 'yarn', 'node', 'go', 'pytest', 'python', 'python3', 'cargo', 'git', 'tsc', 'eslint', 'vitest']);
-    if (!allowed.has(executable)) throw new Error(`Command is not allowlisted: ${executable}`);
-    // -e/-c were blocked but --eval and -p were not, and `git -c alias.x=!cmd`
-    // is a shell escape. This raises the bar against accidents; it is not a
-    // sandbox, and must not be relied on as one.
-    if (/(^|\s)-(?:e|c|p|-eval|-print|-command)\b/.test(command)) {
+    if (!allowed.has(executable) && !readOnly.has(executable)) {
+      throw new Error(`Command is not allowlisted: ${executable}`);
+    }
+    // find can execute: -exec ... + needs no shell metacharacter to fire.
+    if (executable === 'find' && /(^|\s)-(?:exec|execdir|ok|okdir|delete|fls|fprint)\b/.test(command)) {
+      throw new Error('find may only search, not execute or delete.');
+    }
+    // Scoped to interpreters. Applied to everything it also rejected `grep -c`,
+    // `head -c` and `ls -p`, which are ordinary read-only flags.
+    if (['node', 'python', 'python3'].includes(executable)
+        && /(^|\s)-(?:e|c|p|-eval|-print|-command)\b/.test(command)) {
       throw new Error('Inline interpreter execution is not permitted.');
     }
     if (executable === 'git' && /(^|\s)-c\s|alias\.|!\s*\w/.test(command)) {
