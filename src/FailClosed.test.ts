@@ -81,3 +81,40 @@ describe('a task cannot pass by disabling its own verification', () => {
     assert.equal(factory.detectVerificationSabotage('--- a/src/x.ts\n+++ b/src/x.ts\n-const a = 1\n+const a = 2'), null);
   });
 });
+
+describe('declared files must actually be created', () => {
+  const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+
+  it('reports a declared file that was never written', async () => {
+    // godo's T1: creates_files was ['frontend/eslint.config.js'], and it merged
+    // without ever writing it, because local strategy has no reviewer to notice.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-creates-'));
+    await fs.mkdir(path.join(dir, 'frontend'), { recursive: true });
+    const missing = await factory.missingDeclaredFiles(dir, {
+      creates_files: ['frontend/eslint.config.js'],
+    });
+    assert.deepEqual(missing, ['frontend/eslint.config.js']);
+  });
+
+  it('is satisfied once the file exists', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-creates2-'));
+    await fs.mkdir(path.join(dir, 'frontend'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'frontend', 'eslint.config.js'), 'export default []');
+    assert.deepEqual(await factory.missingDeclaredFiles(dir, {
+      creates_files: ['frontend/eslint.config.js'],
+    }), []);
+  });
+
+  it('is a no-op for a task that declares nothing', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-creates3-'));
+    assert.deepEqual(await factory.missingDeclaredFiles(dir, {}), []);
+    assert.deepEqual(await factory.missingDeclaredFiles(dir, { creates_files: [] }), []);
+  });
+
+  it('ignores unsafe declared paths rather than probing outside the worktree', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-creates4-'));
+    assert.deepEqual(await factory.missingDeclaredFiles(dir, {
+      creates_files: ['../escape.js', '/etc/passwd'],
+    }), []);
+  });
+});

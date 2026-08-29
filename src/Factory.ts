@@ -585,6 +585,19 @@ export class Factory extends EventEmitter {
             }
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Committed ${commitResult.filesChanged} file(s)` });
 
+            // In local strategy there is no semantic reviewer, so the only thing
+            // standing between a task and a merge is what can be checked
+            // mechanically. A declared new file that was never written is exactly
+            // that: godo's T1 merged without its eslint.config.js because nothing
+            // ever looked.
+            const missing = await this.missingDeclaredFiles(worktreePath, task);
+            if (missing.length > 0) {
+                this.log(`INCOMPLETE: ${task.id} — declared but never created: ${missing.join(', ')}`);
+                processFailure(`These files are declared in creates_files but do not exist: ${missing.join(', ')}. Create them, or they were not part of this task.`);
+                await this.recordAttempt(task, 'missing_declared_files', missing.join(', '));
+                return null;
+            }
+
             // Automated in-worktree verification (Scoped UAT Gate)
             this.emitEvent({ type: 'verifier:start', taskId: task.id });
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Running verification tests...` });
@@ -685,6 +698,17 @@ export class Factory extends EventEmitter {
      * Non-null when a diff removes a project's ability to verify itself:
      * deleting the `test` script, or emptying a test file.
      */
+    /** Paths the task said it would create that are not on disk. */
+    async missingDeclaredFiles(worktreePath: string, task: { creates_files?: string[] }): Promise<string[]> {
+        const declared = task.creates_files || [];
+        const missing: string[] = [];
+        for (const relative of declared) {
+            if (!relative || path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..')) continue;
+            if (!await this.exists(path.join(worktreePath, relative))) missing.push(relative);
+        }
+        return missing;
+    }
+
     detectVerificationSabotage(diff: string): string | null {
         const removedTestScript = /^-\s*"test"\s*:/m.test(diff);
         const addedTestScript = /^\+\s*"test"\s*:/m.test(diff);
