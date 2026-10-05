@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execa } from 'execa';
 import { Factory } from './Factory.js';
 import { ToolLoopWorker } from './ToolLoopWorker.js';
+import { RunJournal } from './RunJournal.js';
 import type { ChatRequest, ChatReply, ChatTransport, ToolCall } from './ChatTransport.js';
 
 /**
@@ -141,6 +142,18 @@ describe('end to end: a requirement becomes a merged, evidenced commit', () => {
       assert.equal(JSON.parse(metrics[0]).done, 1);
       const toolCalls = (await fs.readFile(path.join(dir, '.softfactory', 'tool-calls.jsonl'), 'utf-8')).trim().split('\n').map(l => JSON.parse(l).tool);
       assert.deepEqual(toolCalls, ['read_file', 'replace_content', 'run_command', 'finish_task']);
+
+      // The run journal chains the whole run and cites the evidence file by hash.
+      const verified = await RunJournal.verify(dir, factory.state.feature_id);
+      assert.deepEqual({ ok: verified.ok, problems: verified.problems }, { ok: true, problems: [] });
+      const events = (await RunJournal.read(RunJournal.pathFor(dir, factory.state.feature_id))).map(e => e.event);
+      for (const expected of ['plan:accepted', 'task:assigned', 'task:committed', 'task:acceptance', 'task:inspected', 'task:merged', 'run:complete']) {
+        assert.ok(events.includes(expected), `journal lacks ${expected}: ${events.join(', ')}`);
+      }
+      assert.ok(verified.filesChecked >= 1, 'the acceptance evidence is hashed into the chain');
+      // Tampering with the evidence after the fact is caught.
+      await fs.appendFile(path.join(dir, task.evidence), 'tampered\n');
+      assert.equal((await RunJournal.verify(dir, factory.state.feature_id)).ok, false);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

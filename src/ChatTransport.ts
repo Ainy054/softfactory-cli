@@ -33,9 +33,13 @@ export interface ChatRequest {
   signal: AbortSignal;
 }
 
+export interface TokenUsage { inputTokens: number; outputTokens: number }
+
 export interface ChatReply {
   content: string;
   toolCalls: ToolCall[];
+  /** Reported by the backend when it counts tokens; absent otherwise. */
+  usage?: TokenUsage;
 }
 
 export interface Availability { reachable: boolean; modelPresent: boolean; installed: string[] }
@@ -66,6 +70,12 @@ const asObject = (args: unknown): Record<string, unknown> => {
   return {};
 };
 const asJsonString = (args: unknown): string => typeof args === 'string' ? args : JSON.stringify(args ?? {});
+
+function usageFrom(input: unknown, output: unknown): TokenUsage | undefined {
+  const i = Number(input), o = Number(output);
+  if (!Number.isFinite(i) && !Number.isFinite(o)) return undefined;
+  return { inputTokens: Number.isFinite(i) ? i : 0, outputTokens: Number.isFinite(o) ? o : 0 };
+}
 
 function workerTimeout(...envNames: string[]): number {
   for (const name of envNames) {
@@ -134,6 +144,7 @@ export class OllamaChatTransport implements ChatTransport {
       toolCalls: (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call: any) => ({
         id: call.id || '', type: 'function' as const, function: { name: call.function?.name, arguments: call.function?.arguments ?? {} },
       })),
+      usage: usageFrom(data.prompt_eval_count, data.eval_count),
     };
   }
 }
@@ -219,6 +230,7 @@ export class OpenAiCompatibleChatTransport implements ChatTransport {
       toolCalls: (Array.isArray(message.tool_calls) ? message.tool_calls : []).map((call: any) => ({
         id: call.id || '', type: 'function' as const, function: { name: call.function?.name, arguments: call.function?.arguments ?? '{}' },
       })),
+      usage: usageFrom(data.usage?.prompt_tokens, data.usage?.completion_tokens),
     };
   }
 }
@@ -296,6 +308,7 @@ export class AnthropicChatTransport implements ChatTransport {
     return {
       content: blocks.filter(block => block.type === 'text').map(block => block.text).join(''),
       toolCalls: blocks.filter(block => block.type === 'tool_use').map(block => ({ id: block.id, type: 'function' as const, function: { name: block.name, arguments: block.input ?? {} } })),
+      usage: usageFrom(data.usage?.input_tokens, data.usage?.output_tokens),
     };
   }
 }

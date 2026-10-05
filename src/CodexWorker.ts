@@ -34,7 +34,7 @@ ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 Before finishing, write ${handoffPath} as JSON with task_id, status, files_changed, summary and, if there were review questions, review_answers.`;
     options.onOutput?.(`[Codex Worker] Starting ${task.id}${model ? ` with ${model}` : ' with the configured Codex default model'}`);
-    const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath));
+    const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath, options.signal));
     if (options.onOutput) proc.all?.on('data', chunk => options.onOutput?.(chunk.toString().trim()));
     await proc;
     try { return HandoffSchema.parse(JSON.parse(await fs.readFile(handoffPath, 'utf8'))); }
@@ -48,11 +48,13 @@ export function buildCodexExecArgs(prompt: string, model?: string): string[] {
 }
 
 /** Prevent Codex from waiting for additional input after the prompt argument. */
-export function buildCodexExecOptions(worktreePath: string) {
+export function buildCodexExecOptions(worktreePath: string, signal?: AbortSignal) {
   return {
     cwd: worktreePath,
     stdin: 'ignore' as const,
     timeout: 600000,
     all: true,
+    // The orchestrator's attempt budget ends the process, not just the wait for it.
+    ...(signal ? { cancelSignal: signal } : {}),
   };
 }

@@ -46,7 +46,8 @@ softfactory "add a farewell endpoint"
 2. **Verifier.** The task's scoped tests run in the sandbox. A task is judged on whether it made the suite worse than the base branch, not on whether an already-red project is red.
 3. **Executed acceptance.** The task's `verification_command` runs verbatim under the command policy, in the sandbox, and is logged to `.softfactory/evidence/<feature>/<task>-attempt<N>.log` ending in `RESULT: PASS` or `RESULT: FAIL`. No PASS, no merge. A test writer's command is allowed to be red; an unrunnable command is not allowed for anyone.
 4. **Review.** Hybrid and cloud runs require the configured reviewer to be reachable before anything starts; the verdict records which model issued it. Diffs touching a path in `.softfactory/protected-paths.txt` (or planned as protected) get the blind frontier review. A local run merges on mechanical gates alone and says so.
-5. **Graph safety and recovery.** Same-phase tasks claiming the same files are serialized. State carries a schema version and is refused rather than misread when written by a newer softfactory. Blocked tasks can be auto-replanned; a failure category seen in two of the last three runs is handed to the planner as something it must change.
+5. **Budgets.** Each attempt has a wall-clock budget; a worker that overruns is stopped, its partial work stays on the line branch, and the retry continues from it. A run can carry a time budget per invocation and a token budget per feature; exhausting either halts between phases without burning a retry.
+6. **Graph safety and recovery.** Same-phase tasks claiming the same files are serialized. State carries a schema version and is refused rather than misread when written by a newer softfactory. Blocked tasks can be auto-replanned; a failure category seen in two of the last three runs is handed to the planner as something it must change.
 
 ## Prerequisites
 
@@ -105,6 +106,11 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--refine` | Modify an in-progress plan; done tasks are kept verbatim | `false` |
 | `--mark-done <task-id> ["note"]` | Record that a person completed an `orchestrator` or `user` task | — |
 | `--history` | Completed features | `false` |
+| `--second-reviewer <provider/model>` | A second reviewer on another vendor. Protected diffs need both verdicts; a split on an ordinary diff goes to the blind review | none |
+| `--attempt-timeout <minutes>` | Wall-clock budget per worker attempt; an overrun is a task failure that keeps its partial work and escalates | `45` |
+| `--run-budget <minutes>` | Wall-clock budget per invocation; the run halts between phases and `--resume` continues | none |
+| `--max-tokens <n>` | Token budget per feature across resumes, where backends report usage | none |
+| `--verify-run [feature-id]` | Recompute the run journal's hash chain and the evidence files it cites; exit 1 on any mismatch | current build |
 | `--no-tui` | Plain stdout instead of the Ink TUI | TUI when interactive |
 | `--no-docker` | Skip the post-build docker-compose check of the finished app | auto-detect |
 
@@ -118,6 +124,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | :--- | :--- |
 | `factory.json` | The run state: feature, tasks, statuses, attempts, inspection results. Versioned. |
 | `evidence/<feature>/<task>-attempt<N>.log` | The acceptance command, its output, and `RESULT: PASS` or `FAIL` |
+| `runs/<feature>/journal.jsonl` | Hash-chained record of the run: accepted plan, assignments, commits, acceptance results with evidence hashes, verdicts from every reviewer, merges with commit ids, budget halts, final metrics. `--verify-run` checks it |
 | `metrics.jsonl` | One line per finished run: outcomes, attempts, failure categories, escalations |
 | `protected-paths.txt` | Globs (one per line, `**` crosses directories) whose diffs get the blind frontier review |
 | `tool-calls.jsonl` | Every tool call a worker made, with arguments and the result it saw |

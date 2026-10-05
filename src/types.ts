@@ -75,6 +75,8 @@ export const FactoryStateSchema = z.object({
   }).optional(),
   tasks: z.array(TaskSchema),
   memory_patterns: z.array(z.string()).default([]),
+  /** Tokens the run has consumed across every attempt, where backends report them. */
+  usage: z.object({ input_tokens: z.number().default(0), output_tokens: z.number().default(0) }).default({ input_tokens: 0, output_tokens: 0 }),
 });
 
 export type FactoryState = z.infer<typeof FactoryStateSchema>;

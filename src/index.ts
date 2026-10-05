@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import process from 'node:process';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { Factory } from './Factory.js';
+import { RunJournal } from './RunJournal.js';
 import { WorkerStrategy, CloudProvider } from './WorkerRegistry.js';
 import type { PlannerProvider } from './Planner.js';
 import type { SandboxMode } from './Sandbox.js';
@@ -9,11 +12,12 @@ import { startFactoryRun } from './runMode.js';
 const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
-  '--planner-provider', '--planner-model', '--mark-done', '--sandbox'
+  '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
+  '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -55,6 +59,23 @@ async function main() {
   }
   const historyMode = args.includes('--history');
 
+  if (args.some(a => a === '--verify-run' || a.startsWith('--verify-run='))) {
+    let runId = getFlagValue(args, '--verify-run');
+    if (!runId) {
+      try { runId = JSON.parse(await fs.readFile(path.join(process.cwd(), '.softfactory', 'factory.json'), 'utf8')).feature_id; } catch { /* no current build */ }
+    }
+    if (!runId) {
+      console.error('No run to verify: pass --verify-run <feature-id> (see --history) or run it inside a repository with a current build.');
+      process.exit(1);
+    }
+    const result = await RunJournal.verify(process.cwd(), runId);
+    console.log(result.ok
+      ? `OK ${runId}: ${result.entries} journal entries and ${result.filesChecked} cited evidence files verified; head ${result.head}`
+      : `FAILED ${runId}: ${result.problems.length} problem(s)`);
+    for (const problem of result.problems) console.log(`  - ${problem}`);
+    process.exit(result.ok ? 0 : 1);
+  }
+
   const strategyArg = (getFlagValue(args, '--strategy') || 'hybrid') as WorkerStrategy;
   const localModelArg = getFlagValue(args, '--local-model') || 'qwen2.5-coder:7b';
   const cloudProviderArg = (getFlagValue(args, '--cloud-provider') || 'agy') as CloudProvider;
@@ -73,6 +94,19 @@ async function main() {
   // The Codex CLI already has an authenticated, user-configured default model.
   // Do not accidentally pass Antigravity's Gemini defaults to it.  Supplying
   // either option remains useful for explicitly choosing fast/frontier tiers.
+  const secondReviewerArg = getFlagValue(args, '--second-reviewer');
+  const minutes = (flag: string): number | undefined => {
+    const raw = getFlagValue(args, flag);
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`${flag} expects a positive number of minutes; got "${raw}".`);
+    return value;
+  };
+  const attemptTimeoutArg = minutes('--attempt-timeout');
+  const runBudgetArg = minutes('--run-budget');
+  const maxTokensRaw = getFlagValue(args, '--max-tokens');
+  const maxTokensArg = maxTokensRaw === undefined ? undefined : Number(maxTokensRaw);
+  if (maxTokensArg !== undefined && (!Number.isFinite(maxTokensArg) || maxTokensArg <= 0)) throw new Error(`--max-tokens expects a positive number; got "${maxTokensRaw}".`);
   const cloudModelArg = getFlagValue(args, '--cloud-model') || (cloudProviderArg === 'openai' ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-flash' : 'Gemini 3.7 Flash (High)');
   const frontierModelArg = getFlagValue(args, '--frontier-model') || (cloudProviderArg === 'openai' ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-pro' : 'Gemini 3.1 Pro (High)');
 
@@ -157,6 +191,10 @@ async function main() {
     cloudProvider: cloudProviderArg,
     plannerProvider: plannerProviderArg,
     plannerModel: plannerModelArg,
+    secondReviewer: secondReviewerArg,
+    attemptTimeoutMinutes: attemptTimeoutArg,
+    runBudgetMinutes: runBudgetArg,
+    maxTokens: maxTokensArg,
   });
   globalFactory = factory;
   await factory.init();

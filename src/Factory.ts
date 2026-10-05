@@ -14,11 +14,19 @@ import { AgyPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner,
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
-import { createTextModel, OllamaTextModel } from './TextModel.js';
+import { createTextModel, OllamaTextModel, type TextModelProvider } from './TextModel.js';
+import { RunJournal } from './RunJournal.js';
+import type { Handoff } from './types.js';
 import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
 import { redactSecrets } from './redact.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
+
+/** An attempt that outlived its wall-clock budget and did not stop when asked. */
+class AttemptTimeoutError extends Error {
+  constructor(minutes: number) { super(`Attempt exceeded its ${minutes}-minute budget and the worker did not stop when asked.`); this.name = 'AttemptTimeoutError'; }
+}
+const TEXT_MODEL_PROVIDERS: TextModelProvider[] = ['local', 'agy', 'openai', 'openai-api', 'anthropic', 'deepseek'];
 
 export interface FactoryOptions {
     streamToTerminal?: boolean;
@@ -32,6 +40,14 @@ export interface FactoryOptions {
     cloudProvider?: CloudProvider;
     plannerProvider?: PlannerProvider;
     plannerModel?: string;
+    /** A second reviewer on another vendor, as provider/model. Protected diffs need both; a disagreement on an ordinary diff goes to the blind review. */
+    secondReviewer?: string;
+    /** Wall-clock budget for one worker attempt, in minutes. */
+    attemptTimeoutMinutes?: number;
+    /** Wall-clock budget for this invocation, in minutes; the run halts between phases and resumes later. */
+    runBudgetMinutes?: number;
+    /** Token budget for the whole feature, across resumes. */
+    maxTokens?: number;
 }
 
 export class Factory extends EventEmitter {
@@ -47,6 +63,17 @@ export class Factory extends EventEmitter {
     inspector: Inspector;
     /** The frontier-tier reviewer for protected diffs; it never sees the worker's summary. */
     frontierInspector: Inspector;
+    /** Optional reviewer on a different vendor; see FactoryOptions.secondReviewer. */
+    secondInspector: Inspector | undefined;
+    attemptTimeoutMs: number;
+    /** How long a worker gets to stop after its attempt budget fires before it is abandoned. */
+    attemptGraceMs = 60_000;
+    runBudgetMs: number | undefined;
+    maxTokens: number | undefined;
+    runStartedAt = Date.now();
+    /** Short facts learned during this run, handed to the tasks that run after. */
+    runNotes: Array<{ taskId: string; note: string }> = [];
+    private journals = new Map<string, RunJournal>();
     protectedPaths = new ProtectedPaths([]);
     sandbox: SandboxManager;
     workerRegistry: WorkerRegistry;
@@ -76,7 +103,10 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '' } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens } = options;
+        this.attemptTimeoutMs = Math.max(1, attemptTimeoutMinutes) * 60_000;
+        this.runBudgetMs = runBudgetMinutes ? Math.max(1, runBudgetMinutes) * 60_000 : undefined;
+        this.maxTokens = maxTokens && maxTokens > 0 ? Math.floor(maxTokens) : undefined;
         this.useDocker = useDocker;
         this.strategy = strategy;
         this.sandbox = new SandboxManager(sandbox, line => this.log(line));
@@ -111,6 +141,15 @@ export class Factory extends EventEmitter {
         this.frontierInspector = new Inspector(strategy === 'local'
             ? new OllamaTextModel(heavyLocal)
             : createTextModel(cloudProvider, frontierModel || cloudModel, { cwd: baseDir }));
+        if (secondReviewer) {
+            const slash = secondReviewer.indexOf('/');
+            const provider = secondReviewer.slice(0, slash) as TextModelProvider;
+            const model = secondReviewer.slice(slash + 1);
+            if (slash <= 0 || !model || !TEXT_MODEL_PROVIDERS.includes(provider)) {
+                throw new Error(`--second-reviewer must be provider/model with provider one of ${TEXT_MODEL_PROVIDERS.join(', ')}; got "${secondReviewer}".`);
+            }
+            this.secondInspector = new Inspector(createTextModel(provider, model, { cwd: baseDir }));
+        }
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
         this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
         this.taskVerifier = new TaskVerifier(this.sandbox);
@@ -411,10 +450,12 @@ export class Factory extends EventEmitter {
             planner_provider: this.planner.provider,
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
+            usage: { input_tokens: 0, output_tokens: 0 },
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
         await this.saveState();
+        await this.journalPlan();
         await this.updateHistory('planned');
         this.emitEvent({ type: 'state:update', state: this.state });
         this.emitEvent({ type: 'build:complete', status: 'planned', feature: this.state.feature });
@@ -465,13 +506,53 @@ export class Factory extends EventEmitter {
             planner_provider: this.planner.provider,
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
+            usage: { input_tokens: 0, output_tokens: 0 },
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
         await this.saveState();
+        await this.journalPlan();
         await this.updateHistory('active');
         this.emitEvent({ type: 'state:update', state: this.state });
         await this.runWorkshopLoop();
+    }
+    /** The journal for the current feature; one chain per run id. */
+    journal(): RunJournal | null {
+        const id = this.state?.feature_id;
+        if (!id) return null;
+        let journal = this.journals.get(id);
+        if (!journal) { journal = new RunJournal(this.baseDir, id); this.journals.set(id, journal); }
+        return journal;
+    }
+    private async journalPlan() {
+        const tasks = this.state.tasks.map(t => ({ id: t.id, title: t.title, executor: t.executor, protected: t.protected, files_hint: t.files_hint, creates_files: t.creates_files, verification_command: t.verification_command, dependencies: t.dependencies, phase: t.phase }));
+        await this.journal()?.append('plan:accepted', { feature: this.state.feature, planner: this.planner.provider, strategy: this.strategy, blueprint_hash: createHash('sha256').update(JSON.stringify(tasks)).digest('hex'), tasks }).catch(() => undefined);
+    }
+    /** A fact the rest of this run should know, kept short and handed to later tasks. */
+    addRunNote(taskId: string, note: string) {
+        const text = redactSecrets(note).replace(/\s+/g, ' ').trim().slice(0, 240);
+        if (!text || this.runNotes.some(n => n.note === text)) return;
+        this.runNotes.push({ taskId, note: text });
+    }
+    notesFor(taskId: string): string[] {
+        return this.runNotes.filter(n => n.taskId !== taskId).slice(-8).map(n => `From ${n.taskId} earlier in this run: ${n.note}`);
+    }
+    recordUsage(usage: { inputTokens: number; outputTokens: number }) {
+        if (!this.state) return;
+        this.state.usage = this.state.usage || { input_tokens: 0, output_tokens: 0 };
+        this.state.usage.input_tokens += usage.inputTokens || 0;
+        this.state.usage.output_tokens += usage.outputTokens || 0;
+    }
+    /** Why the run may not start another phase, or null. Checked between phases, so a phase in flight may overshoot. */
+    budgetExhausted(): string | null {
+        if (this.runBudgetMs && Date.now() - this.runStartedAt >= this.runBudgetMs) {
+            return `Run budget of ${Math.round(this.runBudgetMs / 60_000)} minutes is spent. No task state was lost; run --resume (with a larger --run-budget if needed) to continue.`;
+        }
+        const used = (this.state?.usage?.input_tokens || 0) + (this.state?.usage?.output_tokens || 0);
+        if (this.maxTokens && used >= this.maxTokens) {
+            return `Token budget is spent: ${used} of ${this.maxTokens} tokens used by this feature. Run --resume with a larger --max-tokens to continue.`;
+        }
+        return null;
     }
     async runWorkshopLoop() {
         await this.logBackendPreflight();
@@ -481,7 +562,17 @@ export class Factory extends EventEmitter {
             return;
         }
         if (!this.baseline) await this.captureBaseline();
+        this.runStartedAt = Date.now();
         while (this.hasUnfinishedTasks()) {
+            const exhausted = this.budgetExhausted();
+            if (exhausted) {
+                // Like an environment fault: nothing is a task failure, and
+                // --resume continues exactly here.
+                this.environmentFault = exhausted;
+                this.log(`HALTED: ${exhausted}`);
+                await this.journal()?.append('run:budget-halt', { reason: exhausted, usage: this.state.usage }).catch(() => undefined);
+                break;
+            }
             await this.autoReplanBlockedTasks();
             const allReady = this.getReadyTasks();
             // Orchestrator and user tasks never reach a worker. They are
@@ -537,6 +628,7 @@ export class Factory extends EventEmitter {
                     try {
                         await this.worktreeManager.merge(task.id, branchName, this.defaultBranch);
                         task.status = 'done';
+                        await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
                     }
@@ -696,20 +788,43 @@ export class Factory extends EventEmitter {
                 // to the worker as the first thing to fix instead.
                 const setupError = preparation.message || 'unknown setup error';
                 this.log(`ENVIRONMENT: ${task.id} — setup failed, asking the worker to repair it: ${setupError.slice(0, 200)}`);
+                this.addRunNote(task.id, `environment setup failed: ${setupError.split('\n')[0]}`);
                 await this.recordAttempt(task, 'environment', setupError);
                 task.last_feedback = `Environment setup is failing and you must fix this before anything else:\n${setupError}\n\n${task.last_feedback || ''}`.slice(0, 4000);
             }
-            const handoff = await worker.execute(task, worktreePath, {
-                streamToTerminal: this.streamToTerminal,
-                projectContext,
-                memoryPatterns: await this.lessons.getRelevant(task),
-                model,
-                diagnosticsDir: path.join(this.baseDir, '.softfactory'),
-                sandbox: this.sandbox,
-                onOutput: (line: string) => {
-                    this.emitEvent({ type: 'worker:output', taskId: task.id, line });
-                },
-            });
+            // The attempt has a wall-clock budget. The worker is asked to stop
+            // through the signal; one that does not stop within a minute is
+            // abandoned. Either way whatever it committed is gated below.
+            const attempt = new AbortController();
+            const attemptMinutes = Math.round(this.attemptTimeoutMs / 60_000);
+            const attemptTimer = setTimeout(() => attempt.abort(), this.attemptTimeoutMs);
+            let handoff: Handoff;
+            let graceTimer: NodeJS.Timeout | undefined;
+            try {
+                const execution = worker.execute(task, worktreePath, {
+                    streamToTerminal: this.streamToTerminal,
+                    projectContext,
+                    memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
+                    model,
+                    diagnosticsDir: path.join(this.baseDir, '.softfactory'),
+                    sandbox: this.sandbox,
+                    signal: attempt.signal,
+                    onUsage: usage => this.recordUsage(usage),
+                    onOutput: (line: string) => {
+                        this.emitEvent({ type: 'worker:output', taskId: task.id, line });
+                    },
+                });
+                execution.catch(() => undefined);
+                handoff = await Promise.race([
+                    execution,
+                    new Promise<never>((_, reject) => attempt.signal.addEventListener('abort', () => {
+                        graceTimer = setTimeout(() => reject(new AttemptTimeoutError(attemptMinutes)), this.attemptGraceMs);
+                    }, { once: true })),
+                ]);
+            } finally {
+                clearTimeout(attemptTimer);
+                if (graceTimer) clearTimeout(graceTimer);
+            }
             // A worker's self-report is a hint, not a verdict. Local models
             // routinely finish the work and then forget to call finish_task, so
             // only treat a reported failure as fatal when the worktree is also
@@ -734,6 +849,15 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'worker_reported_failure_with_changes', handoff.summary);
             }
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Committed ${commitResult.filesChanged} file(s)` });
+            await this.journal()?.append('task:committed', { task_id: task.id, attempt: task.attempts, model: task.model, provider: task.provider, files_changed: commitResult.filesChanged, worker_status: handoff.status }).catch(() => undefined);
+            if (attempt.signal.aborted) {
+                // Partial work is committed on the line branch, so the retry
+                // continues from it instead of from HEAD.
+                this.log(`TIMEOUT: ${task.id} — attempt exceeded ${attemptMinutes} minutes; its partial work is kept for the retry`);
+                processFailure(`The previous attempt ran out of its ${attemptMinutes}-minute budget before calling finish_task. Its partial work is already in the worktree: continue from it, and finish sooner.`);
+                await this.recordAttempt(task, 'attempt_timeout', `exceeded ${attemptMinutes} minutes`);
+                return null;
+            }
 
             // In local strategy there is no semantic reviewer, so the only thing
             // standing between a task and a merge is what can be checked
@@ -826,6 +950,8 @@ export class Factory extends EventEmitter {
             });
             if (acceptance.ran) {
                 task.evidence = acceptance.evidencePath ? path.relative(this.baseDir, acceptance.evidencePath) : undefined;
+                await this.journal()?.append('task:acceptance', { task_id: task.id, attempt: task.attempts, command: acceptance.command, exit_code: acceptance.exitCode, passed: acceptance.passed, unrunnable: acceptance.unrunnable }, task.evidence ? [task.evidence] : []).catch(() => undefined);
+                if (acceptance.unrunnable) this.addRunNote(task.id, `acceptance command could not run here: ${acceptance.command}`);
                 const tolerated = !acceptance.passed && task.agent_role === 'test_writer' && !acceptance.unrunnable;
                 reviewEvidence += `\n\nAcceptance command: ${acceptance.command} (exit ${acceptance.exitCode ?? 'n/a'}, ${acceptance.passed ? 'PASS' : tolerated ? 'expected red for test_writer' : 'FAIL'})\n${acceptance.output.slice(-2000)}`;
                 if (!acceptance.passed && !tolerated) {
@@ -869,16 +995,24 @@ export class Factory extends EventEmitter {
             // a blind review of protected code on the frontier model, a
             // model review of ordinary code, or, offline, mechanical gates only.
             const blind = task.protected;
-            const mechanicalOnly = !blind && this.strategy === 'local';
-            if (blind) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Independent review (${this.frontierInspector.provider}/${this.frontierInspector.model}) of protected diff...` });
-            const review = blind
-                ? await this.frontierInspector.inspectBlind(task, diff, reviewEvidence, handoff.review_answers)
-                : mechanicalOnly
-                    ? { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }
-                    : await this.inspector.inspect(task, diff, handoff.summary, reviewEvidence);
-            task.inspection = blind ? 'blind-review' : mechanicalOnly ? 'mechanical-only' : 'model';
+            // Who reviews: the frontier reviewer for protected diffs, the
+            // configured reviewer otherwise (none in a local run), plus the
+            // second reviewer when one is configured.
+            const reviewers = (blind
+                ? [this.frontierInspector, this.secondInspector]
+                : [this.strategy === 'local' ? undefined : this.inspector, this.secondInspector]
+            ).filter((r): r is Inspector => Boolean(r));
+            const mechanicalOnly = reviewers.length === 0;
+            if (blind) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Independent review (${reviewers.map(r => `${r.provider}/${r.model}`).join(' + ')}) of protected diff...` });
+            const blindReview = () => this.frontierInspector.inspectBlind(task, diff, reviewEvidence, handoff.review_answers);
+            const verdicts = mechanicalOnly ? [] : await Promise.all(reviewers.map(r => blind ? r.inspectBlind(task, diff, reviewEvidence, handoff.review_answers) : r.inspect(task, diff, handoff.summary, reviewEvidence)));
+            const decision = mechanicalOnly
+                ? { review: { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }, inspection: 'mechanical-only' as const }
+                : await this.combineVerdicts(verdicts, blind, blindReview);
+            const review = decision.review;
+            task.inspection = decision.inspection;
             task.inspector_model = mechanicalOnly ? undefined : `${review.provider}/${review.model}`;
-            await this.recordTaskEvent({ event: 'task:inspected', task_id: task.id, attempt: task.attempts, verdict: review.verdict, inspection: task.inspection, provider: review.provider, model: review.model, protected: task.protected });
+            await this.recordTaskEvent({ event: 'task:inspected', task_id: task.id, attempt: task.attempts, verdict: review.verdict, inspection: task.inspection, provider: review.provider, model: review.model, protected: task.protected, verdicts: verdicts.map(v => ({ provider: v.provider, model: v.model, verdict: v.verdict })) });
             if (review.verdict === 'PASS') {
                 this.log(mechanicalOnly ? `PASSED (mechanical gates only, no reviewer): ${task.id}` : `PASSED (${blind ? 'independent review' : 'inspector'} ${task.inspector_model}): ${task.id}`);
                 this.emitEvent({ type: 'worker:output', taskId: task.id, line: mechanicalOnly ? `Mechanical gates passed; no model reviewed this diff` : `${blind ? 'Independent reviewer' : 'Quality Inspector'} (${task.inspector_model}): PASSED` });
@@ -891,6 +1025,7 @@ export class Factory extends EventEmitter {
                         if (epiphany?.should_save && await this.lessons.add({ lesson: epiphany.lesson, tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
                             this.state.memory_patterns = this.state.memory_patterns || [];
                             this.state.memory_patterns.push(epiphany.lesson);
+                            this.addRunNote(task.id, epiphany.lesson);
                             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `💡 Epiphany Saved: ${epiphany.lesson}` });
                         }
                     } catch (e: any) {
@@ -921,6 +1056,13 @@ export class Factory extends EventEmitter {
                 this.log(`ENVIRONMENT: ${task.id} could not run — ${e.message}`);
                 await this.recordAttempt(task, 'environment_unavailable', e.message);
                 throw e;
+            }
+            if (e instanceof AttemptTimeoutError) {
+                this.log(`TIMEOUT: ${task.id} — ${e.message}`);
+                await this.worktreeManager.commitWorktree(task.id).catch(() => undefined);
+                processFailure(`${e.message} Continue from the committed partial work and finish sooner.`);
+                await this.recordAttempt(task, 'attempt_timeout', e.message);
+                return null;
             }
             const exitCode = e.exitCode ?? 1;
             this.log(`Worker exited with code ${exitCode} for ${task.id}: ${e.message}`);
@@ -1020,6 +1162,36 @@ export class Factory extends EventEmitter {
         } catch { /* no baseline: the gate simply does not fire */ }
     }
 
+    /**
+     * One verdict from one or two reviewers. Two reviewers that agree speak
+     * as one. On a protected diff a single FAIL is a FAIL. On an ordinary
+     * diff a disagreement is settled by the blind review, which sees the
+     * worker's answers but not its story.
+     */
+    async combineVerdicts(
+        verdicts: import('./Inspector.js').InspectionResult[],
+        blind: boolean,
+        tieBreak: () => Promise<import('./Inspector.js').InspectionResult>,
+    ): Promise<{ review: import('./Inspector.js').InspectionResult; inspection: 'model' | 'blind-review' }> {
+        const label = (v: { provider: string; model: string }) => `${v.provider}/${v.model}`;
+        const inspection = blind ? 'blind-review' as const : 'model' as const;
+        if (verdicts.length === 1) return { review: verdicts[0], inspection };
+        const provider = verdicts.map(v => v.provider).join('+');
+        const model = verdicts.map(v => v.model).join('+');
+        const failed = verdicts.filter(v => v.verdict === 'FAIL');
+        if (failed.length === 0) return { review: { verdict: 'PASS', feedback: verdicts.map(v => `${label(v)}: ${v.feedback}`).join('\n\n'), provider, model }, inspection };
+        if (failed.length === verdicts.length) return { review: { verdict: 'FAIL', feedback: verdicts.map(v => `${label(v)}: ${v.feedback}`).join('\n\n'), provider, model }, inspection };
+        if (blind) {
+            // Protected code needs every reviewer's agreement.
+            return { review: { verdict: 'FAIL', feedback: `Reviewers disagreed on a protected diff, so it does not merge. ${failed.map(v => `${label(v)} failed it: ${v.feedback}`).join(' ')}`, provider, model }, inspection };
+        }
+        this.log(`REVIEW SPLIT: ${verdicts.map(v => `${label(v)} ${v.verdict}`).join(', ')} — asking the independent reviewer`);
+        const decider = await tieBreak();
+        return {
+            review: { ...decider, feedback: `Independent review after ${verdicts.map(v => `${label(v)} said ${v.verdict}`).join(' and ')}: ${decider.feedback}`, provider: `${decider.provider}`, model: `${decider.model} (tie-break of ${model})` },
+            inspection: 'blind-review',
+        };
+    }
     detectVerificationSabotage(diff: string): string | null {
         // Only a package.json hunk can remove the test script. Matched against
         // the whole diff, any JSON fixture or config that dropped a "test" key
@@ -1051,6 +1223,7 @@ export class Factory extends EventEmitter {
                 category, detail: redactSecrets(String(detail)).slice(0, 2000),
             }) + '\n');
         } catch { /* diagnostics must never fail a build */ }
+        await this.journal()?.append('attempt:failed', { task_id: task.id, attempt: task.attempts, escalation_level: task.escalation_level || 0, model: task.model, provider: task.provider, category, detail: String(detail).slice(0, 600) }).catch(() => undefined);
         if (this.trainingCaptureEnabled) {
             await this.trainingData.addFailureLesson({ task, category, detail: redactSecrets(String(detail)) });
         }
@@ -1064,12 +1237,15 @@ export class Factory extends EventEmitter {
                 model: task.model, provider: task.provider,
             }) + '\n');
         } catch { /* diagnostics must never fail a build */ }
+        await this.journal()?.append('task:assigned', { task_id: task.id, attempt: task.attempts, escalation_level: task.escalation_level || 0, model: task.model, provider: task.provider }).catch(() => undefined);
     }
     private async recordTaskEvent(event: Record<string, unknown>) {
         try {
             const journalPath = path.join(this.baseDir, '.softfactory', 'task-events.jsonl');
             await fs.appendFile(journalPath, JSON.stringify({ timestamp: new Date().toISOString(), ...event }) + '\n');
         } catch { /* diagnostics must never fail a build */ }
+        const { event: name, ...data } = event;
+        await this.journal()?.append(String(name), data).catch(() => undefined);
     }
     private async autoReplanBlockedTasks() {
         const candidates = this.state.tasks.filter(task => task.status === 'blocked' && (task.replan_reason || shouldRecommendSplit(task, task.last_feedback || '') || /decompose|rewrite the last valid|no progress/i.test(task.last_feedback || '')));
@@ -1243,7 +1419,8 @@ export class Factory extends EventEmitter {
         try {
             const metrics = await computeRunMetrics(this.baseDir, this.state);
             await appendRunMetrics(this.baseDir, metrics);
-            this.log(`Metrics: ${metrics.done}/${metrics.tasks} done, first-attempt rate ${metrics.first_attempt_rate}, rejections ${JSON.stringify(metrics.rejected_by_category)}`);
+            await this.journal()?.append('run:complete', { status: this.state.status, metrics: metrics as unknown as Record<string, unknown> }).catch(() => undefined);
+            this.log(`Metrics: ${metrics.done}/${metrics.tasks} done, first-attempt rate ${metrics.first_attempt_rate}, rejections ${JSON.stringify(metrics.rejected_by_category)}, tokens ${metrics.tokens.input + metrics.tokens.output}`);
         } catch (e: any) {
             this.log(`Metrics not written: ${e.message}`);
         }
@@ -1532,7 +1709,11 @@ export class Factory extends EventEmitter {
                 // dead cloud provider halts here instead of after the workers
                 // have spent their effort.
                 this.environmentFault = `Quality inspector (${this.inspector.provider}/${this.inspector.model}) is unavailable; no task can be merged without review. Use --strategy=local for an offline run.`;
+            } else if (this.secondInspector && !await this.secondInspector.isAvailable()) {
+                this.environmentFault = `Second reviewer (${this.secondInspector.provider}/${this.secondInspector.model}) is unavailable. Fix it or drop --second-reviewer.`;
             }
+            if (this.secondInspector && !this.environmentFault) this.log(`Second reviewer: ${this.secondInspector.provider}/${this.secondInspector.model}`);
+            if (this.runBudgetMs || this.maxTokens) this.log(`Budget: ${this.runBudgetMs ? `${Math.round(this.runBudgetMs / 60_000)} min per invocation` : 'no time cap'}, ${this.maxTokens ? `${this.maxTokens} tokens per feature` : 'no token cap'}, ${Math.round(this.attemptTimeoutMs / 60_000)} min per attempt`);
         } catch (error: any) {
             this.log(`Backend preflight could not complete: ${error?.message || 'unknown error'}`);
         }

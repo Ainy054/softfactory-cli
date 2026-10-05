@@ -17,6 +17,7 @@ export interface RunMetrics {
   rejected_by_category: Record<string, number>;
   models: Record<string, number>;
   inspections: Record<string, number>;
+  tokens: { input: number; output: number };
 }
 
 const METRICS_FILE = path.join('.softfactory', 'metrics.jsonl');
@@ -67,6 +68,7 @@ export async function computeRunMetrics(baseDir: string, state: FactoryState): P
     rejected_by_category: categories,
     models,
     inspections,
+    tokens: { input: state.usage?.input_tokens || 0, output: state.usage?.output_tokens || 0 },
   };
 }
 

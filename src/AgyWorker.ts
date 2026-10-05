@@ -113,6 +113,7 @@ The JSON must follow this exact schema:
       cwd: worktreePath,
       stdio: useStreaming ? ['ignore', 'pipe', 'pipe'] : 'inherit',
       timeout: 600000,
+      ...(options?.signal ? { cancelSignal: options.signal } : {}),
     });
 
     if (useStreaming && proc.stdout) {

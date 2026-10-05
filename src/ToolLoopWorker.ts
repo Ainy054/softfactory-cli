@@ -234,23 +234,33 @@ ${projectContext}
     let finishAborted = false;
     let lastFinishFailure = '';
     let protocolError = '';
+    let budgetStopped = false;
     let scopeViolations = 0;
     const syntaxRejects = new Map<string, number>();
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
 
     for (let iteration = 0; iteration < ToolLoopWorker.MAX_ITERATIONS; iteration++) {
+      if (options?.signal?.aborted) {
+        // The orchestrator's attempt budget ran out. Stop here; what was
+        // edited so far is committed and gated like any other attempt.
+        budgetStopped = true;
+        onOutput(`[${this.label}] ⛔ Stopping: the attempt's time budget is spent.`);
+        break;
+      }
       try {
         messages = this.compactMessages(messages, safeCtx);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), this.transport.timeoutMs());
+        const signal = options?.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
         let reply;
         try {
-          reply = await this.transport.chat({ model, messages, tools, temperature, contextWindow: safeCtx, signal: controller.signal });
+          reply = await this.transport.chat({ model, messages, tools, temperature, contextWindow: safeCtx, signal });
         } finally {
           // A failed request used to leave a six-minute timer holding the process open.
           clearTimeout(timeout);
         }
+        if (reply.usage) options?.onUsage?.(reply.usage);
 
         lastModelContent = reply.content || '';
         const toolCalls = this.extractToolCalls(reply.content, reply.toolCalls).map((call, index) => ({
@@ -459,7 +469,9 @@ ${projectContext}
     return {
       task_id: task.id,
       status: 'failure',
-      summary: protocolError
+      summary: budgetStopped
+        ? `${who} was stopped because the attempt's time budget ran out before finish_task. Work so far is committed; continue from it.`
+        : protocolError
         ? `${who} hit a protocol error: ${protocolError}. Validate tool-call IDs and tool responses before retrying.`
         : finishAborted
         ? `${who} called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`

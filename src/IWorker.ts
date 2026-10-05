@@ -10,6 +10,10 @@ export interface WorkerOptions {
   diagnosticsDir?: string;
   /** Where the worker's run_command calls execute; host allowlist only when absent. */
   sandbox?: SandboxManager;
+  /** Aborted when the attempt's wall-clock budget is spent; the worker stops at its next step. */
+  signal?: AbortSignal;
+  /** Token counts per model turn, when the backend reports them. */
+  onUsage?: (usage: { inputTokens: number; outputTokens: number }) => void;
 }
 
 export interface IWorker {

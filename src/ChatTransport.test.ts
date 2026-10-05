@@ -87,6 +87,26 @@ describe('the OpenAI-compatible transport', () => {
   });
 });
 
+describe('token usage is read from every wire format', () => {
+  it('maps Ollama, OpenAI-compatible and Anthropic counters to one shape, and omits it when absent', async () => {
+    const previous = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'k';
+    try {
+      const ollama = await new OllamaChatTransport('http://h', capture({ message: { content: 'x' }, prompt_eval_count: 11, eval_count: 4 }).fetchImpl).chat(request(transcript));
+      assert.deepEqual(ollama.usage, { inputTokens: 11, outputTokens: 4 });
+      const config = { id: 'x', name: 'X', label: 'X', chatUrl: 'https://x/chat', modelsUrl: 'https://x/models', apiKeyEnv: 'X_KEY', contextWindow: 1000, timeoutEnv: 'X_TIMEOUT' };
+      const openai = await new OpenAiCompatibleChatTransport(config, capture({ choices: [{ message: { content: 'x' } }], usage: { prompt_tokens: 7, completion_tokens: 2 } }).fetchImpl).chat(request(transcript));
+      assert.deepEqual(openai.usage, { inputTokens: 7, outputTokens: 2 });
+      const anthropic = await new AnthropicChatTransport(capture({ content: [{ type: 'text', text: 'x' }], usage: { input_tokens: 9, output_tokens: 1 } }).fetchImpl).chat(request(transcript));
+      assert.deepEqual(anthropic.usage, { inputTokens: 9, outputTokens: 1 });
+      const none = await new OpenAiCompatibleChatTransport(config, capture({ choices: [{ message: { content: 'x' } }] }).fetchImpl).chat(request(transcript));
+      assert.equal(none.usage, undefined);
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = previous;
+    }
+  });
+});
+
 describe('the Ollama transport', () => {
   it('sends object arguments and the context window, and never a tool_call_id', async () => {
     const { bodies, fetchImpl } = capture({ message: { content: '', tool_calls: [{ function: { name: 'read_file', arguments: { filepath: 'q' } } }] } });
