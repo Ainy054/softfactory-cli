@@ -7,8 +7,10 @@ import { createChatTransport } from './ChatTransport.js';
 import { CliAgentWorker, type CliAgentDefinition } from './CliAgentWorker.js';
 
 export type WorkerStrategy = 'hybrid' | 'local' | 'cloud';
-export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli' | 'muse';
-export const CLOUD_PROVIDERS: CloudProvider[] = ['agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'claude-code', 'gemini-cli', 'muse'];
+export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'qwen' | 'openai-compat' | 'claude-code' | 'gemini-cli' | 'muse';
+export const CLOUD_PROVIDERS: CloudProvider[] = ['agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'qwen', 'openai-compat', 'claude-code', 'gemini-cli', 'muse'];
+/** Providers whose workers are the tool loop over an API transport. */
+export const API_PROVIDERS: CloudProvider[] = ['openai-api', 'anthropic', 'deepseek', 'qwen', 'openai-compat'];
 /** Providers that are whole coding agents with their own loop and permission rules. */
 export const AGENT_PROVIDERS: CloudProvider[] = ['claude-code', 'gemini-cli', 'muse'];
 

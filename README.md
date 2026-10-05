@@ -55,7 +55,8 @@ softfactory "add a farewell endpoint"
 - Git, Node.js 20+
 - Docker, for the sandbox (or `--sandbox=none` and accept host execution)
 - Local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b` (or any tool-capable model via `--local-model`)
-- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), Claude Code (`claude-code`), Gemini CLI (`gemini-cli`), Muse Code (`muse`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
+- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), Claude Code (`claude-code`), Gemini CLI (`gemini-cli`), Muse Code (`muse`), or an API key: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (Qwen), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or any OpenAI-compatible endpoint via `SOFTFACTORY_COMPAT_BASE_URL` and `SOFTFACTORY_COMPAT_API_KEY`
+- Keys may live in a `.env` in the repository root: it is read at start for names not already exported, never copied into worktrees, never committed
 
 ## Usage
 
@@ -76,6 +77,9 @@ softfactory --strategy=hybrid --cloud-provider=openai --resume
 softfactory --strategy=cloud --cloud-provider=openai-api --cloud-model=gpt-5.4 "refactor ledger engine"
 softfactory --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4 "refactor ledger engine"
 softfactory --strategy=hybrid --cloud-provider=deepseek --cloud-model=deepseek-v4-flash --frontier-model=deepseek-v4-pro "refactor ledger engine"
+softfactory --strategy=cloud --cloud-provider=qwen "refactor ledger engine"                      # qwen3-coder-plus, escalating to qwen3.8-max
+SOFTFACTORY_COMPAT_BASE_URL=https://api.moonshot.ai/v1 SOFTFACTORY_COMPAT_API_KEY=... \
+  softfactory --strategy=cloud --cloud-provider=openai-compat --cloud-model=kimi-k2.7-code-highspeed "refactor ledger engine"
 
 # Claude Code or Gemini CLI as the worker: inside the agent container with the sandbox on
 ANTHROPIC_API_KEY=... softfactory --strategy=cloud --cloud-provider=claude-code "refactor ledger engine"
@@ -106,11 +110,11 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | :--- | :--- | :--- |
 | `--strategy` | `hybrid`, `local`, `cloud` | `hybrid` |
 | `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, `none` (host allowlist only, loud warning) | `auto` |
-| `--cloud-provider` | `agy`, `openai` (Codex CLI), `claude-code`, `gemini-cli`, `muse`, `openai-api`, `anthropic`, `deepseek` | `agy` |
+| `--cloud-provider` | `agy`, `openai` (Codex CLI), `claude-code`, `gemini-cli`, `muse`, `openai-api`, `anthropic`, `deepseek`, `qwen`, `openai-compat` | `agy` |
 | `--cloud-model` | Cloud model; optional for Codex CLI, which uses its configured default | provider default |
 | `--frontier-model` | Escalation and blind-review model; optional for Codex CLI | provider default |
 | `--local-model` | Ollama model; pins every local tier when set | `qwen2.5-coder:7b` / `14b` tiers |
-| `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `muse`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
+| `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `muse`, `deepseek`, `qwen`, `anthropic`, `openai-api`, `openai-compat`, `local` | follows the cloud provider; `local` for a local run |
 | `--planner-model` | Planner model override | provider default |
 | `--plan` | Save the plan without executing | `false` |
 | `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
@@ -128,7 +132,7 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--no-tui` | Plain stdout instead of the Ink TUI | TUI when interactive |
 | `--no-docker` | Skip the post-build docker-compose check of the finished app | auto-detect |
 
-Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_AGENT_IMAGE` (or `agentImage`) for the agent container's image when the project needs more than node in it; `SOFTFACTORY_EGRESS_ALLOW` for extra hosts (`host` or `host:port`, `*.example.com`) the agent container may reach; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
+Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (and `DASHSCOPE_BASE_URL`, default the international compatible-mode endpoint), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `META_API_KEY`; `SOFTFACTORY_COMPAT_BASE_URL`, `SOFTFACTORY_COMPAT_API_KEY`, `SOFTFACTORY_COMPAT_LABEL`, `SOFTFACTORY_COMPAT_CONTEXT` for any other OpenAI-compatible endpoint; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_AGENT_IMAGE` (or `agentImage`) for the agent container's image when the project needs more than node in it; `SOFTFACTORY_EGRESS_ALLOW` for extra hosts (`host` or `host:port`, `*.example.com`) the agent container may reach; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
 
 ## A whole agent as the worker
 

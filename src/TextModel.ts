@@ -25,7 +25,34 @@ export interface ITextModel {
   complete(prompt: string, options?: CompletionOptions): Promise<string>;
 }
 
-export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli' | 'muse';
+export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'qwen' | 'openai-compat' | 'claude-code' | 'gemini-cli' | 'muse';
+
+/**
+ * Whether a model listing covers a model id. Listings are advisory: DeepSeek
+ * lists "deepseek-flash" and serves "deepseek-v4-flash", so a version segment
+ * is ignored when matching, and an empty listing never blocks a run.
+ */
+export function modelListed(model: string, listed: string[]): boolean {
+  if (!model || listed.length === 0) return true;
+  const canon = (id: string) => id.toLowerCase().replace(/-v\d+(?:\.\d+)*(?=-|$)/g, '').replace(/:latest$/, '');
+  return listed.includes(model) || listed.some(id => canon(id) === canon(model));
+}
+
+/** OpenAI-compatible endpoints configured by name: Qwen on DashScope, or anything behind SOFTFACTORY_COMPAT_BASE_URL. */
+export interface CompatEndpoint { provider: TextModelProvider; label: string; baseUrl: string; apiKeyEnv: string; contextWindow: number; timeoutEnv: string }
+
+export function compatEndpoint(provider: 'qwen' | 'openai-compat', env: NodeJS.ProcessEnv = process.env): CompatEndpoint {
+  if (provider === 'qwen') {
+    return {
+      provider, label: 'Qwen', apiKeyEnv: 'DASHSCOPE_API_KEY', contextWindow: 128000, timeoutEnv: 'SOFTFACTORY_QWEN_TIMEOUT_MS',
+      baseUrl: (env.DASHSCOPE_BASE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, ''),
+    };
+  }
+  return {
+    provider, label: env.SOFTFACTORY_COMPAT_LABEL || 'Compat', apiKeyEnv: 'SOFTFACTORY_COMPAT_API_KEY', contextWindow: Number(env.SOFTFACTORY_COMPAT_CONTEXT) || 128000, timeoutEnv: 'SOFTFACTORY_COMPAT_TIMEOUT_MS',
+    baseUrl: (env.SOFTFACTORY_COMPAT_BASE_URL || '').replace(/\/+$/, ''),
+  };
+}
 
 /**
  * Size a local window against the host, not the model's name. A 14B at 8192
@@ -265,6 +292,45 @@ export class AnthropicTextModel implements ITextModel {
   }
 }
 
+/** Any OpenAI chat-completions endpoint as a text model. */
+export class OpenAiCompatibleTextModel implements ITextModel {
+  readonly provider: TextModelProvider;
+  constructor(readonly model: string, private readonly endpoint: CompatEndpoint, private readonly fetchImpl: typeof fetch = fetch) {
+    this.provider = endpoint.provider;
+  }
+
+  private get apiKey(): string { return process.env[this.endpoint.apiKeyEnv] || ''; }
+
+  async isAvailable(): Promise<boolean> {
+    if (!this.apiKey || !this.endpoint.baseUrl) return false;
+    try {
+      const response = await fetchWithTimeout(this.fetchImpl, `${this.endpoint.baseUrl}/models`, { headers: { Authorization: `Bearer ${this.apiKey}` } }, 8000);
+      if (response.status === 401 || response.status === 403) return false;
+      if (!response.ok) return true;
+      const data = await response.json() as any;
+      return modelListed(this.model, (data.data || []).map((entry: any) => entry.id).filter(Boolean));
+    } catch {
+      return false;
+    }
+  }
+
+  async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
+    if (!this.endpoint.baseUrl) throw new WorkerEnvironmentError(`${this.endpoint.label}: no base URL configured (set SOFTFACTORY_COMPAT_BASE_URL).`);
+    if (!this.apiKey) throw new WorkerEnvironmentError(`${this.endpoint.apiKeyEnv} is not set.`);
+    const response = await fetchWithTimeout(this.fetchImpl, `${this.endpoint.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.apiKey}` },
+      // No response_format: not every compatible endpoint accepts it, and the callers parse JSON out of text anyway.
+      body: JSON.stringify({ model: this.model, messages: [{ role: 'user', content: prompt }], stream: false, temperature: options.temperature ?? 0.1 }),
+    }, options.timeoutMs ?? 8 * 60_000);
+    if (!response.ok) throw new WorkerEnvironmentError(`${this.endpoint.label} request failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
+    const data: any = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error(`${this.endpoint.label} model ${this.model} returned an empty response.`);
+    return content;
+  }
+}
+
 export class DeepSeekTextModel implements ITextModel {
   readonly provider = 'deepseek';
   constructor(readonly model: string, private readonly fetchImpl: typeof fetch = fetch) {}
@@ -276,7 +342,7 @@ export class DeepSeekTextModel implements ITextModel {
       const response = await fetchWithTimeout(this.fetchImpl, 'https://api.deepseek.com/models', { headers: { Authorization: `Bearer ${apiKey}` } }, 5000);
       if (!response.ok) return false;
       const data = await response.json() as any;
-      return (data.data || []).some((entry: any) => entry.id === this.model);
+      return modelListed(this.model, (data.data || []).map((entry: any) => entry.id).filter(Boolean));
     } catch {
       return false;
     }
@@ -318,6 +384,8 @@ export function createTextModel(provider: TextModelProvider, model: string, opti
     case 'openai-api': return new OpenAiTextModel(model, options.fetchImpl);
     case 'anthropic': return new AnthropicTextModel(model, options.fetchImpl);
     case 'deepseek': return new DeepSeekTextModel(model, options.fetchImpl);
+    case 'qwen':
+    case 'openai-compat': return new OpenAiCompatibleTextModel(model, compatEndpoint(provider), options.fetchImpl);
     case 'claude-code': return new ClaudeCodeTextModel(model, options.cwd);
     case 'gemini-cli': return new GeminiCliTextModel(model, options.cwd);
     case 'muse': return new MuseTextModel(model, options.cwd);

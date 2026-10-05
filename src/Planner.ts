@@ -8,7 +8,7 @@ import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type
 import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
-export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api' | 'claude-code' | 'gemini-cli' | 'muse';
+export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api' | 'qwen' | 'openai-compat' | 'claude-code' | 'gemini-cli' | 'muse';
 
 const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
@@ -358,8 +358,9 @@ export class CliPlanner extends TextModelPlanner {
 
 /** Planning on the Anthropic or OpenAI API directly, so a run needs no CLI besides git. */
 export class ApiPlanner extends TextModelPlanner {
-  constructor(provider: 'anthropic' | 'openai-api', model = '') {
-    super(provider, createTextModel(provider, model || (provider === 'anthropic' ? 'claude-sonnet-4' : 'gpt-5.4')));
+  constructor(provider: 'anthropic' | 'openai-api' | 'qwen' | 'openai-compat', model = '') {
+    const defaults: Record<string, string> = { anthropic: 'claude-sonnet-4', 'openai-api': 'gpt-5.4', qwen: 'qwen3-coder-plus', 'openai-compat': '' };
+    super(provider, createTextModel(provider, model || defaults[provider]));
   }
 }
 

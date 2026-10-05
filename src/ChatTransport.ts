@@ -1,4 +1,4 @@
-import { safeLocalContextWindow } from './TextModel.js';
+import { compatEndpoint, modelListed, safeLocalContextWindow } from './TextModel.js';
 
 /**
  * One tool-calling chat backend. The tool loop (ToolLoopWorker) is written
@@ -62,7 +62,7 @@ export interface ChatTransport {
   chat(request: ChatRequest): Promise<ChatReply>;
 }
 
-export type ChatProvider = 'local' | 'deepseek' | 'openai-api' | 'anthropic';
+export type ChatProvider = 'local' | 'deepseek' | 'openai-api' | 'anthropic' | 'qwen' | 'openai-compat';
 
 const asObject = (args: unknown): Record<string, unknown> => {
   if (args && typeof args === 'object') return args as Record<string, unknown>;
@@ -189,13 +189,14 @@ export class OpenAiCompatibleChatTransport implements ChatTransport {
       if (!response.ok) return { reachable: true, modelPresent: false, installed: [] };
       const data = await response.json() as any;
       const installed: string[] = (data.data || []).map((entry: any) => entry.id).filter(Boolean);
-      return { reachable: true, modelPresent: !model || installed.includes(model), installed };
+      return { reachable: true, modelPresent: !model || modelListed(model, installed), installed };
     } catch {
       return { reachable: false, modelPresent: false, installed: [] };
     }
   }
 
   unreachable(): string {
+    if (!this.config.chatUrl) return `${this.label}: no base URL configured. Set SOFTFACTORY_COMPAT_BASE_URL to the endpoint's /v1 root.`;
     return `${this.label} API is not reachable, rejected the credentials, or ${this.config.apiKeyEnv} is not set.`;
   }
 
@@ -336,5 +337,14 @@ export function createChatTransport(provider: ChatProvider, options: ChatTranspo
       }, options.fetchImpl);
     case 'anthropic':
       return new AnthropicChatTransport(options.fetchImpl);
+    case 'qwen':
+    case 'openai-compat': {
+      const endpoint = compatEndpoint(provider);
+      return new OpenAiCompatibleChatTransport({
+        id: `${provider}-cloud`, name: `${endpoint.label} Cloud Worker`, label: endpoint.label,
+        chatUrl: endpoint.baseUrl ? `${endpoint.baseUrl}/chat/completions` : '', modelsUrl: endpoint.baseUrl ? `${endpoint.baseUrl}/models` : '',
+        apiKeyEnv: endpoint.apiKeyEnv, contextWindow: endpoint.contextWindow, timeoutEnv: endpoint.timeoutEnv,
+      }, options.fetchImpl);
+    }
   }
 }

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Factory } from './Factory.js';
 import { RunJournal } from './RunJournal.js';
 import { GitHub, requirementFromIssue } from './PullRequest.js';
+import { loadDotEnv } from './dotenv.js';
 import { WorkerStrategy, CloudProvider, CLOUD_PROVIDERS, AGENT_PROVIDERS } from './WorkerRegistry.js';
 import type { PlannerProvider } from './Planner.js';
 import type { SandboxMode } from './Sandbox.js';
@@ -18,7 +19,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -52,6 +53,9 @@ function getFlagValue(args: string[], flag: string): string | undefined {
 }
 
 async function main() {
+  // Keys in the repository's .env are read for names not already exported.
+  // The file itself never reaches a worktree or a commit.
+  const loadedFromDotEnv = await loadDotEnv(process.cwd());
   const apiKey = process.env.GEMINI_API_KEY || '';
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
@@ -86,10 +90,10 @@ async function main() {
   // The planner follows the cloud provider unless told otherwise, so a run
   // configured with one API key needs nothing else.
   const defaultPlanner = strategyArg === 'local' ? 'local'
-    : ['deepseek', 'anthropic', 'openai-api', ...AGENT_PROVIDERS].includes(cloudProviderArg) ? cloudProviderArg
+    : ['deepseek', 'anthropic', 'openai-api', 'qwen', 'openai-compat', ...AGENT_PROVIDERS].includes(cloudProviderArg) ? cloudProviderArg
     : 'openai';
   const plannerProviderArg = (getFlagValue(args, '--planner-provider') || defaultPlanner) as PlannerProvider;
-  const PLANNERS = ['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api', 'claude-code', 'gemini-cli', 'muse'];
+  const PLANNERS = ['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api', 'qwen', 'openai-compat', 'claude-code', 'gemini-cli', 'muse'];
   if (!PLANNERS.includes(plannerProviderArg)) {
     throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use one of ${PLANNERS.join(', ')}.`);
   }
@@ -116,8 +120,15 @@ async function main() {
   if (maxTokensArg !== undefined && (!Number.isFinite(maxTokensArg) || maxTokensArg <= 0)) throw new Error(`--max-tokens expects a positive number; got "${maxTokensRaw}".`);
   // CLI agents (Codex, Claude Code, Gemini CLI) have their own configured default model.
   const agentDefault = cloudProviderArg === 'openai' || AGENT_PROVIDERS.includes(cloudProviderArg);
-  const cloudModelArg = getFlagValue(args, '--cloud-model') || (agentDefault ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-flash' : 'Gemini 3.7 Flash (High)');
-  const frontierModelArg = getFlagValue(args, '--frontier-model') || (agentDefault ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-pro' : 'Gemini 3.1 Pro (High)');
+  const MODEL_DEFAULTS: Record<string, [string, string]> = { deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'], qwen: ['qwen3-coder-plus', 'qwen3.8-max'], 'openai-compat': ['', ''] };
+  const [defaultCloud, defaultFrontier] = agentDefault ? ['', ''] : MODEL_DEFAULTS[cloudProviderArg] || ['Gemini 3.7 Flash (High)', 'Gemini 3.1 Pro (High)'];
+  const cloudModelArg = getFlagValue(args, '--cloud-model') || defaultCloud;
+  const frontierModelArg = getFlagValue(args, '--frontier-model') || defaultFrontier || cloudModelArg;
+  if (cloudProviderArg === 'openai-compat') {
+    if (!process.env.SOFTFACTORY_COMPAT_BASE_URL) throw new Error('--cloud-provider=openai-compat needs SOFTFACTORY_COMPAT_BASE_URL (the endpoint\'s /v1 root) and SOFTFACTORY_COMPAT_API_KEY.');
+    if (!cloudModelArg && strategyArg !== 'local') throw new Error('--cloud-provider=openai-compat needs --cloud-model.');
+  }
+  if (loadedFromDotEnv.length && !historyMode) console.error(`[SoftFactory] Loaded ${loadedFromDotEnv.join(', ')} from .env`);
 
   if (historyMode) {
     const factory = new Factory(process.cwd(), apiKey, {

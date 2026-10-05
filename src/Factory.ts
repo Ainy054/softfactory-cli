@@ -144,7 +144,7 @@ export class Factory extends EventEmitter {
                 ? new DeepSeekPlanner(plannerModel || 'deepseek-v4-pro')
             : plannerProvider === 'local'
                 ? new LocalPlanner(plannerModel || heavyLocal)
-            : plannerProvider === 'anthropic' || plannerProvider === 'openai-api'
+            : plannerProvider === 'anthropic' || plannerProvider === 'openai-api' || plannerProvider === 'qwen' || plannerProvider === 'openai-compat'
                 ? new ApiPlanner(plannerProvider, plannerModel)
             : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli' || plannerProvider === 'muse'
                 ? new CliPlanner(plannerProvider, plannerModel, baseDir)
