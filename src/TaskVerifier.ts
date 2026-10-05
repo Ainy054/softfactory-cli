@@ -64,23 +64,36 @@ export class TaskVerifier {
    */
   async verifyAll(projectPath: string): Promise<VerifierResult[]> {
     const results: VerifierResult[] = [];
-    const seen = new Set<string>();
+    // Probe only the ecosystems that exist. Probing both unconditionally and
+    // de-duplicating afterwards never worked — the key included the summary
+    // text, which differs per probe — so a Node-only project ran its whole
+    // suite twice at every final gate.
+    const present = await this.ecosystemsPresent(projectPath);
     for (const probe of [
-      { hint: 'frontend/x.tsx', key: 'node' },
-      { hint: 'backend/x.go', key: 'go' },
+      { hint: 'frontend/x.tsx', key: 'node' as const },
+      { hint: 'backend/x.go', key: 'go' as const },
     ]) {
+      if (!present.has(probe.key)) continue;
       const result = await this.verify(projectPath, { files_hint: [probe.hint] } as Task, true);
-      const id = `${probe.key}:${result.testSummary}`;
-      if (result.executed && !seen.has(id)) {
-        seen.add(id);
-        results.push(result);
-      }
+      if (result.executed) results.push(result);
     }
     if (results.length === 0) results.push(await this.verify(projectPath, undefined, true));
     return results;
   }
 
+  /** Which ecosystems the project contains, so the final gate runs each once. */
+  async ecosystemsPresent(projectPath: string): Promise<Set<'node' | 'go'>> {
+    const present = new Set<'node' | 'go'>();
+    if (await this.exists(path.join(projectPath, 'package.json')) || await this.exists(path.join(projectPath, 'frontend', 'package.json'))) present.add('node');
+    if (await this.exists(path.join(projectPath, 'go.mod')) || await this.exists(path.join(projectPath, 'backend', 'go.mod'))) present.add('go');
+    return present;
+  }
+
   async verify(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {
+    // Caches live for one verification only. A retry reuses the same worktree
+    // path, and a test file or config added since the last attempt must be seen.
+    this.testFileCache.clear();
+    this.configCache.clear();
     const result = await this.runVerification(worktreePath, task, fullSuite);
     const scope = this.scopeForTask(task);
     const enriched = result.executed && !result.counts
@@ -198,7 +211,21 @@ export class TaskVerifier {
           testSummary: 'make test passed',
           output: this.clip(stdout || stderr),
         };
-      } catch {}
+      } catch (e: any) {
+        // Only a missing `make`, or a Makefile without a test target, means
+        // "no runner here". A failing target is a failing suite; swallowing it
+        // fell through to "no runner detected" and passed the task.
+        const out = String(e.stderr || e.stdout || e.message || '');
+        const noRunner = e.exitCode === undefined || e.exitCode === 127 || /No rule to make target/i.test(out);
+        if (!noRunner) {
+          return {
+            executed: true,
+            passed: false,
+            testSummary: 'make test failure',
+            output: this.clip(e.stdout || e.stderr || e.message),
+          };
+        }
+      }
     }
 
     if (await this.hasTestFiles(worktreePath)) {
@@ -298,8 +325,7 @@ export class TaskVerifier {
         }
 
         const hasVitest = await this.exists(path.join(nodeDir, 'node_modules', '.bin', 'vitest'));
-        const binary = hasVitest ? './node_modules/.bin/vitest' : 'npm';
-        
+
         // Falling back to the whole of src gates a task on failures it does not
         // own: godo's T1 touches six config files, yet was held to a green
         // CalendarView.test.tsx that T5-T8 are meant to fix.
@@ -311,7 +337,7 @@ export class TaskVerifier {
         // it for assertion failures that pre-date it.
         const unscoped = !fullSuite && testFiles.length === 0;
         const scope = testFiles.length > 0 ? testFiles : ['src'];
-        const args = hasVitest ? ['run', ...scope] : ['test', '--', '--run', ...scope];
+        const { binary, args } = this.testRunnerArgs(String(pkg.scripts.test), hasVitest, scope);
 
         const runEnv = { ...testEnv, CI: 'true', VITEST_WATCH: 'false' };
         let stdout: string, stderr: string;
@@ -516,12 +542,25 @@ export class TaskVerifier {
    * failed to load — so the remaining failures are assertions that existed
    * before this task and are some other task's job.
    */
-  private isPreExistingAssertionFailure(output: string): boolean {
+  private isPreExistingAssertionFailure(raw: string): boolean {
+    // Coloured output never matched here while parseCounts stripped its
+    // escape codes, so a real red-but-collecting suite always failed the task.
+    const output = this.stripAnsi(raw);
     if (/Failed to load|Cannot find (?:module|package|dependency)|SyntaxError|Transform failed|esbuild|Unexpected token|ERR_MODULE_NOT_FOUND|error TS\d+/i.test(output)) {
       return false;
     }
-    const files = output.match(/Test Files\s+(?:(\d+) failed[^\n]*?)?\|?\s*(\d+) passed/);
-    return Boolean(files && Number(files[2]) > 0);
+    const files = this.tallyLine(output, /Test Files[^\n]*\(\d+\)/);
+    return Boolean(files && files.passed > 0);
+  }
+
+  /**
+   * Arguments for the project's own runner. `--run` belongs to vitest; jest
+   * rejects it as an unknown option and `node --test` treats it as a file.
+   */
+  testRunnerArgs(testScript: string, hasVitestBinary: boolean, scope: string[]): { binary: string; args: string[] } {
+    if (hasVitestBinary) return { binary: './node_modules/.bin/vitest', args: ['run', ...scope] };
+    const usesVitest = /\bvitest\b/.test(testScript);
+    return { binary: 'npm', args: ['test', '--', ...(usesVitest ? ['--run'] : []), ...scope] };
   }
 
   /**
@@ -563,17 +602,34 @@ export class TaskVerifier {
     return `${text.slice(0, head)}\n...[trimmed]...\n${text.slice(-(limit - head))}`;
   }
 
+  private stripAnsi(raw: string): string {
+    return String(raw ?? '').replace(/\u001b\[[0-9;]*m/g, '');
+  }
+
+  /**
+   * Reads each tally word independently. One regex across the whole line lost
+   * the passed count whenever a "skipped" or "todo" segment sat between
+   * "passed" and the total, which the regression gate then read as a drop.
+   */
+  private tallyLine(output: string, label: RegExp): { failed: number; passed: number; skipped: number } | undefined {
+    const match = output.match(label);
+    if (!match) return undefined;
+    const line = match[0];
+    const num = (word: string) => Number((line.match(new RegExp(`(\\d+) ${word}`)) || [])[1] || 0);
+    return { failed: num('failed'), passed: num('passed'), skipped: num('skipped') };
+  }
+
   parseCounts(raw: string): SuiteCounts | undefined {
     // Vitest colours its summary, so the line reads
     // "\u001b[2m Test Files \u001b[22m \u001b[31m43 failed" and \s+ never
     // matches across the escape codes.
-    const output = String(raw ?? '').replace(/\u001b\[[0-9;]*m/g, '');
-    const files = output.match(/Test Files\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
-    const tests = output.match(/\n\s*Tests\s+(?:(\d+) failed)?[^\n]*?(?:(\d+) passed)?\s*\((\d+)\)/);
+    const output = this.stripAnsi(raw);
+    const files = this.tallyLine(output, /Test Files[^\n]*\(\d+\)/);
+    const tests = this.tallyLine(output, /(?:^|\n)\s*Tests[^\n]*\(\d+\)/);
     if (files || tests) {
       return {
-        filesFailed: Number(files?.[1] || 0), filesPassed: Number(files?.[2] || 0),
-        testsFailed: Number(tests?.[1] || 0), testsPassed: Number(tests?.[2] || 0),
+        filesFailed: files?.failed || 0, filesPassed: files?.passed || 0,
+        testsFailed: tests?.failed || 0, testsPassed: tests?.passed || 0,
       };
     }
     const goFail = (output.match(/^--- FAIL:/gm) || []).length;

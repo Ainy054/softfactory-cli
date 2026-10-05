@@ -113,4 +113,68 @@ describe('WorktreeManager', () => {
     assert.equal(await fs.readFile(scratchPath, 'utf-8'), 'keep me');
     await manager.cleanup('T005', 'line/T005');
   });
+
+  it('aborts a conflicting merge so the main checkout is not left mid-merge', async () => {
+    const defaultBranch = await manager.getDefaultBranch();
+    const w6 = await manager.create('T006', 'line/T006');
+    await fs.writeFile(path.join(w6, 'README.md'), '# six');
+    await manager.commitWorktree('T006');
+    const w7 = await manager.create('T007', 'line/T007');
+    await fs.writeFile(path.join(w7, 'README.md'), '# seven');
+    await manager.commitWorktree('T007');
+
+    await manager.merge('T006', 'line/T006', defaultBranch);
+    await assert.rejects(() => manager.merge('T007', 'line/T007', defaultBranch));
+
+    await assert.rejects(() => fs.access(path.join(tmpDir, '.git', 'MERGE_HEAD')), 'MERGE_HEAD must be gone');
+    const readme = await fs.readFile(path.join(tmpDir, 'README.md'), 'utf-8');
+    assert.equal(readme, '# six', 'no conflict markers may remain in the user checkout');
+    const status = execSync('git status --porcelain', { cwd: tmpDir }).toString();
+    assert.ok(!/^(UU|AA|DD) /m.test(status), `unmerged paths remain:\n${status}`);
+
+    await manager.cleanup('T006', 'line/T006');
+    await manager.cleanup('T007', 'line/T007');
+  });
+
+  it('never commits a hydrated .env, even when the worker edited it', async () => {
+    await fs.writeFile(path.join(tmpDir, '.env'), 'APP_SECRET=12345\n');
+    const w = await manager.create('T008', 'line/T008');
+    await fs.writeFile(path.join(w, '.env'), 'APP_SECRET=leaked\n');
+    await fs.writeFile(path.join(w, '.env.production'), 'TOKEN=new\n');
+    await fs.writeFile(path.join(w, 'feature.txt'), 'real work');
+
+    const result = await manager.commitWorktree('T008');
+    assert.equal(result.committed, true);
+    assert.equal(result.filesChanged, 1);
+    const committed = execSync('git show --name-only --format= HEAD', { cwd: w }).toString().trim().split('\n');
+    assert.deepEqual(committed, ['feature.txt']);
+    await manager.cleanup('T008', 'line/T008');
+  });
+
+  it('reports no commit, without throwing, when only a secret file changed', async () => {
+    await fs.writeFile(path.join(tmpDir, '.env'), 'APP_SECRET=12345\n');
+    const w = await manager.create('T010', 'line/T010');
+    await fs.writeFile(path.join(w, '.env'), 'APP_SECRET=leaked\n');
+    const result = await manager.commitWorktree('T010');
+    assert.equal(result.committed, false);
+    await manager.cleanup('T010', 'line/T010');
+  });
+
+  it('deletes the branch even when the worktree directory is already gone', async () => {
+    const w = await manager.create('T009', 'line/T009');
+    await fs.rm(w, { recursive: true, force: true });
+    await manager.cleanup('T009', 'line/T009');
+    assert.equal(await manager.branchExists('line/T009'), false, 'the branch used to survive because one try block covered all three steps');
+  });
+});
+
+describe('secret file detection', () => {
+  it('matches env files and their variants but not examples', () => {
+    for (const f of ['.env', '.env.local', 'backend/.env.production', 'frontend/.env.test']) {
+      assert.equal(WorktreeManager.isSecretFile(f), true, f);
+    }
+    for (const f of ['.env.example', 'config.yaml', 'src/env.ts', 'environment.md']) {
+      assert.equal(WorktreeManager.isSecretFile(f), false, f);
+    }
+  });
 });

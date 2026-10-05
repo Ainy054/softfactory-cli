@@ -1,8 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { execa } from 'execa';
-import { Task, HandoffSchema, Handoff } from './types.js';
+import { Task, Handoff } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
@@ -210,9 +209,9 @@ ${projectContext}
     ];
 
     const safeCtx = this.getSafeContextWindow(model);
-    onOutput(`[LocalAgent] Booting multi-step ReAct loop with ${model} (ctx: ${safeCtx})`);
+    onOutput(`[DeepSeek] Booting multi-step ReAct loop with ${model} (ctx: ${safeCtx})`);
     if (!await this.probeToolSupport(model, tools, safeCtx)) {
-      throw new Error(`Ollama model "${model}" did not produce a parseable tool call; use a tool-capable model or the legacy worker.`);
+      throw new Error(`DeepSeek model "${model}" did not produce a parseable tool call; use a tool-capable model.`);
     }
     
     let finishRejections = 0;
@@ -235,6 +234,8 @@ ${projectContext}
     let callsSinceProgress = 0;
     let stalledWithoutProgress = false;
     let protocolError = '';
+    let finishAborted = false;
+    let lastFinishFailure = '';
     let scopeViolations = 0;
     const syntaxRejects = new Map<string, number>();
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
@@ -244,20 +245,24 @@ ${projectContext}
       try {
         messages = this.compactMessages(messages, safeCtx);
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), Number(process.env.SOFTFACTORY_LOCAL_TIMEOUT_MS) || 360000);
-        const response = await this.fetchImpl(`https://api.deepseek.com/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY || ''}` },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model,
-            messages,
-            tools,
-            stream: false,
-            temperature: Math.min(0.1 + ((task.attempts || 0) * 0.15), 0.8)
-          }),
-        });
-        clearTimeout(timeout);
+        const timeout = setTimeout(() => controller.abort(), Number(process.env.SOFTFACTORY_DEEPSEEK_TIMEOUT_MS) || Number(process.env.SOFTFACTORY_LOCAL_TIMEOUT_MS) || 360000);
+        let response: Response;
+        try {
+          response = await this.fetchImpl(`https://api.deepseek.com/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY || ''}` },
+            signal: controller.signal,
+            body: JSON.stringify({
+              model,
+              messages,
+              tools,
+              stream: false,
+              temperature: Math.min(0.1 + ((task.attempts || 0) * 0.15), 0.8)
+            }),
+          });
+        } finally {
+          clearTimeout(timeout);
+        }
 
         if (!response.ok) {
           const body = await response.text();
@@ -274,16 +279,18 @@ ${projectContext}
           function: { ...call.function, name: call.function?.name, arguments: call.function?.arguments ?? '{}' },
         }));
         
-        // Sometimes Ollama outputs content along with tool calls
+        // The model may return content alongside tool calls
         if (msg.content) {
-            onOutput(`[LocalAgent] ${msg.content}`);
+            onOutput(`[DeepSeek] ${msg.content}`);
         }
         
-        messages.push({ ...msg, tool_calls: toolCalls });
+        // An empty tool_calls array on a text-only turn is rejected by
+        // OpenAI-compatible endpoints; omit the key instead.
+        messages.push({ ...msg, tool_calls: toolCalls.length > 0 ? toolCalls : undefined });
 
         if (toolCalls.length === 0) {
           // Model returned plain text without calling a tool.
-          onOutput(`[LocalAgent] Model stopped without finishing. Reminding it...`);
+          onOutput(`[DeepSeek] Model stopped without finishing. Reminding it...`);
           messages.push({ role: 'user', content: 'You must call a tool. Either use read_file/replace_content to work, or finish_task to complete.' });
           continue;
         }
@@ -296,7 +303,7 @@ ${projectContext}
           catch (error: any) {
             const message = `Malformed tool arguments from DeepSeek: ${error.message}`;
             protocolError = message;
-            onOutput(`[LocalAgent] ❌ ${message}`);
+            onOutput(`[DeepSeek] ❌ ${message}`);
             repeatedCall = `protocol:${call.function?.name || 'unknown'}`;
             break;
           }
@@ -325,18 +332,21 @@ ${projectContext}
               : consecutive >= DeepSeekCloudWorker.REPEAT_ABORT
                 ? `'${name}' repeated ${consecutive} times in a row`
                 : `'${name}' called ${total} times with identical arguments`;
-            onOutput(`[LocalAgent] ⛔ Aborting: ${why} with no progress.`);
+            onOutput(`[DeepSeek] ⛔ Aborting: ${why} with no progress.`);
             break;
           }
           if (consecutive >= DeepSeekCloudWorker.REPEAT_WARN) {
-            onOutput(`[LocalAgent] ↻ '${name}' repeated ${consecutive}x — refusing to re-run it.`);
-            messages.push({ role: 'tool', content: `You have already called ${name} with these exact arguments ${consecutive} times and the result is earlier in this conversation. Do not call it again. Either make an edit with write_file/replace_lines/replace_content, read a different file or line range, or call finish_task.` } as any);
+            onOutput(`[DeepSeek] ↻ '${name}' repeated ${consecutive}x — refusing to re-run it.`);
+            // Every tool message must answer a call by id, this one included,
+            // or the next request fails with a 400 that surfaced as a
+            // "protocol error" and ended the attempt.
+            messages.push({ role: 'tool', tool_call_id: call.id, content: `You have already called ${name} with these exact arguments ${consecutive} times and the result is earlier in this conversation. Do not call it again. Either make an edit with write_file/replace_lines/replace_content, read a different file or line range, or call finish_task.` } as any);
             continue;
           }
 
           try {
             if (name === 'read_file') {
-              onOutput(`[LocalAgent] 📖 Reading ${args.filepath}`);
+              onOutput(`[DeepSeek] 📖 Reading ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, false);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
@@ -345,7 +355,7 @@ ${projectContext}
               const end = Number.isInteger(Number(args.end_line)) && Number(args.end_line) >= start ? Math.min(Number(args.end_line), allLines.length) : Math.min(allLines.length, start + 199);
               toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).map((line, i) => `${start + i} | ${line}`).join('\n')}`.slice(0, this.maxFileRead);
             } else if (name === 'replace_lines') {
-              onOutput(`[LocalAgent] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
+              onOutput(`[DeepSeek] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
@@ -358,30 +368,37 @@ ${projectContext}
               lines.splice(start - 1, end - start + 1, String(args.replacement_content));
               toolResult = await this.writeChecked(fullPath, args.filepath, lines.join('\n'), content, changedFiles, 'Lines successfully replaced.', worktreePath);
             } else if (name === 'write_file') {
-              onOutput(`[LocalAgent] ✍️ Writing ${args.filepath}`);
+              onOutput(`[DeepSeek] ✍️ Writing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               await fs.mkdir(path.dirname(fullPath), { recursive: true });
               const previous = await fs.readFile(fullPath, 'utf-8').catch(() => null);
               toolResult = await this.writeChecked(fullPath, args.filepath, String(args.content), previous, changedFiles, 'File successfully written.', worktreePath);
             } else if (name === 'replace_content') {
-              onOutput(`[LocalAgent] ✂️ Editing ${args.filepath}`);
+              onOutput(`[DeepSeek] ✂️ Editing ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
-              if (content.includes(args.target_content)) {
-                const newContent = content.replace(args.target_content, args.replacement_content);
+              const target = typeof args.target_content === 'string' ? args.target_content : '';
+              const occurrences = target ? content.split(target).length - 1 : 0;
+              if (occurrences === 1) {
+                // A function replacer: "$&", "$'" or "$1" in the model's text
+                // are literal code here, not pattern tokens.
+                const newContent = content.replace(target, () => String(args.replacement_content));
                 toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.', worktreePath);
+              } else if (occurrences > 1) {
+                toolResult = `ERROR: target_content occurs ${occurrences} times in ${args.filepath}, so the edit is ambiguous. Include more surrounding lines to make it unique, or use replace_lines with a line range.`;
+                onOutput(`[DeepSeek] ❌ target_content is ambiguous in ${args.filepath} (${occurrences} matches)`);
               } else {
                 // Telling a small model to "match whitespace exactly" is telling
                 // it to retry the thing it just proved it cannot do: 14 of 15
                 // edits failed this way in a row while replace_lines went
                 // unused. Hand it line numbers and point at that tool instead.
                 toolResult = this.matchFailureGuidance(args.filepath, content, String(args.target_content ?? ''));
-                onOutput(`[LocalAgent] ❌ target_content not found in ${args.filepath} — suggesting replace_lines`);
+                onOutput(`[DeepSeek] ❌ target_content not found in ${args.filepath} — suggesting replace_lines`);
               }
             } else if (name === 'run_command') {
-              onOutput(`[LocalAgent] 🖥️ Running: ${args.command}`);
+              onOutput(`[DeepSeek] 🖥️ Running: ${args.command}`);
               this.assertAllowedCommand(args.command);
               try {
                 // `cd x && y` is blocked by the allowlist, so without this a
@@ -398,14 +415,17 @@ ${projectContext}
               const verification = await this.verifier.verify(worktreePath, task, false);
               if (!verification.passed) {
                 finishRejections++;
-                if (finishRejections >= 2) {
-                  onOutput(`[LocalAgent] ⛔ Aborting: finish_task rejected twice due to test failures. Escalating...`);
-                  throw new Error(`finish_task rejected twice due to test failures: ${verification.testSummary}`);
-                }
+                lastFinishFailure = verification.testSummary;
                 toolResult = this.truncateToolResult(`Cannot finish. Tests failed: ${verification.testSummary}\n${verification.output}`);
-                onOutput(`[LocalAgent] ❌ Finish rejected (${finishRejections}/2): ${verification.testSummary}`);
+                onOutput(`[DeepSeek] ❌ Finish rejected (${finishRejections}/2): ${verification.testSummary}`);
+                if (finishRejections >= 2) {
+                  // Thrown from here, this was caught as an ordinary tool error
+                  // and the loop carried on to the iteration cap.
+                  finishAborted = true;
+                  onOutput(`[DeepSeek] ⛔ Aborting: finish_task rejected twice due to test failures. Escalating...`);
+                }
               } else {
-                onOutput(`[LocalAgent] ✅ Task finished: ${args.status}`);
+                onOutput(`[DeepSeek] ✅ Task finished: ${args.status}`);
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles) };
                 toolResult = 'Task completed and verification passed.';
               }
@@ -414,12 +434,12 @@ ${projectContext}
             }
           } catch (e: any) {
             toolResult = `Tool execution failed: ${e.message}`;
-            onOutput(`[LocalAgent] ❌ Tool error: ${e.message}`);
+            onOutput(`[DeepSeek] ❌ Tool error: ${e.message}`);
             if (/outside declared task scope/i.test(e.message)) {
               scopeViolations++;
               if (scopeViolations >= 2) {
                 repeatedCall = `scope:${args.filepath}`;
-                onOutput(`[LocalAgent] ⛔ Aborting: repeated out-of-scope edits for ${args.filepath}.`);
+                onOutput(`[DeepSeek] ⛔ Aborting: repeated out-of-scope edits for ${args.filepath}.`);
               }
             }
           }
@@ -433,14 +453,15 @@ ${projectContext}
             syntaxRejects.set(file, count);
             if (count >= 2) {
               repeatedCall = `syntax:${file}`;
-              onOutput(`[LocalAgent] ⛔ Aborting: repeated syntax-rejected edits for ${file}.`);
+              onOutput(`[DeepSeek] ⛔ Aborting: repeated syntax-rejected edits for ${file}.`);
             }
           }
-          if (mutated || name === 'finish_task') {
+          // A rejected finish_task is not progress; only an accepted one is.
+          if (mutated || (name === 'finish_task' && handoffResult)) {
             callsSinceProgress = 0;
           } else if (++callsSinceProgress >= DeepSeekCloudWorker.NO_PROGRESS_ABORT) {
             stalledWithoutProgress = true;
-            onOutput(`[LocalAgent] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
+            onOutput(`[DeepSeek] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
           }
 
           messages.push({
@@ -449,17 +470,18 @@ ${projectContext}
             content: toolResult
           } as any);
           await this.recordToolCall(diagnosticsDir, task, name, toolResult, args);
+          if (finishAborted) break;
         }
-        
-        if (repeatedCall || stalledWithoutProgress) break;
+
+        if (repeatedCall || stalledWithoutProgress || finishAborted) break;
         if (handoffResult) break;
 
       } catch (e: any) {
         if (/deserialize|400|422|tool_call_id|tool_calls/i.test(String(e.message))) {
           protocolError = String(e.message).slice(0, 1000);
-          onOutput(`[LocalAgent] ❌ DeepSeek protocol error: ${protocolError}`);
+          onOutput(`[DeepSeek] ❌ DeepSeek protocol error: ${protocolError}`);
         }
-        onOutput(`[LocalAgent] Crash in ReAct loop: ${e.message}`);
+        onOutput(`[DeepSeek] Crash in ReAct loop: ${e.message}`);
         break;
       }
     }
@@ -473,17 +495,19 @@ ${projectContext}
       status: 'failure',
       summary: protocolError
         ? `DeepSeek protocol error: ${protocolError}. Validate tool-call IDs and tool responses before retrying.`
+        : finishAborted
+        ? `DeepSeek worker called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`
         : stalledWithoutProgress
-        ? `LocalAgent made ${DeepSeekCloudWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
+        ? `DeepSeek worker made ${DeepSeekCloudWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
         : repeatedCall?.startsWith('scope:')
-        ? `LocalAgent attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
+        ? `DeepSeek worker attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
         : repeatedCall?.startsWith('syntax:')
-        ? `LocalAgent produced repeated invalid edits for ${repeatedCall.slice(7)}. Restore the last valid file and rewrite it coherently.`
+        ? `DeepSeek worker produced repeated invalid edits for ${repeatedCall.slice(7)}. Restore the last valid file and rewrite it coherently.`
         : repeatedCall
-        ? `LocalAgent stalled in a loop around ${repeatedCall.slice(0, 120)} without making progress. Try a different approach.`
+        ? `DeepSeek worker stalled in a loop around ${repeatedCall.slice(0, 120)} without making progress. Try a different approach.`
         : sawToolCall
-        ? 'LocalAgent stopped before calling finish_task or completing verification.'
-        : `LocalAgent received no parseable tool calls from Ollama. Last response: ${lastModelContent.slice(0, 500)}`,
+        ? 'DeepSeek worker stopped before calling finish_task or completing verification.'
+        : `DeepSeek worker received no parseable tool calls from DeepSeek. Last response: ${lastModelContent.slice(0, 500)}`,
       files_changed: Array.from(changedFiles)
     };
   }
@@ -518,7 +542,7 @@ ${projectContext}
           await fs.access(path.join(worktreePath, dir, manifest));
           roots.push(`${dir === '.' ? '(root)' : dir} -> ${manifest}`);
           break;
-        } catch (e) { console.error('DeepSeek /models threw:', e.message); /* not here */ }
+        } catch { /* not here */ }
       }
     }
     return roots;
@@ -712,8 +736,8 @@ ${projectContext}
       return;
     }
     if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
-    if (/[;&`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
-    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    if (/[;&`$<>\n\r]/.test(command) || /\|\|/.test(command)) throw new Error('Shell operators are not allowed.');
+    const segments = this.splitPipeline(command);
     if (segments.length > 1 && segments.some(part => !this.isReadOnlyCommand(part))) throw new Error('Only read-only commands may be piped.');
     if (!segments.length) throw new Error('Invalid command.');
     for (const segment of segments) this.assertAllowedCommandSegment(segment);
@@ -754,7 +778,7 @@ ${projectContext}
       });
       return { stdout: result.stdout, stderr: result.stderr };
     }
-    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    const segments = this.splitPipeline(command);
     let input: string | undefined;
     let stderr = '';
     for (const segment of segments) {
@@ -767,9 +791,34 @@ ${projectContext}
     return { stdout: input || '', stderr };
   }
 
+  /** Splits on `|` outside quotes, so `rg 'foo|bar' src` stays one command. */
+  private splitPipeline(command: string): string[] {
+    const segments: string[] = [];
+    let current = '';
+    let quote: '"' | "'" | null = null;
+    for (const ch of command) {
+      if (quote) {
+        current += ch;
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+        current += ch;
+      } else if (ch === '|') {
+        segments.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    segments.push(current);
+    return segments.map(part => part.trim()).filter(Boolean);
+  }
+
   private parseCommand(command: string): string[] {
     const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-    return parts.map(part => part.replace(/^(["'])|\1$/g, ''));
+    // Strip each quoted run down to its contents; the old regex removed only
+    // the opening quote.
+    return parts.map(part => part.replace(/"([^"]*)"|'([^']*)'/g, (_m, d, s) => d ?? s));
   }
 
   private safeCommandEnv(): NodeJS.ProcessEnv {
@@ -801,7 +850,12 @@ ${projectContext}
     });
 
     let start = Math.max(2, messages.length - 4);
-    while (start < messages.length && messages[start].role === 'tool') start++;
+    // Step back to the assistant turn that owns these tool results. Stepping
+    // forward walked past the end when one turn made four or more calls. The
+    // walk is bounded so a pathological run cannot drag history back in.
+    let owner = start;
+    while (owner > 2 && messages[owner].role === 'tool' && start - owner < 12) owner--;
+    if (messages[owner].role !== 'tool') start = owner;
 
     // The final tool result is what the model just asked for. Compacting it
     // before the model has ever seen it is what produced the read_file livelock:

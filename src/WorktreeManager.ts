@@ -159,17 +159,25 @@ export class WorktreeManager {
     }
   }
 
+  /** Files that carry credentials: hydrated for the worker's benefit, never committed. */
+  static isSecretFile(relativePath: string): boolean {
+    return /(^|[\\/])\.env(\.[A-Za-z0-9_.-]+)?$/.test(relativePath) && !/\.example$/i.test(relativePath);
+  }
+
   async commitWorktree(taskId: string): Promise<{ committed: boolean; filesChanged: number }> {
     const worktreePath = path.join(this.worktreeBase, taskId);
 
     await execa('git', ['add', '.'], { cwd: worktreePath });
-    await this.unstageUnchangedHydratedFiles(taskId, worktreePath);
+    await this.unstageHydratedAndSecretFiles(taskId, worktreePath);
 
-    const { stdout: status } = await execa('git', ['status', '--porcelain'], { cwd: worktreePath });
-    if (status.trim()) {
-      const filesChanged = status.trim().split('\n').length;
+    // Count what is staged, not what `status --porcelain` lists: an unstaged
+    // hydrated file shows there as untracked, and committing "nothing added
+    // but untracked files present" throws.
+    const { stdout: staged } = await execa('git', ['diff', '--cached', '--name-only'], { cwd: worktreePath });
+    const stagedFiles = staged.split('\n').filter(Boolean);
+    if (stagedFiles.length > 0) {
       await execa('git', ['commit', '-m', `softfactory: complete task ${taskId}`], { cwd: worktreePath });
-      return { committed: true, filesChanged };
+      return { committed: true, filesChanged: stagedFiles.length };
     }
 
     // Worker may have committed its own changes (common with --dangerously-skip-permissions).
@@ -213,22 +221,29 @@ export class WorktreeManager {
     // Never reset or clean the primary checkout here: it may contain user work
     // unrelated to the factory task.
     await execa('git', ['checkout', branch], { cwd: this.baseDir });
-    const { stdout, stderr } = await execa('git', ['merge', branchName, '--no-ff', '-m', `softfactory: merge ${taskId}`], { cwd: this.baseDir });
-    return stdout || stderr;
+    try {
+      const { stdout, stderr } = await execa('git', ['merge', branchName, '--no-ff', '-m', `softfactory: merge ${taskId}`], { cwd: this.baseDir });
+      return stdout || stderr;
+    } catch (error) {
+      // A conflict must not leave the user's checkout mid-merge, with
+      // MERGE_HEAD set and conflict markers in tracked files, until the next
+      // task happens to call merge().
+      await execa('git', ['merge', '--abort'], { cwd: this.baseDir, reject: false });
+      throw error;
+    }
   }
 
   /** `keepBranch` preserves a failed attempt's commits for the next retry. */
   async cleanup(taskId: string, branchName: string, keepBranch = false) {
     const worktreePath = path.join(this.worktreeBase, taskId);
 
-    try {
-      await execa('git', ['worktree', 'remove', '-f', worktreePath], { cwd: this.baseDir });
-      await execa('git', ['worktree', 'prune'], { cwd: this.baseDir });
-      if (!keepBranch) {
-        await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir });
-      }
-    } catch (e) {
-      // Cleanup is best-effort
+    // Each step is best-effort on its own. One try block around all three
+    // meant a worktree that was already gone from disk skipped the branch
+    // delete, and line/* branches accumulated.
+    await execa('git', ['worktree', 'remove', '-f', worktreePath], { cwd: this.baseDir, reject: false });
+    await execa('git', ['worktree', 'prune'], { cwd: this.baseDir, reject: false });
+    if (!keepBranch) {
+      await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir, reject: false });
     }
     this.hydratedFiles.delete(taskId);
   }
@@ -240,16 +255,27 @@ export class WorktreeManager {
     this.hydratedFiles.set(taskId, files);
   }
 
-  private async unstageUnchangedHydratedFiles(taskId: string, worktreePath: string): Promise<void> {
-    const files = this.hydratedFiles.get(taskId);
-    if (!files) return;
+  private async unstageHydratedAndSecretFiles(taskId: string, worktreePath: string): Promise<void> {
+    const files = this.hydratedFiles.get(taskId) || new Map<string, Buffer>();
     for (const [relativePath, original] of files) {
+      // A hydrated .env came from the user's untracked local copy. Changed or
+      // not, it must never enter history: it was being committed, merged and
+      // captured into training data whenever a worker touched it.
+      if (WorktreeManager.isSecretFile(relativePath)) {
+        await execa('git', ['reset', '--', relativePath], { cwd: worktreePath, reject: false });
+        continue;
+      }
       try {
         const current = await fs.readFile(path.join(worktreePath, relativePath));
         if (current.equals(original)) {
           await execa('git', ['reset', '--', relativePath], { cwd: worktreePath, reject: false });
         }
       } catch {}
+    }
+    // A credential file the worker created itself gets the same treatment.
+    const { stdout } = await execa('git', ['diff', '--cached', '--name-only', '--diff-filter=A'], { cwd: worktreePath, reject: false });
+    for (const added of stdout.split('\n').filter(f => f && WorktreeManager.isSecretFile(f))) {
+      await execa('git', ['reset', '--', added], { cwd: worktreePath, reject: false });
     }
   }
 }

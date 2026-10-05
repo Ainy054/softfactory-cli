@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { execa } from 'execa';
-import { Task, HandoffSchema, Handoff } from './types.js';
+import { Task, Handoff } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
@@ -242,6 +242,8 @@ ${projectContext}
     // successful edit and stop on that regardless of what the calls look like.
     let callsSinceProgress = 0;
     let stalledWithoutProgress = false;
+    let finishAborted = false;
+    let lastFinishFailure = '';
     let scopeViolations = 0;
     const syntaxRejects = new Map<string, number>();
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
@@ -252,19 +254,24 @@ ${projectContext}
         messages = this.compactMessages(messages, safeCtx);
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), Number(process.env.SOFTFACTORY_LOCAL_TIMEOUT_MS) || 360000);
-        const response = await fetch(`${this.ollamaHost}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model,
-            messages,
-            tools,
-            stream: false,
-            options: { temperature: 0.1, num_ctx: safeCtx }
-          }),
-        });
-        clearTimeout(timeout);
+        let response: Response;
+        try {
+          response = await fetch(`${this.ollamaHost}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              model,
+              messages,
+              tools,
+              stream: false,
+              options: { temperature: 0.1, num_ctx: safeCtx }
+            }),
+          });
+        } finally {
+          // A failed fetch used to leave a six-minute timer holding the process open.
+          clearTimeout(timeout);
+        }
 
         if (!response.ok) {
           throw new Error(`Ollama API error: ${response.statusText}`);
@@ -362,9 +369,16 @@ ${projectContext}
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
-              if (content.includes(args.target_content)) {
-                const newContent = content.replace(args.target_content, args.replacement_content);
+              const target = typeof args.target_content === 'string' ? args.target_content : '';
+              const occurrences = target ? content.split(target).length - 1 : 0;
+              if (occurrences === 1) {
+                // A function replacer: "$&", "$'" or "$1" in the model's text
+                // are literal code here, not pattern tokens.
+                const newContent = content.replace(target, () => String(args.replacement_content));
                 toolResult = await this.writeChecked(fullPath, args.filepath, newContent, content, changedFiles, 'Content successfully replaced.', worktreePath);
+              } else if (occurrences > 1) {
+                toolResult = `ERROR: target_content occurs ${occurrences} times in ${args.filepath}, so the edit is ambiguous. Include more surrounding lines to make it unique, or use replace_lines with a line range.`;
+                onOutput(`[LocalAgent] ❌ target_content is ambiguous in ${args.filepath} (${occurrences} matches)`);
               } else {
                 // Telling a small model to "match whitespace exactly" is telling
                 // it to retry the thing it just proved it cannot do: 14 of 15
@@ -391,12 +405,16 @@ ${projectContext}
               const verification = await this.verifier.verify(worktreePath, task, false);
               if (!verification.passed) {
                 finishRejections++;
-                if (finishRejections >= 2) {
-                  onOutput(`[LocalAgent] ⛔ Aborting: finish_task rejected twice due to test failures. Escalating...`);
-                  throw new Error(`finish_task rejected twice due to test failures: ${verification.testSummary}`);
-                }
+                lastFinishFailure = verification.testSummary;
                 toolResult = this.truncateToolResult(`Cannot finish. Tests failed: ${verification.testSummary}\n${verification.output}`);
                 onOutput(`[LocalAgent] ❌ Finish rejected (${finishRejections}/2): ${verification.testSummary}`);
+                if (finishRejections >= 2) {
+                  // This used to `throw`, which the tool-error handler below
+                  // caught as an ordinary failed call. The loop then carried on
+                  // and finish_task could be rejected until the iteration cap.
+                  finishAborted = true;
+                  onOutput(`[LocalAgent] ⛔ Aborting: finish_task rejected twice due to test failures. Escalating...`);
+                }
               } else {
                 onOutput(`[LocalAgent] ✅ Task finished: ${args.status}`);
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles) };
@@ -429,7 +447,8 @@ ${projectContext}
               onOutput(`[LocalAgent] ⛔ Aborting: repeated syntax-rejected edits for ${file}.`);
             }
           }
-          if (mutated || name === 'finish_task') {
+          // A rejected finish_task is not progress; only an accepted one is.
+          if (mutated || (name === 'finish_task' && handoffResult)) {
             callsSinceProgress = 0;
           } else if (++callsSinceProgress >= LocalAgentWorker.NO_PROGRESS_ABORT) {
             stalledWithoutProgress = true;
@@ -441,9 +460,10 @@ ${projectContext}
             content: toolResult
           } as any);
           await this.recordToolCall(diagnosticsDir, task, name, toolResult, args);
+          if (finishAborted) break;
         }
-        
-        if (repeatedCall || stalledWithoutProgress) break;
+
+        if (repeatedCall || stalledWithoutProgress || finishAborted) break;
         if (handoffResult) break;
 
       } catch (e: any) {
@@ -459,7 +479,9 @@ ${projectContext}
     return {
       task_id: task.id,
       status: 'failure',
-      summary: stalledWithoutProgress
+      summary: finishAborted
+        ? `LocalAgent called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`
+        : stalledWithoutProgress
         ? `LocalAgent made ${LocalAgentWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
         : repeatedCall?.startsWith('scope:')
         ? `LocalAgent attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
@@ -698,8 +720,8 @@ ${projectContext}
       return;
     }
     if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
-    if (/[;&`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
-    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    if (/[;&`$<>\n\r]/.test(command) || /\|\|/.test(command)) throw new Error('Shell operators are not allowed.');
+    const segments = this.splitPipeline(command);
     if (segments.length > 1 && segments.some(part => !this.isReadOnlyCommand(part))) throw new Error('Only read-only commands may be piped.');
     if (!segments.length) throw new Error('Invalid command.');
     for (const segment of segments) this.assertAllowedCommandSegment(segment);
@@ -741,7 +763,7 @@ ${projectContext}
       });
       return { stdout: result.stdout, stderr: result.stderr };
     }
-    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    const segments = this.splitPipeline(command);
     let input: string | undefined;
     let stderr = '';
     for (const segment of segments) {
@@ -754,9 +776,38 @@ ${projectContext}
     return { stdout: input || '', stderr };
   }
 
+  /**
+   * Splits on `|` outside quotes. A plain split turned `rg 'foo|bar' src` into
+   * the segments `rg 'foo` and `bar' src`, and rejected the second as not
+   * allowlisted.
+   */
+  private splitPipeline(command: string): string[] {
+    const segments: string[] = [];
+    let current = '';
+    let quote: '"' | "'" | null = null;
+    for (const ch of command) {
+      if (quote) {
+        current += ch;
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+        current += ch;
+      } else if (ch === '|') {
+        segments.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    segments.push(current);
+    return segments.map(part => part.trim()).filter(Boolean);
+  }
+
   private parseCommand(command: string): string[] {
     const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-    return parts.map(part => part.replace(/^(["'])|\1$/g, ''));
+    // Strip each quoted run down to its contents. The old `^(["'])|\1$`
+    // removed only the opening quote, so programs received `foo bar"`.
+    return parts.map(part => part.replace(/"([^"]*)"|'([^']*)'/g, (_m, d, s) => d ?? s));
   }
 
   private safeCommandEnv(): NodeJS.ProcessEnv {
@@ -788,7 +839,14 @@ ${projectContext}
     });
 
     let start = Math.max(2, messages.length - 4);
-    while (start < messages.length && messages[start].role === 'tool') start++;
+    // Never begin on a tool result whose call is cut off: step back to the
+    // assistant turn that made it. Stepping forward instead walked past the
+    // end whenever one turn produced four or more tool results, which emptied
+    // the recent window and recreated the read_file livelock. The walk is
+    // bounded so a pathological run of results cannot drag history back in.
+    let owner = start;
+    while (owner > 2 && messages[owner].role === 'tool' && start - owner < 12) owner--;
+    if (messages[owner].role !== 'tool') start = owner;
 
     // The final tool result is what the model just asked for. Compacting it
     // before the model has ever seen it is what produced the read_file livelock:

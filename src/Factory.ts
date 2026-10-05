@@ -900,8 +900,16 @@ export class Factory extends EventEmitter {
     }
 
     detectVerificationSabotage(diff: string): string | null {
-        const removedTestScript = /^-\s*"test"\s*:/m.test(diff);
-        const addedTestScript = /^\+\s*"test"\s*:/m.test(diff);
+        // Only a package.json hunk can remove the test script. Matched against
+        // the whole diff, any JSON fixture or config that dropped a "test" key
+        // tripped this and rejected an honest task.
+        const sections = diff.split(/^(?=--- a\/)/m);
+        const hasHeaders = sections.some(section => /^--- a\//.test(section));
+        const manifestHunks = hasHeaders
+            ? sections.filter(section => /^--- a\/(?:.*\/)?package\.json/.test(section)).join('\n')
+            : diff;
+        const removedTestScript = /^-\s*"test"\s*:/m.test(manifestHunks);
+        const addedTestScript = /^\+\s*"test"\s*:/m.test(manifestHunks);
         if (removedTestScript && !addedTestScript) {
             return 'the "test" script was removed from package.json';
         }

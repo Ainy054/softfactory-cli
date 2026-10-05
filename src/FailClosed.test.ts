@@ -80,6 +80,25 @@ describe('a task cannot pass by disabling its own verification', () => {
   it('leaves ordinary changes alone', () => {
     assert.equal(factory.detectVerificationSabotage('--- a/src/x.ts\n+++ b/src/x.ts\n-const a = 1\n+const a = 2'), null);
   });
+
+  it('ignores a "test" key removed from a file that is not package.json', () => {
+    // A fixture or config with a "test" environment key is not the test script.
+    const diff = [
+      '--- a/fixtures/environments.json',
+      '+++ b/fixtures/environments.json',
+      '-  "test": { "enabled": true },',
+      '+  "staging": { "enabled": true },',
+    ].join('\n');
+    assert.equal(factory.detectVerificationSabotage(diff), null);
+  });
+
+  it('still catches the removal when package.json is one file among several', () => {
+    const diff = [
+      '--- a/src/x.ts', '+++ b/src/x.ts', '-const a = 1', '+const a = 2',
+      '--- a/package.json', '+++ b/package.json', '-  "test": "vitest",', '+  "test:unit": "vitest",',
+    ].join('\n');
+    assert.match(factory.detectVerificationSabotage(diff), /"test" script was removed/);
+  });
 });
 
 describe('declared files must actually be created', () => {
