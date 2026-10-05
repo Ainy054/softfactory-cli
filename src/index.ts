@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Factory } from './Factory.js';
 import { RunJournal } from './RunJournal.js';
+import { GitHub, requirementFromIssue } from './PullRequest.js';
 import { WorkerStrategy, CloudProvider } from './WorkerRegistry.js';
 import type { PlannerProvider } from './Planner.js';
 import type { SandboxMode } from './Sandbox.js';
@@ -13,11 +14,11 @@ const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
-  '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run'
+  '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -82,9 +83,14 @@ async function main() {
   if (!['agy', 'openai', 'openai-api', 'anthropic', 'deepseek'].includes(cloudProviderArg)) {
     throw new Error(`Unsupported --cloud-provider "${cloudProviderArg}". Use agy, openai, openai-api, anthropic, or deepseek.`);
   }
-  const plannerProviderArg = (getFlagValue(args, '--planner-provider') || (strategyArg === 'local' ? 'local' : cloudProviderArg === 'deepseek' ? 'deepseek' : 'openai')) as PlannerProvider;
-  if (!['openai', 'agy', 'local', 'deepseek'].includes(plannerProviderArg)) {
-    throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, local, or deepseek.`);
+  // The planner follows the cloud provider unless told otherwise, so a run
+  // configured with one API key needs nothing else.
+  const defaultPlanner = strategyArg === 'local' ? 'local'
+    : ['deepseek', 'anthropic', 'openai-api'].includes(cloudProviderArg) ? cloudProviderArg
+    : 'openai';
+  const plannerProviderArg = (getFlagValue(args, '--planner-provider') || defaultPlanner) as PlannerProvider;
+  if (!['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api'].includes(plannerProviderArg)) {
+    throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, local, deepseek, anthropic, or openai-api.`);
   }
   const plannerModelArg = getFlagValue(args, '--planner-model') || '';
   const sandboxArg = (getFlagValue(args, '--sandbox') || 'auto') as SandboxMode;
@@ -163,6 +169,22 @@ async function main() {
     return true;
   }).join(' ');
 
+  // Ticket in, pull request out. The issue text becomes the requirement;
+  // anything typed after the flags is appended as operator instructions.
+  const prMode = args.includes('--pr');
+  const issueRaw = getFlagValue(args, '--issue');
+  let issue: { number: number; url: string; title: string } | undefined;
+  if (issueRaw !== undefined && !resumeMode) {
+    const number = Number(issueRaw);
+    if (!Number.isInteger(number) || number <= 0) throw new Error(`--issue expects an issue number; got "${issueRaw}".`);
+    const github = new GitHub(process.cwd());
+    const availability = await github.availability();
+    if (!availability.ok) throw new Error(`--issue needs the GitHub CLI: ${availability.reason}`);
+    const loaded = await github.readIssue(number);
+    requirement = requirementFromIssue(loaded, requirement);
+    issue = { number: loaded.number, url: loaded.url, title: loaded.title };
+  }
+
   if (!resumeMode && !markDoneId && !requirement) {
     console.error(USAGE);
     process.exit(1);
@@ -195,6 +217,8 @@ async function main() {
     attemptTimeoutMinutes: attemptTimeoutArg,
     runBudgetMinutes: runBudgetArg,
     maxTokens: maxTokensArg,
+    prMode,
+    issue,
   });
   globalFactory = factory;
   await factory.init();

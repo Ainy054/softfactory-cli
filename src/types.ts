@@ -62,7 +62,7 @@ export const FactoryStateSchema = z.object({
   status: z.enum(['planning', 'planned', 'active', 'paused', 'completed', 'failed']),
   strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
   cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic', 'deepseek']).default('agy'),
-  planner_provider: z.enum(['openai', 'agy', 'local', 'deepseek']).default('openai'),
+  planner_provider: z.enum(['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api']).default('openai'),
   created_at: z.string(),
   last_updated: z.string(),
   state_revision: z.number().int().nonnegative().default(0),
@@ -77,6 +77,12 @@ export const FactoryStateSchema = z.object({
   memory_patterns: z.array(z.string()).default([]),
   /** Tokens the run has consumed across every attempt, where backends report them. */
   usage: z.object({ input_tokens: z.number().default(0), output_tokens: z.number().default(0) }).default({ input_tokens: 0, output_tokens: 0 }),
+  /** Where the requirement came from, when it was not typed on the command line. */
+  source: z.object({ kind: z.literal('issue'), number: z.number(), url: z.string(), title: z.string() }).optional(),
+  /** PR mode: passing tasks merge here instead of the base branch, and the branch becomes a pull request. */
+  integration_branch: z.string().optional(),
+  base_branch: z.string().optional(),
+  pull_request: z.object({ number: z.number(), url: z.string(), branch: z.string() }).optional(),
 });
 
 export type FactoryState = z.infer<typeof FactoryStateSchema>;

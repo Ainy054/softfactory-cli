@@ -1,0 +1,59 @@
+# Copy to .github/workflows/softfactory-issue.yml in the repository softfactory should work on.
+#
+# Label an issue "softfactory" and this runs the factory on it: plan, implement each task in a
+# sandboxed worktree, gate, merge into softfactory/<feature>, push, and open a pull request that
+# links the issue. Workers never get network or push rights; the push and the PR are done by the
+# orchestrator step with the workflow's token.
+#
+# Secrets to set: one of ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY. Pick the matching
+# --cloud-provider below. Docker is present on ubuntu runners, so the sandbox is on.
+name: softfactory
+on:
+  issues:
+    types: [labeled]
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+concurrency:
+  group: softfactory-${{ github.event.issue.number }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event.label.name == 'softfactory'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install softfactory
+        run: npm install -g softfactory-cli
+      - name: Configure git identity
+        run: |
+          git config user.name "softfactory"
+          git config user.email "softfactory@users.noreply.github.com"
+      - name: Run the factory on the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          softfactory --no-tui --sandbox=docker --strategy=cloud \
+            --cloud-provider=anthropic --cloud-model=claude-sonnet-4 --frontier-model=claude-opus-4 \
+            --planner-provider=anthropic \
+            --attempt-timeout 30 --run-budget 150 \
+            --issue ${{ github.event.issue.number }} --pr
+      - name: Keep the run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: softfactory-run-${{ github.event.issue.number }}
+          path: |
+            .softfactory/factory.json
+            .softfactory/runs/
+            .softfactory/evidence/
+            .softfactory/metrics.jsonl
+          if-no-files-found: ignore

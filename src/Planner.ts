@@ -4,11 +4,11 @@ import path from 'node:path';
 import { execa } from 'execa';
 import { z } from 'zod';
 import { extractJson } from './extractJson.js';
-import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, type ITextModel } from './TextModel.js';
+import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type ITextModel } from './TextModel.js';
 import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
-export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek';
+export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api';
 
 const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
@@ -347,6 +347,13 @@ export class LocalPlanner extends TextModelPlanner {
 
 export class DeepSeekPlanner extends TextModelPlanner {
   constructor(model = 'deepseek-v4-pro') { super('deepseek', new DeepSeekTextModel(model)); }
+}
+
+/** Planning on the Anthropic or OpenAI API directly, so a run needs no CLI besides git. */
+export class ApiPlanner extends TextModelPlanner {
+  constructor(provider: 'anthropic' | 'openai-api', model = '') {
+    super(provider, createTextModel(provider, model || (provider === 'anthropic' ? 'claude-sonnet-4' : 'gpt-5.4')));
+  }
 }
 
 function requirementHeadings(requirement: string): string[] {

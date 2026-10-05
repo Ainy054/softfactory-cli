@@ -10,13 +10,16 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { AgyPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { AgyPlanner, ApiPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
 import { createTextModel, OllamaTextModel, type TextModelProvider } from './TextModel.js';
 import { RunJournal } from './RunJournal.js';
+import { GitHub, buildPullRequestBody } from './PullRequest.js';
+import { SOFTFACTORY_VERSION } from './version.js';
 import type { Handoff } from './types.js';
+import type { RunMetrics } from './Metrics.js';
 import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
 import { redactSecrets } from './redact.js';
@@ -48,6 +51,10 @@ export interface FactoryOptions {
     runBudgetMinutes?: number;
     /** Token budget for the whole feature, across resumes. */
     maxTokens?: number;
+    /** Merge passing tasks into softfactory/<feature> instead of the base branch, then push it and open a pull request. */
+    prMode?: boolean;
+    /** The issue the requirement was read from, so the pull request can close it. */
+    issue?: { number: number; url: string; title: string };
 }
 
 export class Factory extends EventEmitter {
@@ -73,6 +80,12 @@ export class Factory extends EventEmitter {
     runStartedAt = Date.now();
     /** Short facts learned during this run, handed to the tasks that run after. */
     runNotes: Array<{ taskId: string; note: string }> = [];
+    prMode: boolean;
+    issue: { number: number; url: string; title: string } | undefined;
+    /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
+    github: GitHub;
+    lastMetrics: RunMetrics | undefined;
+    private prFinalized = false;
     private journals = new Map<string, RunJournal>();
     protectedPaths = new ProtectedPaths([]);
     sandbox: SandboxManager;
@@ -103,7 +116,10 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue } = options;
+        this.prMode = prMode;
+        this.issue = issue;
+        this.github = new GitHub(baseDir);
         this.attemptTimeoutMs = Math.max(1, attemptTimeoutMinutes) * 60_000;
         this.runBudgetMs = runBudgetMinutes ? Math.max(1, runBudgetMinutes) * 60_000 : undefined;
         this.maxTokens = maxTokens && maxTokens > 0 ? Math.floor(maxTokens) : undefined;
@@ -127,6 +143,8 @@ export class Factory extends EventEmitter {
                 ? new DeepSeekPlanner(plannerModel || 'deepseek-v4-pro')
             : plannerProvider === 'local'
                 ? new LocalPlanner(plannerModel || heavyLocal)
+            : plannerProvider === 'anthropic' || plannerProvider === 'openai-api'
+                ? new ApiPlanner(plannerProvider, plannerModel)
                 : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
         // The reviewer is the configured cloud provider's model, and nothing
         // else. It used to be the Antigravity CLI regardless of provider, with
@@ -182,6 +200,13 @@ export class Factory extends EventEmitter {
         if (await this.exists(this.statePath)) {
             const content = await fs.readFile(this.statePath, 'utf-8');
             this.state = this.loadState(content);
+            // A crash can leave HEAD on the integration branch; it is not the base.
+            if (this.state.integration_branch && this.state.base_branch && this.defaultBranch === this.state.integration_branch) {
+                this.defaultBranch = this.state.base_branch;
+            }
+            if (this.prMode && !this.state.integration_branch && this.state.status !== 'completed' && this.state.status !== 'failed') {
+                this.log(`NOTE: this build started without --pr; it merges into ${this.defaultBranch}. Start a new build with --pr for a pull request.`);
+            }
             // The command-line configuration is authoritative for the
             // process that is resuming the run. Older state files recorded
             // the original provider (often OpenAI) even when the resumed
@@ -381,6 +406,7 @@ export class Factory extends EventEmitter {
                 await this.worktreeManager.cleanup(task.id, `line/${task.id}`);
             } catch { /* best effort */ }
         }
+        await this.leaveIntegrationBranch().catch(() => undefined);
         return { reset: active.length };
     }
     async validateDoneTasks() {
@@ -451,6 +477,9 @@ export class Factory extends EventEmitter {
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
+            source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
+            integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
+            base_branch: this.prMode ? this.defaultBranch : undefined,
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
@@ -507,6 +536,9 @@ export class Factory extends EventEmitter {
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
+            source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
+            integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
+            base_branch: this.prMode ? this.defaultBranch : undefined,
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
@@ -554,11 +586,85 @@ export class Factory extends EventEmitter {
         }
         return null;
     }
+    /** Where passing tasks merge: the integration branch in PR mode, the base branch otherwise. */
+    mergeTarget(): string {
+        return this.state?.integration_branch || this.defaultBranch;
+    }
+    /** PR mode: create the integration branch from the base if needed and check it out, so worktrees and merges build on it. */
+    private async enterIntegrationBranch(): Promise<string | null> {
+        const branch = this.state.integration_branch;
+        if (!branch) return null;
+        const base = this.state.base_branch || this.defaultBranch;
+        if (!await this.worktreeManager.branchExists(branch)) {
+            const created = await execa('git', ['branch', branch, base], { cwd: this.baseDir, reject: false });
+            if (created.exitCode !== 0) return `Could not create ${branch} from ${base}: ${created.stderr.trim()}`;
+        }
+        const checkout = await execa('git', ['checkout', '-q', branch], { cwd: this.baseDir, reject: false });
+        if (checkout.exitCode !== 0) return `Could not check out ${branch} (is the working tree clean?): ${checkout.stderr.trim().split('\n').slice(-2).join(' ')}`;
+        this.log(`PR mode: merging into ${branch} (base ${base}); the pull request opens when the run ends`);
+        return null;
+    }
+    private async leaveIntegrationBranch(): Promise<void> {
+        const base = this.state?.base_branch;
+        if (!this.state?.integration_branch || !base) return;
+        await execa('git', ['checkout', '-q', base], { cwd: this.baseDir, reject: false });
+    }
+    /**
+     * PR mode's last step: push the integration branch and open (or update)
+     * the pull request. A draft until the run completes. Failure here never
+     * fails the run: the merged work is on the local branch either way.
+     */
+    async finalizePullRequest(): Promise<void> {
+        const branch = this.state?.integration_branch;
+        if (!branch || this.prFinalized) return;
+        this.prFinalized = true;
+        try {
+            const merged = this.state.tasks.filter(t => t.status === 'done' && t.executor === 'agent');
+            if (merged.length === 0) {
+                this.log(`PR: nothing merged into ${branch}, so no pull request was opened.`);
+                return;
+            }
+            const availability = await this.github.availability();
+            if (!availability.ok) {
+                this.log(`PR: ${availability.reason}. The work is on local branch ${branch}; push it and open the pull request by hand.`);
+                return;
+            }
+            await this.github.pushBranch(branch);
+            const base = this.state.base_branch || this.defaultBranch;
+            const journal = await RunJournal.verify(this.baseDir, this.state.feature_id);
+            const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, generator: `softfactory ${SOFTFACTORY_VERSION}` });
+            const title = this.state.source?.kind === 'issue' ? `${this.state.feature} (#${this.state.source.number})` : this.state.feature;
+            const completed = this.state.status === 'completed';
+            const existing = await this.github.findOpenPullRequest(branch);
+            let pr = existing;
+            if (existing) {
+                await this.github.updatePullRequest(existing.number, { title, body });
+                if (completed && existing.isDraft) await this.github.markReady(existing.number);
+            } else {
+                pr = await this.github.createPullRequest({ base, head: branch, title, body, draft: !completed });
+            }
+            this.state.pull_request = { number: pr!.number, url: pr!.url, branch };
+            await this.saveState();
+            await this.journal()?.append('run:pull-request', { number: pr!.number, url: pr!.url, branch, base, status: this.state.status, merged: merged.map(t => t.id) }).catch(() => undefined);
+            this.log(`PR: ${pr!.url}${completed ? '' : ' (draft until the run completes)'}`);
+        } catch (error: any) {
+            this.log(`PR: could not open the pull request: ${error?.message || error}. The work is on branch ${branch}.`);
+        } finally {
+            await this.leaveIntegrationBranch();
+        }
+    }
     async runWorkshopLoop() {
         await this.logBackendPreflight();
         if (this.environmentFault) {
             this.log(`HALTED: ${this.environmentFault}`);
             this.log('No task state was changed. Fix the backend configuration and run --resume.');
+            return;
+        }
+        this.prFinalized = false;
+        const branchFault = await this.enterIntegrationBranch();
+        if (branchFault) {
+            this.environmentFault = branchFault;
+            this.log(`HALTED: ${branchFault}`);
             return;
         }
         if (!this.baseline) await this.captureBaseline();
@@ -626,7 +732,7 @@ export class Factory extends EventEmitter {
                 if (result.status === 'fulfilled' && result.value) {
                     const { task, branchName } = result.value;
                     try {
-                        await this.worktreeManager.merge(task.id, branchName, this.defaultBranch);
+                        await this.worktreeManager.merge(task.id, branchName, this.mergeTarget());
                         task.status = 'done';
                         await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
@@ -665,6 +771,7 @@ export class Factory extends EventEmitter {
             await this.saveState();
             await this.updateHistory('active');
             this.log(`Run halted by an environment fault: ${this.environmentFault}`);
+            await this.finalizePullRequest();
             this.emitEvent({ type: 'build:complete', status: 'failed', feature: this.state.feature });
             return;
         }
@@ -677,6 +784,7 @@ export class Factory extends EventEmitter {
             this.log(`PAUSED: ${awaitingHuman.length} task(s) need a person: ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}`);
             this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
             if (failedTasks.length > 0) this.log(`Also unresolved: ${failedTasks.map(t => `${t.id}:${t.status}`).join(', ')}`);
+            await this.finalizePullRequest();
             this.emitEvent({ type: 'build:complete', status: 'paused', feature: this.state.feature });
             return;
         }
@@ -694,7 +802,7 @@ export class Factory extends EventEmitter {
                 this.log(`Final gate: ${check.passed ? 'PASS' : 'FAIL'} — ${check.testSummary}`);
             }
             if (blocking.length > 0) {
-                this.log(`FINAL GATE FAILED on ${this.defaultBranch}: ${blocking.map(c => c.testSummary).join('; ')}`);
+                this.log(`FINAL GATE FAILED on ${this.mergeTarget()}: ${blocking.map(c => c.testSummary).join('; ')}`);
                 this.log(blocking[0].output.slice(0, 1000));
                 this.state.status = 'failed';
                 await this.saveState();
@@ -708,6 +816,7 @@ export class Factory extends EventEmitter {
             if (this.state.status === 'completed') await this.synthesizeMemory();
         }
         await this.writeRunMetrics();
+        await this.finalizePullRequest();
         this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
         if (failedTasks.length > 0) {
             this.log(`Build partial: ${doneTasks.length}/${this.state.tasks.length} tasks completed, ${failedTasks.length} failed/skipped`);
@@ -1418,6 +1527,7 @@ export class Factory extends EventEmitter {
     private async writeRunMetrics() {
         try {
             const metrics = await computeRunMetrics(this.baseDir, this.state);
+            this.lastMetrics = metrics;
             await appendRunMetrics(this.baseDir, metrics);
             await this.journal()?.append('run:complete', { status: this.state.status, metrics: metrics as unknown as Record<string, unknown> }).catch(() => undefined);
             this.log(`Metrics: ${metrics.done}/${metrics.tasks} done, first-attempt rate ${metrics.first_attempt_rate}, rejections ${JSON.stringify(metrics.rejected_by_category)}, tokens ${metrics.tokens.input + metrics.tokens.output}`);
@@ -1670,7 +1780,7 @@ export class Factory extends EventEmitter {
             : lessons;
     }
     async getDiff(branch: string) {
-        const { stdout } = await execa('git', ['diff', `${this.defaultBranch}...${branch}`], { cwd: this.baseDir });
+        const { stdout } = await execa('git', ['diff', `${this.mergeTarget()}...${branch}`], { cwd: this.baseDir });
         return stdout;
     }
     async saveState() {

@@ -84,6 +84,12 @@ softfactory --refine "also reverse the ledger entry"
 # A person finished an orchestrator/user task
 softfactory --mark-done T3 "rotated the key in the vault" --resume
 
+# Ticket in, pull request out: the issue is the requirement, the PR closes it
+softfactory --issue 42 --pr --no-tui --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4
+
+# Check a run's record after the fact
+softfactory --verify-run f-20261005-abcd
+
 # CI: plain stdout, no TUI
 softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 ```
@@ -98,7 +104,7 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--cloud-model` | Cloud model; optional for Codex CLI, which uses its configured default | provider default |
 | `--frontier-model` | Escalation and blind-review model; optional for Codex CLI | provider default |
 | `--local-model` | Ollama model; pins every local tier when set | `qwen2.5-coder:7b` / `14b` tiers |
-| `--planner-provider` | `openai` (Codex CLI), `agy`, `deepseek`, `local` | follows the cloud provider; `local` for a local run |
+| `--planner-provider` | `openai` (Codex CLI), `agy`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
 | `--planner-model` | Planner model override | provider default |
 | `--plan` | Save the plan without executing | `false` |
 | `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
@@ -111,10 +117,20 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--run-budget <minutes>` | Wall-clock budget per invocation; the run halts between phases and `--resume` continues | none |
 | `--max-tokens <n>` | Token budget per feature across resumes, where backends report usage | none |
 | `--verify-run [feature-id]` | Recompute the run journal's hash chain and the evidence files it cites; exit 1 on any mismatch | current build |
+| `--issue <n>` | Read the requirement from GitHub issue `n` through `gh`; words after the flags are appended as operator instructions | — |
+| `--pr` | Merge passing tasks into `softfactory/<feature>` instead of the base branch, push it, and open a pull request (draft until the run completes) | `false` |
 | `--no-tui` | Plain stdout instead of the Ink TUI | TUI when interactive |
 | `--no-docker` | Skip the post-build docker-compose check of the finished app | auto-detect |
 
 Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
+
+## Ticket in, pull request out
+
+With `--issue <n>` the requirement is the issue's title and body, read through the GitHub CLI with your own login. With `--pr` the run merges each passing task into `softfactory/<feature>` (created from the base branch) instead of the base branch itself. When the run ends, the orchestrator pushes that branch and opens a pull request: a draft if the run paused or failed with some work merged, ready for review if it completed. Resuming the same feature updates the same pull request. The body carries the task table with each task's review and acceptance result, the tail of every acceptance evidence log, the run metrics, and the journal's head hash so the record can be checked with `--verify-run`.
+
+Workers never see any of this. Network git is refused to them by the command policy; the push and the pull request are orchestrator actions after the gates. If `gh` is missing or logged out, the run still finishes and tells you which local branch holds the work.
+
+`examples/github/softfactory-issue.yml` is a GitHub Actions workflow that runs the factory on any issue labelled `softfactory`, with Docker sandboxing on the runner and the run record uploaded as a build artifact. Copy it into `.github/workflows/` and set one model API key as a secret.
 
 ## What it writes
 
