@@ -2,6 +2,7 @@
 import process from 'node:process';
 import { Factory } from './Factory.js';
 import { WorkerStrategy, CloudProvider } from './WorkerRegistry.js';
+import type { PlannerProvider } from './Planner.js';
 import { startFactoryRun } from './runMode.js';
 
 const KNOWN_FLAGS = [
@@ -58,7 +59,7 @@ async function main() {
   if (!['agy', 'openai', 'openai-api', 'anthropic', 'deepseek'].includes(cloudProviderArg)) {
     throw new Error(`Unsupported --cloud-provider "${cloudProviderArg}". Use agy, openai, openai-api, anthropic, or deepseek.`);
   }
-  const plannerProviderArg = getFlagValue(args, '--planner-provider') || (strategyArg === 'local' ? 'local' : cloudProviderArg === 'deepseek' ? 'deepseek' : 'openai');
+  const plannerProviderArg = (getFlagValue(args, '--planner-provider') || (strategyArg === 'local' ? 'local' : cloudProviderArg === 'deepseek' ? 'deepseek' : 'openai')) as PlannerProvider;
   if (!['openai', 'agy', 'local', 'deepseek'].includes(plannerProviderArg)) {
     throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, local, or deepseek.`);
   }

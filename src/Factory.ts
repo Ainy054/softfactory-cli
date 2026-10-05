@@ -2,10 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
-import { FactoryStateSchema, TaskSchema, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
+import { FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
-import { GeminiClient } from './GeminiClient.js';
-import { WorkerRegistry, type CloudProvider } from './WorkerRegistry.js';
+import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
 import { isEnvironmentFailure } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
@@ -14,25 +13,41 @@ import { execa } from 'execa';
 import { AgyPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
+import { Inspector } from './Inspector.js';
+import { createTextModel, OllamaTextModel } from './TextModel.js';
+
+export interface FactoryOptions {
+    streamToTerminal?: boolean;
+    useDocker?: boolean;
+    strategy?: WorkerStrategy;
+    localModel?: string;
+    cloudModel?: string;
+    frontierModel?: string;
+    cloudProvider?: CloudProvider;
+    plannerProvider?: PlannerProvider;
+    plannerModel?: string;
+}
+
 export class Factory extends EventEmitter {
     static readonly MAX_TASK_ATTEMPTS = 5;
-    baseDir;
+    baseDir: string;
     state!: FactoryState;
-    statePath;
-    historyPath;
-    archiveDir;
-    memoryPath;
-    worktreeManager;
-    gemini;
-    workerRegistry;
-    taskVerifier;
-    lessons;
+    statePath: string;
+    historyPath: string;
+    archiveDir: string;
+    memoryPath: string;
+    worktreeManager: WorktreeManager;
+    /** Reviews diffs on the configured provider's model; the merge gate for hybrid and cloud runs. */
+    inspector: Inspector;
+    workerRegistry: WorkerRegistry;
+    taskVerifier: TaskVerifier;
+    lessons: LessonManager;
     planner: IPlanner;
     dockerVerifier: DockerVerifier | null = null;
     defaultBranch = 'master';
-    streamToTerminal;
-    useDocker;
-    strategy;
+    streamToTerminal: boolean;
+    useDocker: boolean;
+    strategy: WorkerStrategy;
     buildStartCommit: string | undefined;
     saveLock = Promise.resolve();
     environmentFault: string | undefined;
@@ -48,10 +63,10 @@ export class Factory extends EventEmitter {
     trainingData: TrainingDataManager;
     trainingCaptureEnabled: boolean;
     private runtimeConfig: { strategy: 'hybrid' | 'local' | 'cloud'; local_model?: string; cloud_provider?: string; cloud_model?: string; frontier_model?: string };
-    constructor(baseDir, apiKey, options: any = {}) {
+    constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { proModel = 'Gemini 3.1 Pro (High)', flashModel = 'Gemini 3.7 Flash (High)', streamToTerminal = false, useDocker = true, strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy' as CloudProvider, plannerProvider = 'openai' as PlannerProvider, plannerModel = '' } = options;
+        const { streamToTerminal = false, useDocker = true, strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '' } = options;
         this.useDocker = useDocker;
         this.strategy = strategy;
         this.statePath = path.join(baseDir, '.softfactory', 'factory.json');
@@ -59,19 +74,27 @@ export class Factory extends EventEmitter {
         this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
         this.memoryPath = path.join(baseDir, '.softfactory', 'FACTORY_MEMORY.md');
         this.worktreeManager = new WorktreeManager(baseDir);
-        this.gemini = new GeminiClient(apiKey, proModel, flashModel);
-        this.planner = plannerProvider === 'openai'
-            ? new CodexPlanner(plannerModel)
-            : plannerProvider === 'deepseek'
-                ? new DeepSeekPlanner(plannerModel || 'deepseek-v4-pro')
-            : plannerProvider === 'local'
-                ? new LocalPlanner(plannerModel || (localModel === 'auto' ? 'qwen2.5-coder:14b' : localModel))
-                : new AgyPlanner(this.gemini);
         // An explicit --local-model must pin every local tier. Passing undefined
         // left the light/heavy tiers on their hardcoded qwen defaults, so the
         // chosen model was honoured on a task's first attempt and silently
         // replaced by qwen2.5-coder:14b on every retry.
         const pinnedLocal = localModel && localModel !== 'auto' && localModel !== 'tiered' ? localModel : undefined;
+        const heavyLocal = pinnedLocal || 'qwen2.5-coder:14b';
+        this.planner = plannerProvider === 'openai'
+            ? new CodexPlanner(plannerModel, baseDir)
+            : plannerProvider === 'deepseek'
+                ? new DeepSeekPlanner(plannerModel || 'deepseek-v4-pro')
+            : plannerProvider === 'local'
+                ? new LocalPlanner(plannerModel || heavyLocal)
+                : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
+        // The reviewer is the configured cloud provider's model, and nothing
+        // else. It used to be the Antigravity CLI regardless of provider, with
+        // a silent fallback to a local 7B when that failed, so a DeepSeek run
+        // could be approved by a model nobody chose. A local run has no cloud
+        // reviewer; its local model serves only the non-gating syntheses.
+        this.inspector = new Inspector(strategy === 'local'
+            ? new OllamaTextModel(heavyLocal)
+            : createTextModel(cloudProvider, cloudModel, { cwd: baseDir }));
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
         this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
         this.taskVerifier = new TaskVerifier();
@@ -124,7 +147,7 @@ export class Factory extends EventEmitter {
     getState() {
         return this.state;
     }
-    async refine(refinement) {
+    async refine(refinement: string) {
         if (!this.state) {
             this.log('No existing build to refine. Run a build first.');
             return;
@@ -138,27 +161,29 @@ export class Factory extends EventEmitter {
         this.log(`Refining plan: "${refinement}"`);
         this.log(`Preserving ${doneTasks.length} done task(s), ${pendingOrFailed.length} task(s) eligible for modification`);
         const codebaseContext = await this.getRepoContext(refinement);
-        const refined = await this.gemini.refineBlueprint(refinement, this.state.tasks, codebaseContext);
-        const newTasks = refined.tasks.map((t) => TaskSchema.parse({
-            ...t,
-            status: t.status || 'pending',
-            attempts: t.status === 'done' ? (this.state.tasks.find(old => old.id === t.id)?.attempts ?? 0) : 0,
-            dependencies: t.dependencies || [],
-            blockedBy: t.blockedBy || [],
-            files_hint: t.files_hint || [],
-        }));
-        // Verify done tasks weren't tampered with
+        // The same planner and the same validator as the original plan. The
+        // refinement used to go straight to the Antigravity client with no
+        // validation, so refined tasks arrived with no acceptance criteria and
+        // unchecked paths.
+        const refined = await this.planner.refineBlueprint({
+            refinement, currentTasks: this.state.tasks, codebaseContext,
+            repositoryFiles: new Set(await this.getRepositoryFiles()),
+            workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local',
+        });
+        const newTasks: Task[] = refined.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 }));
+        // Done tasks are merged code; whatever the planner returned for them,
+        // the original record stands.
         for (const done of doneTasks) {
-            const match = newTasks.find((t) => t.id === done.id);
-            if (!match || match.status !== 'done') {
-                this.log(`WARNING: Gemini tried to modify done task ${done.id} — restoring original`);
-                const idx = newTasks.findIndex((t) => t.id === done.id);
-                if (idx >= 0) {
-                    newTasks[idx] = { ...done };
+            const idx = newTasks.findIndex((t) => t.id === done.id);
+            const returned = idx >= 0 ? newTasks[idx] : undefined;
+            if (!returned) {
+                this.log(`WARNING: planner dropped done task ${done.id} — restoring original`);
+                newTasks.push({ ...done });
+            } else {
+                if (returned.title !== done.title || returned.description !== done.description) {
+                    this.log(`WARNING: planner tried to modify done task ${done.id} — restoring original`);
                 }
-                else {
-                    newTasks.push({ ...done });
-                }
+                newTasks[idx] = { ...done };
             }
         }
         const added = newTasks.filter((t) => !this.state.tasks.find(old => old.id === t.id));
@@ -182,7 +207,7 @@ export class Factory extends EventEmitter {
         this.emitEvent({ type: 'state:update', state: this.state });
         await this.runWorkshopLoop();
     }
-    async resume(featureId, retryBlocked = false) {
+    async resume(featureId?: string, retryBlocked = false) {
         if (featureId) {
             const archivePath = path.join(this.archiveDir, `${featureId}.json`);
             if (await this.exists(archivePath)) {
@@ -310,7 +335,7 @@ export class Factory extends EventEmitter {
             await this.saveState();
         }
     }
-    async mergeExistsInHistory(taskId) {
+    async mergeExistsInHistory(taskId: string) {
         try {
             const { stdout } = await execa('git', ['log', '--oneline', '--all', '--grep', `softfactory: merge ${taskId}`], { cwd: this.baseDir });
             if (stdout.trim())
@@ -323,7 +348,7 @@ export class Factory extends EventEmitter {
             return false;
         }
     }
-    async plan(requirement) {
+    async plan(requirement: string) {
         if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
             await this.archiveCurrentState();
         }
@@ -372,7 +397,7 @@ export class Factory extends EventEmitter {
         }
         this.log(`\nTo execute this plan: softfactory --resume`);
     }
-    async build(requirement) {
+    async build(requirement: string) {
         if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
             await this.archiveCurrentState();
         }
@@ -549,7 +574,7 @@ export class Factory extends EventEmitter {
             this.log(`Build completed: ${this.state.feature}`);
         }
     }
-    async executeAndInspect(task: any, preCreatedWorktree?: string) {
+    async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<{ task: Task; branchName: string } | null> {
         task.error_history = task.error_history || [];
         task.escalation_level = task.escalation_level || 0;
         const processFailure = (feedback: string) => {
@@ -728,7 +753,10 @@ export class Factory extends EventEmitter {
             if (!verifierResult.passed && !expectedTddFailure) {
                 this.log(`VERIFIER FAILED: ${task.id} — ${verifierResult.testSummary}`);
                 this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Verifier FAILED: ${verifierResult.testSummary}` });
-                processFailure(`Automated verification failed:\n${verifierResult.testSummary}\n\nHint: ${verifierResult.hints?.join(', ') || ''}`);
+                // The old "Hint:" here read a field the verifier never set, so
+                // every retry prompt carried an empty hint. The output tail is
+                // what the worker can act on.
+                processFailure(`Automated verification failed:\n${verifierResult.testSummary}${verifierResult.output ? `\n\nVerifier output tail:\n${verifierResult.output.slice(-1200)}` : ''}`);
                 await this.recordAttempt(task, 'verification', verifierResult.testSummary);
                 return null;
             }
@@ -753,24 +781,28 @@ export class Factory extends EventEmitter {
             // merged with its acceptance criteria unmet.
             this.log(`Inspection: Reviewing ${task.id}`);
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector reviewing diff...` });
-            // Local mode must remain offline: the automated verifier is the
-            // review gate when no cloud provider is allowed.
-            const review = this.strategy === 'local'
-                ? { verdict: 'PASS' as const, feedback: 'Local mode: passed automated verification and non-empty diff checks.' }
-                : await this.gemini.inspectTask(task, diff, handoff.summary, verifierResult.output);
+            // Local mode stays offline: no model reviews the diff, and the
+            // record says so instead of reporting a PASS nobody issued.
+            const mechanicalOnly = this.strategy === 'local';
+            const review = mechanicalOnly
+                ? { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }
+                : await this.inspector.inspect(task, diff, handoff.summary, verifierResult.output);
+            task.inspection = mechanicalOnly ? 'mechanical-only' : 'model';
+            task.inspector_model = mechanicalOnly ? undefined : `${review.provider}/${review.model}`;
+            await this.recordTaskEvent({ event: 'task:inspected', task_id: task.id, attempt: task.attempts, verdict: review.verdict, inspection: task.inspection, provider: review.provider, model: review.model });
             if (review.verdict === 'PASS') {
-                this.log(`PASSED: ${task.id}`);
-                this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector: PASSED` });
+                this.log(mechanicalOnly ? `PASSED (mechanical gates only, no reviewer): ${task.id}` : `PASSED (${task.inspector_model}): ${task.id}`);
+                this.emitEvent({ type: 'worker:output', taskId: task.id, line: mechanicalOnly ? `Mechanical gates passed; no model reviewed this diff` : `Quality Inspector (${task.inspector_model}): PASSED` });
 
                 // Epiphany Hook: Extract generalized learnings from fixed bugs
-                if (this.strategy !== 'local' && task.error_history && task.error_history.length > 0) {
+                if (!mechanicalOnly && task.error_history && task.error_history.length > 0) {
                     this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Synthesizing Epiphany from ${task.error_history.length} failures...` });
                     try {
-                        const epiphany = await this.gemini.synthesizeEpiphany(task, diff);
+                        const epiphany = await this.inspector.synthesizeEpiphany(task, diff);
                         if (epiphany?.should_save && await this.lessons.add({ lesson: epiphany.lesson, tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
                             this.state.memory_patterns = this.state.memory_patterns || [];
                             this.state.memory_patterns.push(epiphany.lesson);
-                            this.emitEvent({ type: 'worker:output', taskId: task.id, line: `💡 Epiphany Saved: ${epiphany}` });
+                            this.emitEvent({ type: 'worker:output', taskId: task.id, line: `💡 Epiphany Saved: ${epiphany.lesson}` });
                         }
                     } catch (e: any) {
                         this.log(`Epiphany synthesis failed: ${e.message}`);
@@ -921,7 +953,7 @@ export class Factory extends EventEmitter {
         }
         return null;
     }
-    async recordAttempt(task, category, detail) {
+    async recordAttempt(task: Task, category: string, detail: string) {
         try {
             const journalPath = path.join(this.baseDir, '.softfactory', 'attempts.jsonl');
             await fs.appendFile(journalPath, JSON.stringify({
@@ -934,7 +966,7 @@ export class Factory extends EventEmitter {
             await this.trainingData.addFailureLesson({ task, category, detail: String(detail) });
         }
     }
-    async recordTaskAssignment(task) {
+    async recordTaskAssignment(task: Task) {
         try {
             const journalPath = path.join(this.baseDir, '.softfactory', 'task-events.jsonl');
             await fs.appendFile(journalPath, JSON.stringify({
@@ -1045,7 +1077,7 @@ export class Factory extends EventEmitter {
             return [];
         }
     }
-    async updateHistory(status) {
+    async updateHistory(status: string) {
         let features: FeatureHistoryEntry[] = [];
         try {
             const content = await fs.readFile(this.historyPath, 'utf-8');
@@ -1121,8 +1153,12 @@ export class Factory extends EventEmitter {
                 this.log('No diff available for memory synthesis — skipping.');
                 return;
             }
-            this.log('Synthesizing memory from completed build...');
-            const memory = await this.gemini.synthesizeMemory(this.state.feature, diff);
+            this.log(`Synthesizing memory from completed build (${this.inspector.provider}/${this.inspector.model})...`);
+            const memory = await this.inspector.synthesizeMemory(this.state.feature, diff);
+            if (!memory.trim()) {
+                this.log('Memory synthesis skipped: the model returned nothing or was unreachable.');
+                return;
+            }
             if (memory.trim()) {
                 let existing = '';
                 try {
@@ -1188,7 +1224,7 @@ export class Factory extends EventEmitter {
      * file it had just read and looped on read_file until the iteration cap.
      * Send the neighbourhood of the task's own files, hard-capped.
      */
-    async getProjectContext(worktreePath, task?: { files_hint?: string[]; creates_files?: string[] }) {
+    async getProjectContext(worktreePath: string, task?: { files_hint?: string[]; creates_files?: string[] }) {
         const parts: string[] = [];
         let tracked: string[] = [];
         try {
@@ -1262,7 +1298,7 @@ export class Factory extends EventEmitter {
             ? `${lessons}\n\nArchitectural memory from previous builds:\n${memory.trim()}`
             : lessons;
     }
-    async getDiff(branch) {
+    async getDiff(branch: string) {
         const { stdout } = await execa('git', ['diff', `${this.defaultBranch}...${branch}`], { cwd: this.baseDir });
         return stdout;
     }
@@ -1289,6 +1325,11 @@ export class Factory extends EventEmitter {
                 this.environmentFault = `Configured cloud provider "${this.workerRegistry.getCloudProvider()}" is unavailable.`;
             } else if (this.strategy === 'hybrid' && !health.local && !health.cloud) {
                 this.environmentFault = 'Neither the configured local nor cloud worker is available.';
+            } else if (this.strategy !== 'local' && !await this.inspector.isAvailable()) {
+                // Without a reviewer no task can merge, so a hybrid run with a
+                // dead cloud provider halts here instead of after the workers
+                // have spent their effort.
+                this.environmentFault = `Quality inspector (${this.inspector.provider}/${this.inspector.model}) is unavailable; no task can be merged without review. Use --strategy=local for an offline run.`;
             }
         } catch (error: any) {
             this.log(`Backend preflight could not complete: ${error?.message || 'unknown error'}`);
@@ -1297,7 +1338,7 @@ export class Factory extends EventEmitter {
     hasUnfinishedTasks() {
         return this.state.tasks.some(t => t.status === 'pending' || t.status === 'active' || (t.status === 'failed' && t.attempts < Factory.MAX_TASK_ATTEMPTS));
     }
-    async exists(p) {
+    async exists(p: string) {
         try {
             await fs.access(p);
             return true;
@@ -1306,10 +1347,10 @@ export class Factory extends EventEmitter {
             return false;
         }
     }
-    emitEvent(event) {
+    emitEvent(event: FactoryEvent) {
         this.emit(event.type, event);
     }
-    log(msg) {
+    log(msg: string) {
         this.emit('log', msg);
         if (this.streamToTerminal) {
             console.log(`[SoftFactory] ${msg}`);

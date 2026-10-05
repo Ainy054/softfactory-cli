@@ -12,6 +12,7 @@ const STATUS_ICONS: Record<string, { icon: string; color: string }> = {
   done: { icon: 'v', color: 'green' },
   failed: { icon: 'x', color: 'red' },
   rejected: { icon: '!', color: 'red' },
+  blocked: { icon: '#', color: 'magenta' },
 };
 
 const SPINNER_FRAMES = ['|', '/', '-', '\\'];
@@ -50,6 +51,8 @@ export function TaskList({ tasks }: TaskListProps) {
           statusBadge = <Text color="green"> [Merged]</Text>;
         } else if (task.status === 'failed') {
           statusBadge = <Text color="red"> [Failed after {task.attempts} iterations]</Text>;
+        } else if (task.status === 'blocked') {
+          statusBadge = <Text color="magenta"> [Blocked{task.replan_reason ? ` • ${task.replan_reason}` : ''}]</Text>;
         }
 
         return (

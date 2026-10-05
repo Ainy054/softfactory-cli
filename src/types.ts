@@ -28,6 +28,9 @@ export const TaskSchema = z.object({
   complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
   allocation_reason: z.string().optional(),
   replan_reason: z.string().optional(),
+  /** How the last merge decision was reached: a model reviewed the diff, or only mechanical gates ran. */
+  inspection: z.enum(['model', 'mechanical-only']).optional(),
+  inspector_model: z.string().optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -98,4 +101,6 @@ export type FactoryEvent =
   | { type: 'state:update'; state: FactoryState }
   | { type: 'worker:output'; taskId: string; line: string }
   | { type: 'phase:start'; phase: number }
+  | { type: 'task:auto-replan'; task_id: string; reason: string; replacements: string[] }
+  | { type: 'task:auto-replan-failed'; task_id: string; reason: string; error: string }
   | { type: 'build:complete'; status: 'completed' | 'failed' | 'planned'; feature: string };

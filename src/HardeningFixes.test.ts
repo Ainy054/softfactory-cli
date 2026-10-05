@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import { WorkerRegistry } from './WorkerRegistry.js';
 import { LocalAgentWorker } from './LocalAgentWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
-import { AgyClient } from './GeminiClient.js';
+import { Inspector } from './Inspector.js';
 import { isEnvironmentFailure } from './IWorker.js';
 import { Factory } from './Factory.js';
 import { Task } from './types.js';
@@ -69,15 +69,15 @@ describe('command allowlist', () => {
 });
 
 describe('inspector fails closed', () => {
+  const model = (complete: () => Promise<string>) => ({ provider: 'stub', model: 'stub-model', isAvailable: async () => true, complete });
+
   it('raises an environment fault when inference is unavailable, never PASS', async () => {
-    const client: any = new AgyClient(undefined, 'unreachable-model', 'unreachable-model');
-    client.callLlm = async () => { throw new Error('Inference failed across both cloud agy and local Ollama.'); };
-    await assert.rejects(() => client.inspectTask(task({ id: 'T1' }), 'diff', 'summary'), isEnvironmentFailure);
+    const inspector = new Inspector(model(async () => { throw new Error('ECONNREFUSED'); }));
+    await assert.rejects(() => inspector.inspect(task({ id: 'T1' }), 'diff', 'summary'), isEnvironmentFailure);
   });
   it('returns FAIL, not PASS, when the inspector output is unreadable', async () => {
-    const client: any = new AgyClient();
-    client.callLlm = async () => 'I think it looks fine to me!';
-    assert.equal((await client.inspectTask(task({ id: 'T1' }), 'diff', 'summary')).verdict, 'FAIL');
+    const inspector = new Inspector(model(async () => 'I think it looks fine to me!'));
+    assert.equal((await inspector.inspect(task({ id: 'T1' }), 'diff', 'summary')).verdict, 'FAIL');
   });
 });
 

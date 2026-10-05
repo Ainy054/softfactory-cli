@@ -3,8 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execa } from 'execa';
 import { z } from 'zod';
-import { AgyClient } from './GeminiClient.js';
-import { extractJson } from './GeminiClient.js';
+import { extractJson } from './extractJson.js';
+import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, type ITextModel } from './TextModel.js';
+import type { Task } from './types.js';
 
 export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek';
 
@@ -46,9 +47,19 @@ export interface PlanningInput {
   workerCapability?: 'local' | 'cloud';
 }
 
+export interface RefinementInput {
+  refinement: string;
+  currentTasks: Task[];
+  codebaseContext: string;
+  repositoryFiles: Set<string>;
+  workerCapability?: 'local' | 'cloud';
+}
+
 export interface IPlanner {
   provider: PlannerProvider;
   generateBlueprint(input: PlanningInput): Promise<Blueprint>;
+  /** A mid-flight change to an in-progress plan; done tasks must come back unchanged. */
+  refineBlueprint(input: RefinementInput): Promise<Blueprint>;
 }
 
 export const OUTPUT_SCHEMA = {
@@ -89,15 +100,12 @@ export const OUTPUT_SCHEMA = {
   },
 };
 
-function buildPlanningPrompt(input: PlanningInput): string {
-  return `You are the SoftFactory Blueprint Architect. Produce a repository-grounded implementation plan, not code.
-
-Planning rules:
+const PLANNING_RULES = (workerCapability?: 'local' | 'cloud') => `Planning rules:
 - Preserve working functionality and map every explicit requirement area exactly once or explain intentional overlap.
 - Never transfer behavior from one component or domain to another.
 - Reference an existing path only when it appears in Repository Context. Put justified new paths in both files_hint and creates_files.
 - Prefer cohesive tasks over many sequential tasks editing the same file. Keep each task under roughly 300 changed lines.
-${input.workerCapability === 'local' ? `
+${workerCapability === 'local' ? `
 LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not a frontier model:
 - At most 2 files in files_hint per task, counting creates_files. Split anything larger.
 - One concern per task. Do not bundle unrelated changes (a config split, a new lint config and dependency metadata are three tasks, not one).
@@ -111,7 +119,12 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - For every test_writer task, declare test_targets and production_targets. If the criterion requires behavior that is not already present, add a dependency on the implementation task first.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
-- Do not add DevOps work unless the requirement or repository evidence calls for it.
+- Do not add DevOps work unless the requirement or repository evidence calls for it.`;
+
+function buildPlanningPrompt(input: PlanningInput): string {
+  return `You are the SoftFactory Blueprint Architect. Produce a repository-grounded implementation plan, not code.
+
+${PLANNING_RULES(input.workerCapability)}
 
 Repository Context:
 ${input.codebaseContext}
@@ -126,12 +139,40 @@ User Requirement:
 ${input.requirement}`;
 }
 
+function buildRefinementPrompt(input: RefinementInput): string {
+  const current = input.currentTasks.map(task => ({
+    id: task.id, status: task.status, phase: task.phase, title: task.title,
+    description: task.description, agent_role: task.agent_role,
+    dependencies: task.dependencies, blockedBy: task.blockedBy,
+    files_hint: task.files_hint, creates_files: task.creates_files,
+    acceptance_criteria: task.acceptance_criteria, verification: task.verification,
+  }));
+  return `You are the SoftFactory Blueprint Architect performing a MID-FLIGHT REFINEMENT of an in-progress plan.
+
+Refinement rules:
+- Tasks with status "done" are already merged. Return each of them UNCHANGED: same id, title, description, phase, dependencies, files_hint. Never remove one.
+- Tasks with any other status may be modified, removed, or replaced.
+- New tasks get new ids that continue the existing numbering.
+- Return the COMPLETE plan (done tasks included) in the blueprint schema; every task carries acceptance_criteria and verification.
+
+${PLANNING_RULES(input.workerCapability)}
+
+Current Tasks:
+${JSON.stringify(current, null, 2)}
+
+Repository Context:
+${input.codebaseContext}
+
+Refinement Request:
+${input.refinement}`;
+}
+
 /**
- * CodexPlanner gets the shape from --output-schema and AgyPlanner states it in
- * its own prompt. A planner with neither must be told, or `format: "json"` just
- * guarantees well-formed JSON of the wrong shape.
+ * CodexPlanner gets the shape from --output-schema. Every other planner must
+ * be told, or `format: "json"` just guarantees well-formed JSON of the wrong
+ * shape.
  */
-const SCHEMA_INSTRUCTION = `
+export const SCHEMA_INSTRUCTION = `
 Return ONLY a JSON object with exactly these keys:
 {
   "feature": "short feature name",
@@ -160,166 +201,132 @@ Return ONLY a JSON object with exactly these keys:
 }
 Every field is required on every task. Do not wrap the object in any other key.`;
 
-export class CodexPlanner implements IPlanner {
-  provider: PlannerProvider = 'openai';
-  constructor(private model = '') {}
+const REPAIR_ROUNDS = 2;
 
-  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'softfactory-plan-'));
-    const schemaPath = path.join(tempDir, 'blueprint.schema.json');
-    const outputPath = path.join(tempDir, 'blueprint.json');
-    await fs.writeFile(schemaPath, JSON.stringify(OUTPUT_SCHEMA));
-    try {
-      const run = async (prompt: string) => {
-        const args = [
-          'exec', '--sandbox', 'read-only', '--ephemeral',
-          '--output-schema', schemaPath,
-          '--output-last-message', outputPath,
-          ...(this.model ? ['--model', this.model] : []),
-          prompt,
-        ];
-        await execa('codex', args, { cwd: process.cwd(), stdin: 'ignore', timeout: 300000, all: true });
-        return JSON.parse(await fs.readFile(outputPath, 'utf8'));
-      };
-
-      let draft = await run(buildPlanningPrompt(input));
-      for (let repairAttempt = 0; repairAttempt <= 2; repairAttempt++) {
-        try {
-          return validateBlueprint(draft, input);
-        } catch (error: any) {
-          if (repairAttempt === 2) throw error;
-          const repairPrompt = `Repair this SoftFactory blueprint. Return the complete corrected blueprint using the required output schema.
+function repairPrompt(error: Error, requirement: string, draft: unknown): string {
+  return `Your previous plan was rejected. Repair this SoftFactory blueprint and return the complete corrected blueprint using the required output schema.
 
 Validation errors:
 ${error.message}
 
 Mandatory rule: requirements_covered must contain these section titles exactly:
-${requirementHeadings(input.requirement).map(heading => `- ${heading}`).join('\n')}
+${requirementHeadings(requirement).map(heading => `- ${heading}`).join('\n') || '(none)'}
 
 Do not invent or transfer requirements. Preserve valid task details, but correct omissions, unsafe paths, dependencies, phase conflicts, acceptance criteria, and verification.
 
 User requirement:
-${input.requirement}
+${requirement}
 
 Draft blueprint:
 ${JSON.stringify(draft, null, 2)}`;
-          draft = await run(repairPrompt);
-        }
+}
+
+/**
+ * Shared by every planner: one attempt, then up to two repair rounds that feed
+ * the validator's own error list back to the model. Before this each planner
+ * had its own copy of the loop, and the Antigravity planner had none, so a
+ * single missing field failed the whole build.
+ */
+abstract class BasePlanner implements IPlanner {
+  abstract provider: PlannerProvider;
+  protected abstract run(prompt: string): Promise<unknown>;
+
+  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
+    const fitted = { ...input, codebaseContext: this.fitContext(buildPlanningPrompt({ ...input, codebaseContext: '' }), input.codebaseContext) };
+    return this.planWithRepair(buildPlanningPrompt(fitted), input.requirement, fitted);
+  }
+
+  async refineBlueprint(input: RefinementInput): Promise<Blueprint> {
+    const fitted = { ...input, codebaseContext: this.fitContext(buildRefinementPrompt({ ...input, codebaseContext: '' }), input.codebaseContext) };
+    const validationInput: PlanningInput = {
+      requirement: input.refinement, codebaseContext: fitted.codebaseContext,
+      memoryPatterns: '', featureHistory: '', repositoryFiles: input.repositoryFiles,
+      workerCapability: input.workerCapability,
+    };
+    return this.planWithRepair(buildRefinementPrompt(fitted), input.refinement, validationInput);
+  }
+
+  private async planWithRepair(prompt: string, requirement: string, validationInput: PlanningInput): Promise<Blueprint> {
+    let draft = await this.run(prompt);
+    for (let round = 0; round <= REPAIR_ROUNDS; round++) {
+      try {
+        return validateBlueprint(draft, validationInput);
+      } catch (error: any) {
+        if (round === REPAIR_ROUNDS) throw error;
+        draft = await this.run(repairPrompt(error, requirement, draft));
       }
-      throw new Error('Planner repair loop ended unexpectedly.');
+    }
+    throw new Error('Planner repair loop ended unexpectedly.');
+  }
+
+  /** Characters of repository context the backend can take; undefined means no hard limit. */
+  protected contextCharBudget(): number | undefined { return undefined; }
+
+  /**
+   * Trim repository context to the model's window. Ollama drops the FRONT of
+   * an oversized prompt, which is where the planning rules live, so an
+   * unbounded context silently removed the rules rather than the context.
+   */
+  private fitContext(fixedPrompt: string, codebaseContext: string): string {
+    const budget = this.contextCharBudget();
+    if (!budget) return codebaseContext;
+    const allowance = budget - fixedPrompt.length - SCHEMA_INSTRUCTION.length - 400;
+    if (codebaseContext.length <= allowance) return codebaseContext;
+    if (allowance <= 200) return '[repository context omitted: the model window is too small to carry it]';
+    return `${codebaseContext.slice(0, allowance)}\n...[repository context truncated to fit the model window; rely on the file list above]`;
+  }
+}
+
+/** Any ITextModel can plan: the prompt states the shape and the loop repairs it. */
+export class TextModelPlanner extends BasePlanner {
+  constructor(readonly provider: PlannerProvider, private readonly textModel: ITextModel) { super(); }
+
+  protected async run(prompt: string): Promise<unknown> {
+    return extractJson(await this.textModel.complete(`${prompt}\n${SCHEMA_INSTRUCTION}`, { json: true, temperature: 0.1 }));
+  }
+
+  protected contextCharBudget(): number | undefined {
+    // ~2.5 chars per token for paths and English, conservative on purpose.
+    return this.textModel.contextWindow ? Math.floor(this.textModel.contextWindow * 2.5) : undefined;
+  }
+}
+
+/** Codex CLI, read-only, with the schema enforced by --output-schema. */
+export class CodexPlanner extends BasePlanner {
+  provider: PlannerProvider = 'openai';
+  constructor(private model = '', private cwd: string = process.cwd()) { super(); }
+
+  protected async run(prompt: string): Promise<unknown> {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'softfactory-plan-'));
+    const schemaPath = path.join(tempDir, 'blueprint.schema.json');
+    const outputPath = path.join(tempDir, 'blueprint.json');
+    try {
+      await fs.writeFile(schemaPath, JSON.stringify(OUTPUT_SCHEMA));
+      await execa('codex', [
+        'exec', '--sandbox', 'read-only', '--ephemeral',
+        '--output-schema', schemaPath,
+        '--output-last-message', outputPath,
+        ...(this.model ? ['--model', this.model] : []),
+        prompt,
+      ], { cwd: this.cwd, stdin: 'ignore', timeout: 300000, all: true });
+      return JSON.parse(await fs.readFile(outputPath, 'utf8'));
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   }
 }
 
-export class AgyPlanner implements IPlanner {
-  provider: PlannerProvider = 'agy';
-  constructor(private client: AgyClient) {}
-
-  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
-    const raw = await this.client.generateBlueprint(
-      input.requirement,
-      input.codebaseContext,
-      input.memoryPatterns,
-      input.featureHistory,
-    );
-    return validateBlueprint(raw, input);
-  }
+export class AgyPlanner extends TextModelPlanner {
+  constructor(model = 'Gemini 3.1 Pro (High)') { super('agy', new AgyTextModel(model)); }
 }
 
 /** Offline planner backed directly by Ollama. */
-export class LocalPlanner implements IPlanner {
-  provider: PlannerProvider = 'local';
-  constructor(private model = 'qwen2.5-coder:14b', private host = 'http://127.0.0.1:11434') {}
-
-  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
-    const run = async (prompt: string): Promise<unknown> => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8 * 60_000);
-      try {
-        const response = await fetch(`${this.host}/api/generate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model: this.model,
-            prompt,
-            format: 'json',
-            stream: false,
-            options: { temperature: 0.1, num_ctx: 8192 },
-          }),
-        });
-        if (!response.ok) throw new Error(`Local planner Ollama error: ${response.status} ${response.statusText}`);
-        const data = await response.json() as { response?: string };
-        if (!data.response) throw new Error('Local planner returned an empty response.');
-        return extractJson(data.response);
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
-    let draft = await run(`${buildPlanningPrompt(input)}\n${SCHEMA_INSTRUCTION}`);
-    // A local model rarely gets the whole shape right first time; give it the
-    // same repair budget the Codex planner has instead of failing the build.
-    for (let repair = 0; repair <= 2; repair++) {
-      try {
-        return validateBlueprint(draft, input);
-      } catch (error: any) {
-        if (repair === 2) throw error;
-        draft = await run(`Your previous plan was rejected.\n\nErrors:\n${error.message}\n\nRequirement:\n${input.requirement}\n${SCHEMA_INSTRUCTION}`);
-      }
-    }
-    throw new Error('Local planner repair loop ended unexpectedly.');
-  }
+export class LocalPlanner extends TextModelPlanner {
+  constructor(model = 'qwen2.5-coder:14b', host = 'http://127.0.0.1:11434') { super('local', new OllamaTextModel(model, host)); }
 }
 
-
-export class DeepSeekPlanner implements IPlanner {
-  provider: PlannerProvider = 'deepseek';
-  constructor(private model = 'deepseek-v4-pro') {}
-
-  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
-    if (!process.env.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY is not set; cannot use the DeepSeek planner.');
-    const run = async (prompt: string): Promise<unknown> => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8 * 60_000);
-      try {
-        const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
-          },
-          signal: controller.signal,
-          body: JSON.stringify({
-            model: this.model,
-            messages: [{ role: 'user', content: prompt }],
-            stream: false,
-            temperature: 0.1,
-          }),
-        });
-        if (!response.ok) throw new Error(`DeepSeek planner API error: ${response.status} ${response.statusText}`);
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content;
-        if (!content) throw new Error('DeepSeek planner returned an empty response.');
-        return extractJson(content);
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
-    let draft = await run(`${buildPlanningPrompt(input)}\n${SCHEMA_INSTRUCTION}`);
-    for (let repair = 0; repair <= 2; repair++) {
-      try {
-        return validateBlueprint(draft, input);
-      } catch (error: any) {
-        if (repair === 2) throw error;
-        draft = await run(`Your previous plan was rejected.\n\nErrors:\n${error.message}\n\nRequirement:\n${input.requirement}\n${SCHEMA_INSTRUCTION}`);
-      }
-    }
-    throw new Error('DeepSeek planner repair loop ended unexpectedly.');
-  }
+export class DeepSeekPlanner extends TextModelPlanner {
+  constructor(model = 'deepseek-v4-pro') { super('deepseek', new DeepSeekTextModel(model)); }
 }
 
 function requirementHeadings(requirement: string): string[] {

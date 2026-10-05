@@ -70,4 +70,89 @@ describe('LocalPlanner', () => {
       assert.equal(ollama.prompts.length, 3, 'one attempt plus two repairs');
     } finally { await ollama.close(); }
   });
+
+  it('fits the repository context to the model window instead of letting the rules be truncated', async () => {
+    const previous = process.env.SOFTFACTORY_LOCAL_NUM_CTX;
+    process.env.SOFTFACTORY_LOCAL_NUM_CTX = '2048';
+    const ollama = await fakeOllama([goodPlan]);
+    try {
+      // Ollama drops the FRONT of an oversized prompt, where the rules are.
+      const huge = { ...input, codebaseContext: `Tracked Files:\n${'src/file.ts\n'.repeat(5000)}` };
+      await new LocalPlanner('m', ollama.host).generateBlueprint(huge as any);
+      const p = ollama.prompts[0];
+      assert.ok(p.length <= 2048 * 2.5 + 200, `prompt is ${p.length} chars for a 2048-token window`);
+      assert.match(p, /Planning rules:/);
+      assert.match(p, /User Requirement:\nAdd a formatCurrency helper/);
+      assert.match(p, /repository context truncated/);
+    } finally {
+      await ollama.close();
+      if (previous === undefined) delete process.env.SOFTFACTORY_LOCAL_NUM_CTX; else process.env.SOFTFACTORY_LOCAL_NUM_CTX = previous;
+    }
+  });
+});
+
+describe('every planner validates a refinement like a plan', () => {
+  const doneTask: any = {
+    id: 'T1', title: 'Add helper', description: 'Add formatCurrency to the utils module', agent_role: 'coder',
+    phase: 1, dependencies: [], blockedBy: [], files_hint: ['frontend/src/utils/currency.ts'], creates_files: [],
+    acceptance_criteria: ['formatCurrency returns a USD string'], verification: ['npm test --prefix frontend'],
+    status: 'done', attempts: 1, escalation_level: 0, error_history: [], worker_type: 'auto',
+  };
+  const refinedPlan = JSON.stringify({
+    feature: 'Currency helper', requirements_covered: [],
+    tasks: [
+      { ...doneTask, status: undefined },
+      { id: 'T2', title: 'Add EUR support', description: 'Extend formatCurrency with a EUR branch', agent_role: 'coder',
+        phase: 2, dependencies: ['T1'], blockedBy: [], files_hint: ['frontend/src/utils/currency.ts'], creates_files: [],
+        acceptance_criteria: ['formatCurrency formats EUR'], verification: ['npm test --prefix frontend'] },
+    ],
+  });
+
+  it('tells the model to keep done tasks and returns the validated full plan', async () => {
+    const ollama = await fakeOllama([refinedPlan]);
+    try {
+      const plan = await new LocalPlanner('m', ollama.host).refineBlueprint({
+        refinement: 'also support EUR', currentTasks: [doneTask], codebaseContext: '',
+        repositoryFiles: new Set(['frontend/src/utils/currency.ts']),
+      });
+      assert.equal(plan.tasks.length, 2);
+      assert.match(ollama.prompts[0], /status "done" are already merged/);
+      assert.match(ollama.prompts[0], /"id": "T1"/);
+    } finally { await ollama.close(); }
+  });
+
+  it('rejects a refinement that invents a file, through the same repair loop', async () => {
+    const invented = JSON.parse(refinedPlan);
+    invented.tasks[1].files_hint = ['frontend/src/utils/euro.ts'];
+    const ollama = await fakeOllama([JSON.stringify(invented), refinedPlan]);
+    try {
+      const plan = await new LocalPlanner('m', ollama.host).refineBlueprint({
+        refinement: 'also support EUR', currentTasks: [doneTask], codebaseContext: '',
+        repositoryFiles: new Set(['frontend/src/utils/currency.ts']),
+      });
+      assert.equal(plan.tasks.length, 2);
+      assert.equal(ollama.prompts.length, 2);
+      assert.match(ollama.prompts[1], /nonexistent file frontend\/src\/utils\/euro\.ts/);
+    } finally { await ollama.close(); }
+  });
+});
+
+describe('the Antigravity planner uses the shared prompt and repair loop', () => {
+  it('states the schema and repairs a wrong-shaped first answer', async () => {
+    const { TextModelPlanner } = await import('./Planner.js');
+    const prompts: string[] = [];
+    const replies = [JSON.stringify({ plan: 'wrong shape' }), goodPlan];
+    const planner = new TextModelPlanner('agy', {
+      provider: 'agy', model: 'Gemini 3.1 Pro (High)', isAvailable: async () => true,
+      complete: async (prompt: string) => { prompts.push(prompt); return replies[Math.min(prompts.length - 1, replies.length - 1)]; },
+    });
+    const plan = await planner.generateBlueprint(input as any);
+    assert.equal(plan.tasks.length, 1);
+    assert.equal(prompts.length, 2, 'one attempt plus one repair');
+    // The old Antigravity prompt asked for a shape without acceptance
+    // criteria, which the validator then rejected with no second chance.
+    assert.match(prompts[0], /acceptance_criteria/);
+    assert.match(prompts[0], /Planning rules:/);
+    assert.doesNotMatch(prompts[0], /DEVOPS FIRST/);
+  });
 });

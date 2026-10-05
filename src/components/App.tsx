@@ -89,6 +89,12 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
       case 'phase:start':
         dispatch({ type: 'phase:start', phase: event.phase });
         break;
+      case 'task:auto-replan':
+        dispatch({ type: 'worker:output', taskId: event.task_id, line: `Auto-replan (${event.reason}) → ${event.replacements.join(', ')}` });
+        break;
+      case 'task:auto-replan-failed':
+        dispatch({ type: 'worker:output', taskId: event.task_id, line: `Auto-replan failed: ${event.error}` });
+        break;
       case 'build:complete':
         dispatch({ type: 'build:complete', status: event.status, feature: event.feature });
         break;
@@ -99,6 +105,8 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
     factory.on('state:update', handleEvent);
     factory.on('worker:output', handleEvent);
     factory.on('phase:start', handleEvent);
+    factory.on('task:auto-replan', handleEvent);
+    factory.on('task:auto-replan-failed', handleEvent);
     factory.on('build:complete', handleEvent);
 
     if (!hasStartedRef.current) {
@@ -113,6 +121,8 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
       factory.off('state:update', handleEvent);
       factory.off('worker:output', handleEvent);
       factory.off('phase:start', handleEvent);
+      factory.off('task:auto-replan', handleEvent);
+      factory.off('task:auto-replan-failed', handleEvent);
       factory.off('build:complete', handleEvent);
     };
   }, [factory, requirement, handleEvent, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode]);

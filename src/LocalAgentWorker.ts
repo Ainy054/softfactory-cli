@@ -1,11 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
+import { safeLocalContextWindow } from './TextModel.js';
 
 interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -63,12 +63,7 @@ export class LocalAgentWorker implements IWorker {
    * escalating to a stronger model is not a silent context downgrade elsewhere.
    */
   getSafeContextWindow(modelName: string): number {
-    const configured = Number(process.env.SOFTFACTORY_LOCAL_NUM_CTX);
-    if (Number.isFinite(configured) && configured >= 2048) return Math.floor(configured);
-    const totalGb = os.totalmem() / 1024 ** 3;
-    const isLargeModel = /(?:1[0-9]|[2-9][0-9])b\b/i.test(modelName);
-    if (isLargeModel && totalGb < 32) return 4096;
-    return 8192;
+    return safeLocalContextWindow(modelName);
   }
 
   private buildSystemPrompt(task: Task, projectContext: string, projectRoots: string[] = []): string {

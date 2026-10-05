@@ -9,6 +9,7 @@ interface HeaderProps {
 
 const statusColors: Record<string, string> = {
   planning: 'yellow',
+  planned: 'blue',
   active: 'cyan',
   completed: 'green',
   failed: 'red',
