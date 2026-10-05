@@ -2,6 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { AgentContainer } from './AgentContainer.js';
 
 export interface ExecOptions {
   cwd: string;
@@ -104,6 +105,7 @@ export class SandboxManager {
   private detected = false;
   private readonly ensuredImages = new Set<string>();
   private readonly log: (line: string) => void;
+  private agents: AgentContainer | undefined;
 
   constructor(readonly mode: SandboxMode = 'auto', log: (line: string) => void = () => {}) {
     this.log = log;
@@ -208,6 +210,17 @@ export class SandboxManager {
       mounts.push({ host: goModCache, container: '/go/pkg/mod', readOnly: true });
     }
     return mounts;
+  }
+
+  /** Where whole CLI agents run when the sandbox is active; built on first use. */
+  agentContainer(): AgentContainer {
+    if (!this.agents) this.agents = new AgentContainer(this.log);
+    return this.agents;
+  }
+
+  /** Stops anything long-lived the sandbox started (the egress proxy). */
+  async close(): Promise<void> {
+    await this.agents?.close();
   }
 
   async runnerFor(rootPath: string, executable?: string): Promise<CommandRunner> {

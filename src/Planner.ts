@@ -8,7 +8,7 @@ import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type
 import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
-export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api';
+export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api' | 'claude-code' | 'gemini-cli';
 
 const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
@@ -347,6 +347,13 @@ export class LocalPlanner extends TextModelPlanner {
 
 export class DeepSeekPlanner extends TextModelPlanner {
   constructor(model = 'deepseek-v4-pro') { super('deepseek', new DeepSeekTextModel(model)); }
+}
+
+/** Planning through an installed coding agent's print mode, so its login is the only credential needed. */
+export class CliPlanner extends TextModelPlanner {
+  constructor(provider: 'claude-code' | 'gemini-cli', model = '', cwd: string = process.cwd()) {
+    super(provider, createTextModel(provider, model, { cwd }));
+  }
 }
 
 /** Planning on the Anthropic or OpenAI API directly, so a run needs no CLI besides git. */

@@ -10,7 +10,8 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { AgyPlanner, ApiPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
@@ -145,6 +146,8 @@ export class Factory extends EventEmitter {
                 ? new LocalPlanner(plannerModel || heavyLocal)
             : plannerProvider === 'anthropic' || plannerProvider === 'openai-api'
                 ? new ApiPlanner(plannerProvider, plannerModel)
+            : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli'
+                ? new CliPlanner(plannerProvider, plannerModel, baseDir)
                 : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
         // The reviewer is the configured cloud provider's model, and nothing
         // else. It used to be the Antigravity CLI regardless of provider, with
@@ -406,6 +409,7 @@ export class Factory extends EventEmitter {
                 await this.worktreeManager.cleanup(task.id, `line/${task.id}`);
             } catch { /* best effort */ }
         }
+        await this.sandbox.close().catch(() => undefined);
         await this.leaveIntegrationBranch().catch(() => undefined);
         return { reset: active.length };
     }
@@ -614,6 +618,11 @@ export class Factory extends EventEmitter {
      * the pull request. A draft until the run completes. Failure here never
      * fails the run: the merged work is on the local branch either way.
      */
+    /** Everything that ends a run, whatever its outcome: long-lived sandbox pieces, then the pull request. */
+    private async endRun(): Promise<void> {
+        await this.sandbox.close().catch(() => undefined);
+        await this.finalizePullRequest();
+    }
     async finalizePullRequest(): Promise<void> {
         const branch = this.state?.integration_branch;
         if (!branch || this.prFinalized) return;
@@ -771,7 +780,7 @@ export class Factory extends EventEmitter {
             await this.saveState();
             await this.updateHistory('active');
             this.log(`Run halted by an environment fault: ${this.environmentFault}`);
-            await this.finalizePullRequest();
+            await this.endRun();
             this.emitEvent({ type: 'build:complete', status: 'failed', feature: this.state.feature });
             return;
         }
@@ -784,7 +793,7 @@ export class Factory extends EventEmitter {
             this.log(`PAUSED: ${awaitingHuman.length} task(s) need a person: ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}`);
             this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
             if (failedTasks.length > 0) this.log(`Also unresolved: ${failedTasks.map(t => `${t.id}:${t.status}`).join(', ')}`);
-            await this.finalizePullRequest();
+            await this.endRun();
             this.emitEvent({ type: 'build:complete', status: 'paused', feature: this.state.feature });
             return;
         }
@@ -816,7 +825,7 @@ export class Factory extends EventEmitter {
             if (this.state.status === 'completed') await this.synthesizeMemory();
         }
         await this.writeRunMetrics();
-        await this.finalizePullRequest();
+        await this.endRun();
         this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
         if (failedTasks.length > 0) {
             this.log(`Build partial: ${doneTasks.length}/${this.state.tasks.length} tasks completed, ${failedTasks.length} failed/skipped`);
@@ -1805,6 +1814,23 @@ export class Factory extends EventEmitter {
             return;
         }
         this.log(`Sandbox: ${this.sandbox.describe()}`);
+        // A whole coding agent as the worker runs its own commands. Inside
+        // the sandbox that happens in the agent container behind the egress
+        // proxy; without the sandbox it happens on this host, and that is
+        // said as loudly as --sandbox=none itself.
+        const agent = this.strategy === 'local' ? undefined : this.workerRegistry.agentDefinition();
+        if (agent) {
+            if (this.sandbox.active) {
+                const problem = AgentContainer.credentialProblem(agent);
+                if (problem) {
+                    this.environmentFault = problem;
+                    return;
+                }
+                this.log(`Agent container: ${agent.id} runs inside Docker; egress limited to ${AgentContainer.egressFor(agent).join(', ')}`);
+            } else {
+                this.log(`UNSANDBOXED AGENT: ${agent.id} runs its own commands on this host under its own permission rules; softfactory's command policy and sandbox do not apply to them.`);
+            }
+        }
         try {
             const health = await this.workerRegistry.preflight();
             this.log(`Backend preflight: local ${health.local ? 'ready' : 'unavailable'} (${health.localModel}), cloud ${health.cloud ? 'ready' : 'unavailable'} (${this.workerRegistry.getCloudProvider()}/${health.cloudModel || 'configured default'})`);

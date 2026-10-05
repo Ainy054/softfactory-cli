@@ -4,9 +4,13 @@ import { AgyWorker } from './AgyWorker.js';
 import { CodexWorker } from './CodexWorker.js';
 import { ToolLoopWorker } from './ToolLoopWorker.js';
 import { createChatTransport } from './ChatTransport.js';
+import { CliAgentWorker, type CliAgentDefinition } from './CliAgentWorker.js';
 
 export type WorkerStrategy = 'hybrid' | 'local' | 'cloud';
-export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek';
+export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli';
+export const CLOUD_PROVIDERS: CloudProvider[] = ['agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'claude-code', 'gemini-cli'];
+/** Providers that are whole coding agents with their own loop and permission rules. */
+export const AGENT_PROVIDERS: CloudProvider[] = ['claude-code', 'gemini-cli'];
 
 export class WorkerRegistry {
   private localWorker: IWorker;
@@ -39,6 +43,7 @@ export class WorkerRegistry {
     this.localWorker = new ToolLoopWorker(createChatTransport('local'), localModel === 'auto' ? lightLocalModel : localModel);
     this.cloudWorker = cloudProvider === 'agy' ? new AgyWorker(cloudModel)
       : cloudProvider === 'openai' ? new CodexWorker(cloudModel)
+      : cloudProvider === 'claude-code' || cloudProvider === 'gemini-cli' ? new CliAgentWorker(cloudProvider, cloudModel)
       : cloudProvider === 'deepseek' ? new ToolLoopWorker(createChatTransport('deepseek'), cloudModel || 'deepseek-v4-flash')
       : new ToolLoopWorker(createChatTransport(cloudProvider), cloudModel);
   }
@@ -68,6 +73,11 @@ export class WorkerRegistry {
 
   getCloudProvider(): CloudProvider {
     return this.cloudProvider;
+  }
+
+  /** Set when the cloud worker is an external coding agent that runs its own commands. */
+  agentDefinition(): CliAgentDefinition | undefined {
+    return this.cloudWorker instanceof CliAgentWorker ? this.cloudWorker.definition : undefined;
   }
 
   /** Check configured backends once before a run starts. */

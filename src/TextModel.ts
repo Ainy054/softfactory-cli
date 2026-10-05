@@ -25,7 +25,7 @@ export interface ITextModel {
   complete(prompt: string, options?: CompletionOptions): Promise<string>;
 }
 
-export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek';
+export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli';
 
 /**
  * Size a local window against the host, not the model's name. A 14B at 8192
@@ -140,6 +140,56 @@ export class CodexTextModel implements ITextModel {
   }
 }
 
+/** One prompt through Claude Code's print mode, with no tools: the agent as a plain model. */
+export class ClaudeCodeTextModel implements ITextModel {
+  readonly provider = 'claude-code';
+  constructor(readonly model: string, private readonly cwd: string = process.cwd()) {}
+
+  async isAvailable(): Promise<boolean> {
+    try { await execa('claude', ['--version'], { timeout: 10000 }); return true; } catch { return false; }
+  }
+
+  async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
+    let data: any;
+    try {
+      const { stdout } = await execa('claude', ['-p', prompt, '--output-format', 'json', '--bare', '--no-session-persistence', '--max-turns', '1', '--restricted', '--permission-mode', 'dontAsk', ...(this.model ? ['--model', this.model] : [])],
+        { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 });
+      data = JSON.parse(stdout.slice(stdout.indexOf('{')));
+    } catch (error: any) {
+      throw new WorkerEnvironmentError(`Claude Code failed for ${this.model || 'its default model'}: ${(error?.shortMessage || error?.message || 'unknown error').slice(0, 300)}`);
+    }
+    const text = String(data.result ?? '').trim();
+    if (data.is_error) throw new WorkerEnvironmentError(`Claude Code could not answer: ${text.slice(0, 300)}`);
+    if (!text) throw new Error('Claude Code returned no text.');
+    return text;
+  }
+}
+
+/** One prompt through the Gemini CLI in non-interactive mode. */
+export class GeminiCliTextModel implements ITextModel {
+  readonly provider = 'gemini-cli';
+  constructor(readonly model: string, private readonly cwd: string = process.cwd()) {}
+
+  async isAvailable(): Promise<boolean> {
+    try { await execa('gemini', ['--version'], { timeout: 10000 }); return true; } catch { return false; }
+  }
+
+  async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
+    let data: any;
+    try {
+      const { stdout } = await execa('gemini', ['-p', prompt, '--output-format', 'json', '--approval-mode', 'default', ...(this.model ? ['-m', this.model] : [])],
+        { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 });
+      data = JSON.parse(stdout.slice(stdout.indexOf('{')));
+    } catch (error: any) {
+      throw new WorkerEnvironmentError(`Gemini CLI failed for ${this.model || 'its default model'}: ${(error?.shortMessage || error?.message || 'unknown error').slice(0, 300)}`);
+    }
+    if (data.error) throw new WorkerEnvironmentError(`Gemini CLI could not answer: ${String(data.error.message || data.error).slice(0, 300)}`);
+    const text = String(data.response ?? '').trim();
+    if (!text) throw new Error('Gemini CLI returned no text.');
+    return text;
+  }
+}
+
 export class OpenAiTextModel implements ITextModel {
   readonly provider = 'openai-api';
   constructor(readonly model: string, private readonly fetchImpl: typeof fetch = fetch) {}
@@ -233,5 +283,7 @@ export function createTextModel(provider: TextModelProvider, model: string, opti
     case 'openai-api': return new OpenAiTextModel(model, options.fetchImpl);
     case 'anthropic': return new AnthropicTextModel(model, options.fetchImpl);
     case 'deepseek': return new DeepSeekTextModel(model, options.fetchImpl);
+    case 'claude-code': return new ClaudeCodeTextModel(model, options.cwd);
+    case 'gemini-cli': return new GeminiCliTextModel(model, options.cwd);
   }
 }

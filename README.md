@@ -2,7 +2,7 @@
 
 A software delivery factory for one repository. You give it a requirement. A planner decomposes it into dependency-ordered tasks with an acceptance command each. Workers, local Ollama models or a cloud model, implement each task in its own git worktree, running every command inside a sandbox. Mechanical gates (the project's tests, the task's acceptance command, scope and sabotage checks) and a reviewer decide what merges. Everything it decides is written down: evidence logs, per-run metrics, and a state file you can resume from.
 
-**What the isolation boundary actually is.** Workers edit files only inside their git worktree. Every command a model chooses to run, and every test the verifier runs, executes in a throwaway Docker container with the network off, no capabilities, a read-only root filesystem, and the worktree as the only writable mount (the main repository is mounted read-only so `git status` works). Without Docker, softfactory refuses to start workers unless you pass `--sandbox=none`, in which case commands run on the host under an allowlist (no shell, no network git, no interpreter preloads, every path argument inside the worktree). The allowlist is a filter, not a boundary; treat `--sandbox=none` as running the model's commands yourself.
+**What the isolation boundary actually is.** Workers edit files only inside their git worktree. Every command a model chooses to run, and every test the verifier runs, executes in a throwaway Docker container with the network off, no capabilities, a read-only root filesystem, and the worktree as the only writable mount (the main repository is mounted read-only so `git status` works). Without Docker, softfactory refuses to start workers unless you pass `--sandbox=none`, in which case commands run on the host under an allowlist (no shell, no network git, no interpreter preloads, every path argument inside the worktree). The allowlist is a filter, not a boundary; treat `--sandbox=none` as running the model's commands yourself. A whole coding agent used as the worker (Claude Code, Gemini CLI) runs its own commands under its own permission rules: with the sandbox on, the entire agent runs in a container whose only network exit is a proxy that admits its model API and nothing else; with `--sandbox=none`, it runs on your host and preflight says UNSANDBOXED AGENT.
 
 ## How a run works
 
@@ -22,7 +22,8 @@ softfactory "add a farewell endpoint"
              the run pauses when nothing else can proceed.
      │         worker = the tool loop (read_file, replace_lines, replace_content,
      │                  write_file, run_command, finish_task) over a chat transport:
-     │                  Ollama, DeepSeek, OpenAI, Anthropic; or the Codex / Antigravity CLI
+     │                  Ollama, DeepSeek, OpenAI, Anthropic; or a whole agent:
+     │                  Codex CLI, Antigravity, Claude Code, Gemini CLI
      ▼
  GATES       commit the worktree → declared files exist → no verification sabotage →
              the project's tests, judged against a per-ecosystem baseline → the task's
@@ -54,7 +55,7 @@ softfactory "add a farewell endpoint"
 - Git, Node.js 20+
 - Docker, for the sandbox (or `--sandbox=none` and accept host execution)
 - Local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b` (or any tool-capable model via `--local-model`)
-- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
+- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), Claude Code (`claude-code`), Gemini CLI (`gemini-cli`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
 
 ## Usage
 
@@ -75,6 +76,11 @@ softfactory --strategy=hybrid --cloud-provider=openai --resume
 softfactory --strategy=cloud --cloud-provider=openai-api --cloud-model=gpt-5.4 "refactor ledger engine"
 softfactory --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4 "refactor ledger engine"
 softfactory --strategy=hybrid --cloud-provider=deepseek --cloud-model=deepseek-v4-flash --frontier-model=deepseek-v4-pro "refactor ledger engine"
+
+# Claude Code or Gemini CLI as the worker: inside the agent container with the sandbox on
+ANTHROPIC_API_KEY=... softfactory --strategy=cloud --cloud-provider=claude-code "refactor ledger engine"
+# ...or on the host under the agent's own permission rules (loud UNSANDBOXED AGENT warning)
+softfactory --strategy=cloud --cloud-provider=claude-code --sandbox=none "refactor ledger engine"
 
 # Plan now, execute later; resume; refine a plan mid-flight
 softfactory --plan "implement transaction reversal endpoint"
@@ -100,11 +106,11 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | :--- | :--- | :--- |
 | `--strategy` | `hybrid`, `local`, `cloud` | `hybrid` |
 | `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, `none` (host allowlist only, loud warning) | `auto` |
-| `--cloud-provider` | `agy`, `openai` (Codex CLI), `openai-api`, `anthropic`, `deepseek` | `agy` |
+| `--cloud-provider` | `agy`, `openai` (Codex CLI), `claude-code`, `gemini-cli`, `openai-api`, `anthropic`, `deepseek` | `agy` |
 | `--cloud-model` | Cloud model; optional for Codex CLI, which uses its configured default | provider default |
 | `--frontier-model` | Escalation and blind-review model; optional for Codex CLI | provider default |
 | `--local-model` | Ollama model; pins every local tier when set | `qwen2.5-coder:7b` / `14b` tiers |
-| `--planner-provider` | `openai` (Codex CLI), `agy`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
+| `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
 | `--planner-model` | Planner model override | provider default |
 | `--plan` | Save the plan without executing | `false` |
 | `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
@@ -122,7 +128,16 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--no-tui` | Plain stdout instead of the Ink TUI | TUI when interactive |
 | `--no-docker` | Skip the post-build docker-compose check of the finished app | auto-detect |
 
-Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
+Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_AGENT_IMAGE` (or `agentImage`) for the agent container's image when the project needs more than node in it; `SOFTFACTORY_EGRESS_ALLOW` for extra hosts (`host` or `host:port`, `*.example.com`) the agent container may reach; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
+
+## A whole agent as the worker
+
+`--cloud-provider=claude-code` or `gemini-cli` hands each task to that agent in print mode inside the task's worktree, with the same prompt the tool loop gets: the task, its acceptance command, its review questions, the lessons, and the handoff file to write. The agent brings its own loop, tools and permission system, so softfactory's command policy does not apply to what it runs. Two placements, chosen by the sandbox mode:
+
+- **Sandbox on (default).** The whole agent runs in a container built once from the node image plus the agent's npm package (`softfactory-agent-<name>`). It has the worktree as its only writable mount, no capabilities, a read-only root, and sits on an internal Docker network with no route out. The one other container on that network is an allowlisting CONNECT proxy, bridged to the outside, that admits the agent's API host (plus `ANTHROPIC_BASE_URL`'s host and anything in `SOFTFACTORY_EGRESS_ALLOW`) on port 443 and refuses everything else. Inside, the agent runs with its permission checks off, since the container is the boundary. Only the agent's own credential variable crosses into the container, so a login kept in your home directory does not work there: set `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`, or use `--sandbox=none`. The container has node and git; for a Go or Python project the agent cannot run those tests itself (the verifier still does, in the right image), or set `SOFTFACTORY_AGENT_IMAGE` to an image that has both the toolchain and the agent CLI.
+- **`--sandbox=none`.** The agent runs on your host under its own rules: Claude Code with `acceptEdits` and an allowlist of read-only and test commands, Gemini CLI with `auto_edit`. Preflight prints UNSANDBOXED AGENT. Those rules are the agent's, not softfactory's: `cat ~/.ssh/id_rsa` passes a `Bash(cat:*)` rule.
+
+Either way the gates are unchanged: the worktree is committed by the orchestrator, verified, the acceptance command executed, the diff reviewed, and only then merged. The agent's token usage counts toward `--max-tokens`, and the attempt budget ends its process.
 
 ## Ticket in, pull request out
 
