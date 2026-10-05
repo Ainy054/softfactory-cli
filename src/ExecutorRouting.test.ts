@@ -20,7 +20,7 @@ function task(over: Partial<Task> & { id: string }): Task {
 async function loopHarness(tasks: Task[]) {
   const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-exec-'));
   await fs.mkdir(path.join(baseDir, '.softfactory'), { recursive: true });
-  const factory: any = new Factory(baseDir, '', { strategy: 'local' });
+  const factory: any = new Factory(baseDir, '', { strategy: 'local', sandbox: 'none' });
   factory.state = {
     schema_version: CURRENT_SCHEMA_VERSION, feature_id: 'f-1', feature: 'routing', status: 'active', strategy: 'local',
     cloud_provider: 'agy', planner_provider: 'local', created_at: new Date().toISOString(), last_updated: '', tasks, memory_patterns: [],

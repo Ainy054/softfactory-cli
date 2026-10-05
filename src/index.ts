@@ -3,16 +3,17 @@ import process from 'node:process';
 import { Factory } from './Factory.js';
 import { WorkerStrategy, CloudProvider } from './WorkerRegistry.js';
 import type { PlannerProvider } from './Planner.js';
+import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 
 const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
-  '--planner-provider', '--planner-model', '--mark-done'
+  '--planner-provider', '--planner-model', '--mark-done', '--sandbox'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -65,6 +66,10 @@ async function main() {
     throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, local, or deepseek.`);
   }
   const plannerModelArg = getFlagValue(args, '--planner-model') || '';
+  const sandboxArg = (getFlagValue(args, '--sandbox') || 'auto') as SandboxMode;
+  if (!['auto', 'docker', 'none'].includes(sandboxArg)) {
+    throw new Error(`Unsupported --sandbox "${sandboxArg}". Use auto, docker, or none.`);
+  }
   // The Codex CLI already has an authenticated, user-configured default model.
   // Do not accidentally pass Antigravity's Gemini defaults to it.  Supplying
   // either option remains useful for explicitly choosing fast/frontier tiers.
@@ -144,6 +149,7 @@ async function main() {
   const factory = new Factory(process.cwd(), apiKey, {
     streamToTerminal: noTui,
     useDocker: !noDocker,
+    sandbox: sandboxArg,
     strategy: strategyArg,
     localModel: localModelArg,
     cloudModel: cloudModelArg,

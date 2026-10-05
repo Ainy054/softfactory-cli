@@ -97,7 +97,7 @@ describe('a local run does not claim a review it never had', () => {
 
 describe('preflight requires the reviewer for hybrid and cloud runs', () => {
   it('reports an environment fault naming the inspector when it is unavailable', async () => {
-    const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-pre-')), '', { strategy: 'hybrid', cloudProvider: 'deepseek', cloudModel: 'deepseek-v4-flash' });
+    const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-pre-')), '', { strategy: 'hybrid', cloudProvider: 'deepseek', cloudModel: 'deepseek-v4-flash', sandbox: 'none' });
     factory.workerRegistry.preflight = async () => ({ local: true, cloud: false, localModel: 'q', cloudModel: 'deepseek-v4-flash' });
     factory.inspector.isAvailable = async () => false;
     await factory.logBackendPreflight();
@@ -105,7 +105,7 @@ describe('preflight requires the reviewer for hybrid and cloud runs', () => {
   });
 
   it('does not require one for a local run', async () => {
-    const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-pre-')), '', { strategy: 'local' });
+    const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-pre-')), '', { strategy: 'local', sandbox: 'none' });
     factory.workerRegistry.preflight = async () => ({ local: true, cloud: false, localModel: 'q', cloudModel: '' });
     factory.inspector.isAvailable = async () => false;
     await factory.logBackendPreflight();

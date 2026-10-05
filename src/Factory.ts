@@ -18,10 +18,13 @@ import { createTextModel, OllamaTextModel } from './TextModel.js';
 import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
 import { redactSecrets } from './redact.js';
+import { SandboxManager, type SandboxMode } from './Sandbox.js';
 
 export interface FactoryOptions {
     streamToTerminal?: boolean;
     useDocker?: boolean;
+    /** Where model-chosen commands run: a Docker container (auto/docker) or the host allowlist (none). */
+    sandbox?: SandboxMode;
     strategy?: WorkerStrategy;
     localModel?: string;
     cloudModel?: string;
@@ -45,6 +48,7 @@ export class Factory extends EventEmitter {
     /** The frontier-tier reviewer for protected diffs; it never sees the worker's summary. */
     frontierInspector: Inspector;
     protectedPaths = new ProtectedPaths([]);
+    sandbox: SandboxManager;
     workerRegistry: WorkerRegistry;
     taskVerifier: TaskVerifier;
     lessons: LessonManager;
@@ -72,9 +76,10 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '' } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '' } = options;
         this.useDocker = useDocker;
         this.strategy = strategy;
+        this.sandbox = new SandboxManager(sandbox, line => this.log(line));
         this.statePath = path.join(baseDir, '.softfactory', 'factory.json');
         this.historyPath = path.join(baseDir, '.softfactory', 'history.json');
         this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
@@ -108,7 +113,7 @@ export class Factory extends EventEmitter {
             : createTextModel(cloudProvider, frontierModel || cloudModel, { cwd: baseDir }));
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
         this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
-        this.taskVerifier = new TaskVerifier();
+        this.taskVerifier = new TaskVerifier(this.sandbox);
         this.lessons = new LessonManager(baseDir);
         this.trainingData = new TrainingDataManager(baseDir);
         // Capture is enabled by default so verified trajectories are not lost.
@@ -122,6 +127,7 @@ export class Factory extends EventEmitter {
         await fs.mkdir(this.archiveDir, { recursive: true });
         this.protectedPaths = await ProtectedPaths.load(this.baseDir);
         if (this.protectedPaths.size > 0) this.log(`Protected paths: ${this.protectedPaths.size} pattern(s) from ${ProtectedPaths.FILE}`);
+        await this.sandbox.detect();
         await this.worktreeManager.init();
         this.defaultBranch = await this.worktreeManager.getDefaultBranch();
         if (this.useDocker) {
@@ -699,6 +705,7 @@ export class Factory extends EventEmitter {
                 memoryPatterns: await this.lessons.getRelevant(task),
                 model,
                 diagnosticsDir: path.join(this.baseDir, '.softfactory'),
+                sandbox: this.sandbox,
                 onOutput: (line: string) => {
                     this.emitEvent({ type: 'worker:output', taskId: task.id, line });
                 },
@@ -1503,6 +1510,14 @@ export class Factory extends EventEmitter {
     }
 
     private async logBackendPreflight() {
+        // The sandbox is checked first: without one, nothing a model chooses
+        // to run should start, whatever the model backends look like.
+        const unsandboxed = this.sandbox.blockingReason();
+        if (unsandboxed) {
+            this.environmentFault = unsandboxed;
+            return;
+        }
+        this.log(`Sandbox: ${this.sandbox.describe()}`);
         try {
             const health = await this.workerRegistry.preflight();
             this.log(`Backend preflight: local ${health.local ? 'ready' : 'unavailable'} (${health.localModel}), cloud ${health.cloud ? 'ready' : 'unavailable'} (${this.workerRegistry.getCloudProvider()}/${health.cloudModel || 'configured default'})`);

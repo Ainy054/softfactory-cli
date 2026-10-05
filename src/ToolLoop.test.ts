@@ -101,6 +101,26 @@ describe('replace_content treats the replacement as literal text', () => {
   });
 });
 
+describe('a worker command cannot reach outside its worktree', () => {
+  it('rejects an absolute path argument as a tool error and keeps going', async () => {
+    const dir = await worktree('x');
+    const script = scriptOllama([
+      { calls: [{ name: 'run_command', args: { command: 'cat /etc/passwd' } }] },
+      { calls: [finish] },
+    ]);
+    try {
+      const handoff = await workerWithVerifier(true).execute(task, dir, { diagnosticsDir: dir });
+      assert.equal(handoff.status, 'success');
+      const last = script.requests[script.requests.length - 1];
+      const toolReplies = last.messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content);
+      assert.ok(toolReplies.some((c: string) => /escapes the worktree/.test(c)), toolReplies.join(' | '));
+    } finally {
+      script.restore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('command parsing keeps quoted arguments intact', () => {
   const w: any = new LocalAgentWorker();
 

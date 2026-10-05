@@ -1,4 +1,5 @@
 import { Task, Handoff } from './types.js';
+import type { SandboxManager } from './Sandbox.js';
 
 export interface WorkerOptions {
   onOutput?: (line: string) => void;
@@ -7,6 +8,8 @@ export interface WorkerOptions {
   memoryPatterns?: string[];
   model?: string;
   diagnosticsDir?: string;
+  /** Where the worker's run_command calls execute; host allowlist only when absent. */
+  sandbox?: SandboxManager;
 }
 
 export interface IWorker {

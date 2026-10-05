@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task } from './types.js';
 import { commandPolicyViolation, runSafeCommand } from './commandPolicy.js';
+import { SandboxManager, type ExecOptions, type ExecResult } from './Sandbox.js';
 
 export interface AcceptanceResult {
   /** False when the task declares no command; nothing was checked. */
@@ -43,6 +44,14 @@ export interface VerifierResult {
 }
 
 export class TaskVerifier {
+  /** Test runs and acceptance commands execute through the sandbox; dependency installs stay on the host (they need the network). */
+  constructor(private readonly sandbox: SandboxManager = new SandboxManager('none')) {}
+
+  private async run(rootPath: string, file: string, args: string[], options: ExecOptions): Promise<ExecResult> {
+    const runner = await this.sandbox.runnerFor(rootPath, file);
+    return runner.exec(file, args, options);
+  }
+
   async prepare(worktreePath: string, task?: Task): Promise<{ ok: boolean; message?: string }> {
     const hints = task?.files_hint || [];
     const isFrontendHint = hints.some(f => f.startsWith('frontend/'));
@@ -164,7 +173,7 @@ export class TaskVerifier {
       const pytestArgs = pythonTests.length > 0 ? pythonTests : [];
 
       try {
-        const { stdout, stderr } = await execa('pytest', pytestArgs, {
+        const { stdout, stderr } = await this.run(worktreePath, 'pytest', pytestArgs, {
           cwd: worktreePath,
           env: testEnv,
           timeout: 60000,
@@ -190,7 +199,7 @@ export class TaskVerifier {
     // 5. Rust Project Verification
     if (isRustProject) {
       try {
-        const { stdout, stderr } = await execa('cargo', ['test'], {
+        const { stdout, stderr } = await this.run(worktreePath, 'cargo', ['test'], {
           cwd: worktreePath,
           env: testEnv,
           timeout: 90000,
@@ -214,7 +223,7 @@ export class TaskVerifier {
     // 6. Makefile Verification
     if (hasMakefile) {
       try {
-        const { stdout, stderr } = await execa('make', ['test'], {
+        const { stdout, stderr } = await this.run(worktreePath, 'make', ['test'], {
           cwd: worktreePath,
           env: testEnv,
           timeout: 60000,
@@ -356,7 +365,7 @@ export class TaskVerifier {
         const runEnv = { ...testEnv, CI: 'true', VITEST_WATCH: 'false' };
         let stdout: string, stderr: string;
         try {
-          ({ stdout, stderr } = await execa(binary, args, { cwd: nodeDir, env: runEnv, timeout: 180000 }));
+          ({ stdout, stderr } = await this.run(worktreePath, binary, args, { cwd: nodeDir, env: runEnv, timeout: 180000 }));
         } catch (runError: any) {
           const out = (runError.stdout || runError.stderr || runError.message || '') as string;
           if (unscoped && this.isPreExistingAssertionFailure(out)) {
@@ -418,7 +427,7 @@ export class TaskVerifier {
 
     // A) Verify compilation first
     try {
-      await execa('go', ['vet', ...(packages.length > 0 ? packages : ['./...'])], {
+      await this.run(worktreePath, 'go', ['vet', ...(packages.length > 0 ? packages : ['./...'])], {
         cwd: goDir,
         env: testEnv,
         timeout: 90000,
@@ -446,7 +455,7 @@ export class TaskVerifier {
       testArgs.push(...packages);
 
       try {
-        const { stdout, stderr } = await execa('go', testArgs, {
+        const { stdout, stderr } = await this.run(worktreePath, 'go', testArgs, {
           cwd: goDir,
           env: testEnv,
           timeout: 180000,
@@ -489,7 +498,7 @@ export class TaskVerifier {
 
     // D) Full test suite fallback
     try {
-      const { stdout, stderr } = await execa('go', ['test', '-short', '-p', '1', './...'], {
+      const { stdout, stderr } = await this.run(worktreePath, 'go', ['test', '-short', '-p', '1', './...'], {
         cwd: goDir,
         env: testEnv,
         timeout: 120000,
@@ -629,7 +638,7 @@ export class TaskVerifier {
     const command = (task.verification_command || '').trim();
     if (!command) return { ran: false, passed: true, exitCode: null, output: '', command: '', unrunnable: false };
     const cwd = await this.acceptanceCwd(worktreePath, command);
-    const violation = commandPolicyViolation(command);
+    const violation = commandPolicyViolation(command, { root: worktreePath, cwd });
     let exitCode: number | null = null;
     let output = '';
     let passed = false;
@@ -639,7 +648,8 @@ export class TaskVerifier {
       unrunnable = true;
     } else {
       try {
-        const result = await runSafeCommand(command, cwd, options.timeoutMs ?? 180000);
+        const runner = await this.sandbox.runnerFor(worktreePath, command.split(/\s+/, 1)[0]);
+        const result = await runSafeCommand(command, cwd, options.timeoutMs ?? 180000, { root: worktreePath, runner });
         exitCode = result.exitCode;
         output = `${result.stdout}\n${result.stderr}`.trim();
         passed = true;

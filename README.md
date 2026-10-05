@@ -1,6 +1,8 @@
-# SoftFactory CLI (Hybrid `agy` + `Qwen` Edition)
+# SoftFactory CLI
 
-High-assurance multi-agent software delivery factory. Decomposes requirements into dependency-ordered phases, executes tasks in parallel inside isolated Git worktrees via **local Qwen (Ollama)** and **cloud Antigravity (`agy`)**, verifies code with automated in-worktree test runners, inspects diffs, and merges passing work.
+Multi-agent software delivery factory. Decomposes requirements into dependency-ordered phases, executes tasks in parallel inside isolated Git worktrees via local Ollama models and a cloud provider of your choice, runs each task's tests and acceptance command, reviews the diff, and merges passing work.
+
+**What the isolation boundary actually is.** Workers edit files only inside their git worktree. Every command a model chooses to run, and every test the verifier runs, executes in a throwaway Docker container with the network off, no capabilities, and the worktree as the only writable mount (the main repository is mounted read-only so `git status` works). Without Docker, softfactory refuses to start workers unless you pass `--sandbox=none`, in which case commands run on the host under an allowlist (no shell, no network git, no interpreter preloads, every path argument inside the worktree). The allowlist is a filter, not a boundary; treat `--sandbox=none` as running the model's commands yourself.
 
 ## Architecture
 
@@ -23,21 +25,22 @@ softfactory "add user authentication"
    [MERGE]              Sequential merge of verified tasks + FACTORY_MEMORY.md update
 ```
 
-### Key Advantages:
-1. **Zero Pay-Per-Token Bills:** Routine coding and test writing run 100% locally on **`qwen2.5-coder:7b`** via Ollama.
-2. **Cloud Frontier Power via `agy`:** Blueprints and adversarial inspection utilize **Gemini 3.1 Pro** and **Gemini 3.7 Flash** via your Antigravity CLI without raw API keys or rate-limit lockouts.
-3. **Automated Verifier Gate:** Automated local test execution prevents broken builds from reaching the inspector stage.
-4. **Mechanical Graph Safety:** Tasks in the same phase with overlapping file hints are automatically serialized to eliminate merge conflicts.
-5. **P-85 State Persistence:** Resilient state and SIGINT/SIGTERM trap recovery.
+### What each gate does
+1. **Local-first execution:** routine coding and test writing run on local Ollama models; oversized, protected, or repeatedly failing tasks escalate to the configured cloud provider.
+2. **Verifier:** the task's scoped tests run in the sandbox, with a per-ecosystem regression baseline so a task is judged on whether it made the suite worse, not on whether an already-red project is red.
+3. **Executed acceptance:** the task's own `verification_command` runs verbatim and its evidence log must end in PASS.
+4. **Review:** the configured provider's model reviews the diff; protected diffs get an independent review on the frontier model that never sees the worker's summary; a local run records "mechanical gates only" rather than a review it did not have.
+5. **Graph safety and recovery:** same-phase tasks with overlapping files are serialized, state is persisted after every step, and Ctrl-C reconciles worktrees.
 
 ---
 
 ## Prerequisites
 
 - Git
-- Antigravity CLI (`agy` installed and authenticated on PATH)
-- Ollama with `qwen2.5-coder:7b` (`ollama run qwen2.5-coder:7b`)
 - Node.js 20+
+- Docker (for the sandbox; or pass `--sandbox=none` and accept host execution)
+- For local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b`
+- For cloud workers, one of: Antigravity CLI (`agy`), Codex CLI, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
 
 ---
 
@@ -88,7 +91,8 @@ softfactory --resume
 | `--frontier-model` | Escalation model after repeated cloud-worker failures; optional for Codex CLI | `Gemini 3.1 Pro (High)` |
 | `--cloud-provider` | Cloud execution backend: `agy`, `openai` (Codex CLI), `openai-api`, `anthropic`, or `deepseek` | `agy` |
 | `--no-tui` | Plain stdout console output without Ink TUI | Interactive default |
-| `--no-docker` | Skip post-build docker verification | Docker auto-detect |
+| `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, or `none` (host allowlist only, loud warning) | `auto` |
+| `--no-docker` | Skip post-build docker-compose verification of the finished app | Docker auto-detect |
 | `DEEPSEEK_API_KEY` | API key for DeepSeek cloud workers/planner | Not set |
 | `SOFTFACTORY_TRAINING_CAPTURE=0` | Opt out of sanitized verified candidates and failure lessons in `.softfactory/training-*.jsonl` | Enabled |
 | `--plan` | Generate and save plan without immediate execution | `false` |

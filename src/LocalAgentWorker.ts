@@ -6,7 +6,8 @@ import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { safeLocalContextWindow } from './TextModel.js';
-import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline } from './commandPolicy.js';
+import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
+import type { SandboxManager } from './Sandbox.js';
 
 interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -392,14 +393,14 @@ ${projectContext}
               }
             } else if (name === 'run_command') {
               onOutput(`[LocalAgent] 🖥️ Running: ${args.command}`);
-              this.assertAllowedCommand(args.command);
+              // `cd x && y` is blocked by the allowlist, so without this a
+              // monorepo worker could never run the project's own tests: godo
+              // keeps package.json in frontend/, and every `npm test` at the
+              // worktree root died with ENOENT.
+              const cwd = this.resolveWorkingDir(worktreePath, args.working_dir);
+              this.assertAllowedCommand(args.command, { root: worktreePath, cwd });
               try {
-                // `cd x && y` is blocked by the allowlist, so without this a
-                // monorepo worker could never run the project's own tests: godo
-                // keeps package.json in frontend/, and every `npm test` at the
-                // worktree root died with ENOENT.
-                const cwd = this.resolveWorkingDir(worktreePath, args.working_dir);
-                const result = await this.runSafeCommand(args.command, cwd);
+                const result = await this.runSafeCommand(args.command, cwd, worktreePath, options?.sandbox);
                 toolResult = this.truncateToolResult(`STDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
               } catch (cmdErr: any) {
                 toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
@@ -720,10 +721,13 @@ ${projectContext}
 
   // The command policy is shared with the acceptance runner and the DeepSeek
   // worker (commandPolicy.ts); these thin wrappers keep the call sites local.
-  private assertAllowedCommand(command: unknown): asserts command is string { assertAllowedCommand(command); }
+  private assertAllowedCommand(command: unknown, scope?: CommandScope): asserts command is string { assertAllowedCommand(command, scope); }
   private splitPipeline(command: string): string[] { return splitPipeline(command); }
   private parseCommand(command: string): string[] { return parseCommand(command); }
-  private runSafeCommand(command: string, cwd: string) { return runSafeCommand(command, cwd, 30000); }
+  private async runSafeCommand(command: string, cwd: string, root: string = cwd, sandbox?: SandboxManager) {
+    const runner = sandbox ? await sandbox.runnerFor(root, command.trim().split(/\s+/, 1)[0]) : undefined;
+    return runSafeCommand(command, cwd, 30000, { root, runner });
+  }
 
   private truncateToolResult(result: string): string {
     return result.length > this.maxToolOutput ? `${result.slice(0, this.maxToolOutput)}\n...[truncated]` : result;
