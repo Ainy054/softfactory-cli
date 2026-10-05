@@ -75,3 +75,72 @@ describe('executeAndInspect: worker self-reported failure', () => {
     assert.match(task.error_history[0], /produced no file changes/);
   });
 });
+
+describe('test-writer acceptance evidence', () => {
+  it('rejects a placeholder test diff', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    assert.match(factory.validateTestWriterEvidence({ agent_role: 'test_writer' }, '+export {};'), /no test cases/);
+  });
+
+  it('accepts executable assertions', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    assert.equal(factory.validateTestWriterEvidence({ agent_role: 'test_writer' }, '+it("works", () => expect(true).toBe(true));'), null);
+  });
+});
+
+describe('automatic re-plan scope', () => {
+  it('allows splitting work across the parent task files', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    const parent = { ...makeTask(), files_hint: ['app.ts', 'app.test.ts'] };
+    const replacements = [
+      { ...makeTask(), id: 'T1.1', files_hint: ['app.ts'] },
+      { ...makeTask(), id: 'T1.2', files_hint: ['app.test.ts'] },
+    ];
+    assert.doesNotThrow(() => factory.validateAutoReplanScope(parent, replacements));
+  });
+
+  it('rejects invented paths that expand the parent scope', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    const replacements = [{
+      ...makeTask(), id: 'T1.1',
+      files_hint: ['src/invented/__tests__/app.test.ts'],
+      creates_files: ['src/invented/__tests__/app.test.ts'],
+    }];
+    assert.throws(() => factory.validateAutoReplanScope(makeTask(), replacements), /expanded task scope/);
+  });
+});
+
+describe('resume runtime configuration', () => {
+  it('synchronizes persisted provider metadata with the current process', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'softfactory-runtime-'));
+    await fs.mkdir(path.join(baseDir, '.softfactory'), { recursive: true });
+    await fs.writeFile(path.join(baseDir, '.softfactory', 'factory.json'), JSON.stringify({
+      feature_id: 'f-1', feature: 'test', status: 'active', strategy: 'hybrid',
+      cloud_provider: 'openai', planner_provider: 'openai', created_at: '', last_updated: '',
+      tasks: [], memory_patterns: [],
+    }));
+    const factory: any = new Factory(baseDir, '', {
+      strategy: 'hybrid', cloudProvider: 'deepseek', plannerProvider: 'local', useDocker: false,
+    });
+    factory.worktreeManager.init = async () => {};
+    factory.worktreeManager.getDefaultBranch = async () => 'master';
+    await factory.init();
+    assert.equal(factory.state.cloud_provider, 'deepseek');
+    assert.equal(factory.state.planner_provider, 'local');
+  });
+});
+
+describe('training capture configuration', () => {
+  it('is enabled by default and supports an explicit opt-out', () => {
+    const previous = process.env.SOFTFACTORY_TRAINING_CAPTURE;
+    try {
+      delete process.env.SOFTFACTORY_TRAINING_CAPTURE;
+      assert.equal((new Factory('/tmp', '', { strategy: 'local' }) as any).trainingCaptureEnabled, true);
+      process.env.SOFTFACTORY_TRAINING_CAPTURE = '0';
+      assert.equal((new Factory('/tmp', '', { strategy: 'local' }) as any).trainingCaptureEnabled, false);
+    } finally {
+      if (previous === undefined) delete process.env.SOFTFACTORY_TRAINING_CAPTURE;
+      else process.env.SOFTFACTORY_TRAINING_CAPTURE = previous;
+    }
+  });
+});

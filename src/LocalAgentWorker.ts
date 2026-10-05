@@ -5,6 +5,7 @@ import { execa } from 'execa';
 import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
+import { AutoHeal } from './AutoHeal.js';
 
 interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -22,7 +23,7 @@ export class LocalAgentWorker implements IWorker {
   static readonly REPEAT_TOTAL_ABORT = 8;    // identical calls anywhere in the attempt
   static readonly CYCLE_WINDOW = 6;          // rolling window for A/B/A/B oscillation
   static readonly CYCLE_DISTINCT = 2;
-  static readonly NO_PROGRESS_ABORT = 10;    // tool calls with no successful edit
+  static readonly NO_PROGRESS_ABORT = 10;    // allow initial inspection; cycle guards stop repetitive exploration sooner
   private readonly maxToolOutput = 6000;
   private readonly maxFileRead = 24000;
   private readonly verifier = new TaskVerifier();
@@ -48,7 +49,7 @@ export class LocalAgentWorker implements IWorker {
       if (!response.ok) return { reachable: false, modelPresent: false, installed: [] };
       const data = await response.json() as any;
       const installed: string[] = (data.models || []).map((entry: any) => entry.name).filter(Boolean);
-      return { reachable: true, modelPresent: !model || installed.includes(model), installed };
+      return { reachable: true, modelPresent: !model || installed.includes(model) || installed.includes(`${model}:latest`), installed };
     } catch {
       return { reachable: false, modelPresent: false, installed: [] };
     }
@@ -80,7 +81,9 @@ CRITICAL INSTRUCTIONS:
 3. When using 'replace_content', provide the EXACT target content you want to replace, including all whitespace.
 4. If tests are failing, read the test files, understand the requirements, and modify the code.
 5. When you are completely finished, call 'finish_task'.
-6. Shell operators (&&, ;, |) are NOT available. To run a command inside a subproject, pass run_command's working_dir, e.g. {"command": "npm test", "working_dir": "frontend"}.
+6. Stay strictly within the task's declared files. Do not edit unrelated files to fix baseline failures.
+7. For test-writing tasks, add real executable assertions and interactions; never leave placeholder comments or empty tests.
+6. Only read-only pipelines using | are available (for example rg ... | head -20). Other shell operators (&&, ;, redirects, substitutions) are NOT available. Use working_dir for subprojects.
 ${projectRoots.length ? `\nPACKAGE ROOTS (run commands with the matching working_dir):\n${projectRoots.map(r => `- ${r}`).join('\n')}` : ''}
 
 PROJECT CONTEXT:
@@ -105,6 +108,10 @@ ${projectContext}
     }
     if (task.files_hint && task.files_hint.length > 0) {
       userPrompt += `\nRelevant files:\n${task.files_hint.join('\n')}\n`;
+      const tests = task.files_hint.filter(file => /(?:\.test|\.spec)\.[a-z]+$/i.test(file));
+      if (tests.length) {
+        userPrompt += `\nSCOPED VERIFICATION: Run the focused tests for these files first (for example, npm test -- ${tests.join(' ')} from the package root). Do not use unrelated suite failures to justify edits outside the declared scope.\n`;
+      }
     }
 
     let messages: Message[] = [
@@ -133,7 +140,7 @@ ${projectContext}
         type: 'function',
         function: {
           name: 'replace_lines',
-          description: 'Replace an inclusive 1-based line range in a file.',
+          description: 'Replace an inclusive 1-based line range in a file. IMPORTANT: Do not include the line number prefixes (e.g. "12 | ") in the replacement_content. Provide only the raw text.',
           parameters: {
             type: 'object',
             properties: {
@@ -216,6 +223,7 @@ ${projectContext}
       throw new Error(`Ollama model "${model}" did not produce a parseable tool call; use a tool-capable model or the legacy worker.`);
     }
     
+    let finishRejections = 0;
     let handoffResult: Handoff | null = null;
     const changedFiles = new Set<string>();
     let sawToolCall = false;
@@ -234,6 +242,8 @@ ${projectContext}
     // successful edit and stop on that regardless of what the calls look like.
     let callsSinceProgress = 0;
     let stalledWithoutProgress = false;
+    let scopeViolations = 0;
+    const syntaxRejects = new Map<string, number>();
     const diagnosticsDir = options?.diagnosticsDir || path.join(worktreePath, '.softfactory');
     await fs.mkdir(diagnosticsDir, { recursive: true });
 
@@ -326,7 +336,7 @@ ${projectContext}
               const allLines = content.split(/\r?\n/);
               const start = Number.isInteger(Number(args.start_line)) && Number(args.start_line) > 0 ? Number(args.start_line) : 1;
               const end = Number.isInteger(Number(args.end_line)) && Number(args.end_line) >= start ? Math.min(Number(args.end_line), allLines.length) : Math.min(allLines.length, start + 199);
-              toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).join('\n')}`.slice(0, this.maxFileRead);
+              toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).map((line, i) => `${start + i} | ${line}`).join('\n')}`.slice(0, this.maxFileRead);
             } else if (name === 'replace_lines') {
               onOutput(`[LocalAgent] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
@@ -367,22 +377,26 @@ ${projectContext}
               onOutput(`[LocalAgent] 🖥️ Running: ${args.command}`);
               this.assertAllowedCommand(args.command);
               try {
-                const [executable, ...commandArgs] = this.parseCommand(args.command);
                 // `cd x && y` is blocked by the allowlist, so without this a
                 // monorepo worker could never run the project's own tests: godo
                 // keeps package.json in frontend/, and every `npm test` at the
                 // worktree root died with ENOENT.
                 const cwd = this.resolveWorkingDir(worktreePath, args.working_dir);
-                const { stdout, stderr } = await execa(executable, commandArgs, { cwd, timeout: 30000, env: this.safeCommandEnv() });
-                toolResult = this.truncateToolResult(`STDOUT:\n${stdout}\nSTDERR:\n${stderr}`);
+                const result = await this.runSafeCommand(args.command, cwd);
+                toolResult = this.truncateToolResult(`STDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
               } catch (cmdErr: any) {
                 toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
               }
             } else if (name === 'finish_task') {
-              const verification = await this.verifier.verify(worktreePath, task);
+              const verification = await this.verifier.verify(worktreePath, task, false);
               if (!verification.passed) {
+                finishRejections++;
+                if (finishRejections >= 2) {
+                  onOutput(`[LocalAgent] ⛔ Aborting: finish_task rejected twice due to test failures. Escalating...`);
+                  throw new Error(`finish_task rejected twice due to test failures: ${verification.testSummary}`);
+                }
                 toolResult = this.truncateToolResult(`Cannot finish. Tests failed: ${verification.testSummary}\n${verification.output}`);
-                onOutput(`[LocalAgent] ❌ Finish rejected: ${verification.testSummary}`);
+                onOutput(`[LocalAgent] ❌ Finish rejected (${finishRejections}/2): ${verification.testSummary}`);
               } else {
                 onOutput(`[LocalAgent] ✅ Task finished: ${args.status}`);
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles) };
@@ -394,10 +408,27 @@ ${projectContext}
           } catch (e: any) {
             toolResult = `Tool execution failed: ${e.message}`;
             onOutput(`[LocalAgent] ❌ Tool error: ${e.message}`);
+            if (/outside declared task scope/i.test(e.message)) {
+              scopeViolations++;
+              if (scopeViolations >= 2) {
+                repeatedCall = `scope:${args.filepath}`;
+                onOutput(`[LocalAgent] ⛔ Aborting: repeated out-of-scope edits for ${args.filepath}.`);
+              }
+            }
           }
 
           const mutated = ['write_file', 'replace_content', 'replace_lines'].includes(name)
-            && !toolResult.startsWith('ERROR');
+            && !toolResult.startsWith('ERROR')
+            && !toolResult.startsWith('Tool execution failed:');
+          if (toolResult.startsWith('ERROR: edit rejected and reverted')) {
+            const file = String(args.filepath || 'unknown');
+            const count = (syntaxRejects.get(file) || 0) + 1;
+            syntaxRejects.set(file, count);
+            if (count >= 2) {
+              repeatedCall = `syntax:${file}`;
+              onOutput(`[LocalAgent] ⛔ Aborting: repeated syntax-rejected edits for ${file}.`);
+            }
+          }
           if (mutated || name === 'finish_task') {
             callsSinceProgress = 0;
           } else if (++callsSinceProgress >= LocalAgentWorker.NO_PROGRESS_ABORT) {
@@ -430,6 +461,10 @@ ${projectContext}
       status: 'failure',
       summary: stalledWithoutProgress
         ? `LocalAgent made ${LocalAgentWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
+        : repeatedCall?.startsWith('scope:')
+        ? `LocalAgent attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
+        : repeatedCall?.startsWith('syntax:')
+        ? `LocalAgent produced repeated invalid edits for ${repeatedCall.slice(7)}. Restore the last valid file and rewrite it coherently.`
         : repeatedCall
         ? `LocalAgent stalled in a loop around ${repeatedCall.slice(0, 120)} without making progress. Try a different approach.`
         : sawToolCall
@@ -506,6 +541,14 @@ ${projectContext}
     successMessage: string,
     worktreeRoot = '',
   ): Promise<string> {
+    let healed = false;
+    if (fullPath.toLowerCase().endsWith('.json') && await this.structuralError(worktreeRoot, relativePath, content)) {
+      const repaired = AutoHeal.healJson(content);
+      if (repaired !== content && !(await this.structuralError(worktreeRoot, relativePath, repaired))) {
+        content = repaired;
+        healed = true;
+      }
+    }
     await fs.writeFile(fullPath, content, 'utf-8');
     const invalid = await this.structuralError(worktreeRoot, relativePath, content);
     if (invalid) {
@@ -514,7 +557,8 @@ ${projectContext}
       return `ERROR: edit rejected and reverted — ${relativePath} would no longer be valid: ${invalid}. Re-read the file and make a corrected edit.`;
     }
     changedFiles.add(relativePath);
-    return successMessage;
+    await AutoHeal.formatCode(worktreeRoot, relativePath);
+    return healed ? `${successMessage} (JSON auto-healed and revalidated)` : successMessage;
   }
 
   /**
@@ -649,8 +693,19 @@ ${projectContext}
   }
 
   private assertAllowedCommand(command: unknown): asserts command is string {
+    if (process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING === '1') {
+      if (typeof command !== 'string' || !command.trim()) throw new Error('Invalid command.');
+      return;
+    }
     if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
-    if (/[;&|`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
+    if (/[;&`$<>\n\r]/.test(command)) throw new Error('Shell operators are not allowed.');
+    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    if (segments.length > 1 && segments.some(part => !this.isReadOnlyCommand(part))) throw new Error('Only read-only commands may be piped.');
+    if (!segments.length) throw new Error('Invalid command.');
+    for (const segment of segments) this.assertAllowedCommandSegment(segment);
+    return;
+  }
+  private assertAllowedCommandSegment(command: string) {
     const executable = command.trim().split(/\s+/, 1)[0];
     // Read-only inspection. A worker naturally reaches for these to orient
     // itself, and refusing them burned whole turns on `ls -R` and `grep -r`
@@ -674,6 +729,29 @@ ${projectContext}
       throw new Error('git -c / alias execution is not permitted.');
     }
     if (executable === 'npx') throw new Error('npx is not permitted because it can download and execute arbitrary packages.');
+  }
+  private isReadOnlyCommand(command: string) {
+    const executable = command.trim().split(/\s+/, 1)[0];
+    return new Set(['ls', 'cat', 'grep', 'egrep', 'rg', 'find', 'head', 'tail', 'wc', 'pwd', 'file', 'stat']).has(executable);
+  }
+  private async runSafeCommand(command: string, cwd: string) {
+    if (process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING === '1') {
+      const result = await execa('/bin/zsh', ['-lc', command], {
+        cwd, timeout: 30000, env: this.safeCommandEnv(),
+      });
+      return { stdout: result.stdout, stderr: result.stderr };
+    }
+    const segments = command.split('|').map(part => part.trim()).filter(Boolean);
+    let input: string | undefined;
+    let stderr = '';
+    for (const segment of segments) {
+      this.assertAllowedCommandSegment(segment);
+      const [executable, ...commandArgs] = this.parseCommand(segment);
+      const result = await execa(executable, commandArgs, { cwd, timeout: 30000, env: this.safeCommandEnv(), input });
+      input = result.stdout;
+      stderr += result.stderr;
+    }
+    return { stdout: input || '', stderr };
   }
 
   private parseCommand(command: string): string[] {

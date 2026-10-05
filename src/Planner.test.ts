@@ -48,4 +48,15 @@ describe('planner semantic validation', () => {
     plan.tasks[0].dependencies = ['T002'];
     assert.throws(() => validateBlueprint(plan, input), /dependency cycle|file conflict/);
   });
+
+  it('rejects unsupported Vitest discovery and repeat commands', () => {
+    for (const verification of [
+      ['npx vitest list'],
+      ['npx vitest run src/App.test.tsx --repeat=2'],
+    ]) {
+      const plan = structuredClone(valid);
+      plan.tasks[0].verification = verification;
+      assert.throws(() => validateBlueprint(plan, input), /unsupported Vitest/);
+    }
+  });
 });

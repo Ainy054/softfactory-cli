@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { AutoHeal } from './AutoHeal.js';
 
 const GOOD = JSON.stringify({
   name: 'godo-frontend',
@@ -25,16 +26,14 @@ async function scratch(content = GOOD) {
 describe('edits that would corrupt a structured file are rejected', () => {
   const worker: any = new LocalAgentWorker();
 
-  it('reverts a JSON file left unparseable, and says so', async () => {
+  it('auto-heals a repairable JSON typo and reports it', async () => {
     const { file } = await scratch();
     const changed = new Set<string>();
     const result = await worker.writeChecked(file, 'package.json', BROKEN, GOOD, changed, 'ok');
 
-    assert.match(result, /edit rejected and reverted/);
-    assert.match(result, /invalid JSON/);
-    assert.equal(await fs.readFile(file, 'utf-8'), GOOD, 'the good content must be restored');
-    assert.equal(changed.size, 0, 'a reverted edit must not count as a change');
-    JSON.parse(await fs.readFile(file, 'utf-8'));   // still parseable
+    assert.match(result, /JSON auto-healed and revalidated/);
+    JSON.parse(await fs.readFile(file, 'utf-8'));
+    assert.equal(changed.size, 1, 'a healed edit counts as a validated change');
   });
 
   it('accepts a valid edit and records the change', async () => {
@@ -52,7 +51,13 @@ describe('edits that would corrupt a structured file are rejected', () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-edit-new-'));
     const file = path.join(dir, 'tsconfig.json');
     const changed = new Set<string>();
-    await worker.writeChecked(file, 'tsconfig.json', '{ "a": }', null, changed, 'ok');
+    const heal = AutoHeal.healJson;
+    AutoHeal.healJson = () => '{ "a": }';
+    try {
+      await worker.writeChecked(file, 'tsconfig.json', '{ "a": }', null, changed, 'ok');
+    } finally {
+      AutoHeal.healJson = heal;
+    }
     await assert.rejects(() => fs.readFile(file, 'utf-8'), 'a file that was never valid must not persist');
   });
 

@@ -21,6 +21,13 @@ export const TaskSchema = z.object({
   model: z.string().optional(),
   provider: z.string().optional(),
   worker_type: z.enum(['local', 'cloud', 'auto']).default('auto'),
+  production_targets: z.array(z.string()).default([]),
+  test_targets: z.array(z.string()).default([]),
+  behavior_tags: z.array(z.string()).default([]),
+  verification_command: z.string().optional(),
+  complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
+  allocation_reason: z.string().optional(),
+  replan_reason: z.string().optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -30,10 +37,18 @@ export const FactoryStateSchema = z.object({
   feature: z.string(),
   status: z.enum(['planning', 'planned', 'active', 'completed', 'failed']),
   strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
-  cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic']).default('agy'),
-  planner_provider: z.enum(['openai', 'agy', 'local']).default('openai'),
+  cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic', 'deepseek']).default('agy'),
+  planner_provider: z.enum(['openai', 'agy', 'local', 'deepseek']).default('openai'),
   created_at: z.string(),
   last_updated: z.string(),
+  state_revision: z.number().int().nonnegative().default(0),
+  runtime: z.object({
+    strategy: z.enum(['hybrid', 'local', 'cloud']),
+    local_model: z.string().optional(),
+    cloud_provider: z.string().optional(),
+    cloud_model: z.string().optional(),
+    frontier_model: z.string().optional(),
+  }).optional(),
   tasks: z.array(TaskSchema),
   memory_patterns: z.array(z.string()).default([]),
 });

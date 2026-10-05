@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { AgyClient } from './GeminiClient.js';
 import { extractJson } from './GeminiClient.js';
 
-export type PlannerProvider = 'openai' | 'agy' | 'local';
+export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek';
 
 const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
@@ -20,6 +20,12 @@ const BlueprintTaskSchema = z.object({
   creates_files: z.array(z.string()).default([]),
   acceptance_criteria: z.array(z.string()).default([]),
   verification: z.array(z.string()).default([]),
+  production_targets: z.array(z.string()).default([]),
+  test_targets: z.array(z.string()).default([]),
+  behavior_tags: z.array(z.string()).default([]),
+  verification_command: z.string().optional(),
+  complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
+  allocation_reason: z.string().optional(),
 });
 
 export const BlueprintSchema = z.object({
@@ -45,7 +51,7 @@ export interface IPlanner {
   generateBlueprint(input: PlanningInput): Promise<Blueprint>;
 }
 
-const OUTPUT_SCHEMA = {
+export const OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['feature', 'requirements_covered', 'tasks'],
@@ -58,7 +64,7 @@ const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason'],
         properties: {
           id: { type: 'string' },
           title: { type: 'string' },
@@ -71,6 +77,12 @@ const OUTPUT_SCHEMA = {
           creates_files: { type: 'array', items: { type: 'string' } },
           acceptance_criteria: { type: 'array', minItems: 1, items: { type: 'string' } },
           verification: { type: 'array', minItems: 1, items: { type: 'string' } },
+          production_targets: { type: 'array', items: { type: 'string' } },
+          test_targets: { type: 'array', items: { type: 'string' } },
+          behavior_tags: { type: 'array', items: { type: 'string' } },
+          verification_command: { type: 'string' },
+          complexity: { type: 'string', enum: ['simple', 'moderate', 'complex'] },
+          allocation_reason: { type: 'string' },
         },
       },
     },
@@ -96,6 +108,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - Put tests before dependent implementation where useful. Put the final cross-cutting quality gate in the last phase.
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria must be observable outcomes. verification must contain concrete commands or inspection checks.
+- For every test_writer task, declare test_targets and production_targets. If the criterion requires behavior that is not already present, add a dependency on the implementation task first.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
@@ -135,7 +148,13 @@ Return ONLY a JSON object with exactly these keys:
       "files_hint": ["path/to/file.ts"],
       "creates_files": ["path/to/new-file.ts"],
       "acceptance_criteria": ["at least one observable outcome"],
-      "verification": ["at least one concrete command or check"]
+      "verification": ["at least one concrete command or check"],
+      "production_targets": ["path/to/production-file.ts"],
+      "test_targets": ["path/to/test-file.test.ts"],
+      "behavior_tags": ["keyboard"],
+      "verification_command": "npm test -- path/to/test-file.test.ts",
+      "complexity": "simple",
+      "allocation_reason": "single-file bounded change"
     }
   ]
 }
@@ -255,6 +274,54 @@ export class LocalPlanner implements IPlanner {
   }
 }
 
+
+export class DeepSeekPlanner implements IPlanner {
+  provider: PlannerProvider = 'deepseek';
+  constructor(private model = 'deepseek-v4-pro') {}
+
+  async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
+    if (!process.env.DEEPSEEK_API_KEY) throw new Error('DEEPSEEK_API_KEY is not set; cannot use the DeepSeek planner.');
+    const run = async (prompt: string): Promise<unknown> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8 * 60_000);
+      try {
+        const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            model: this.model,
+            messages: [{ role: 'user', content: prompt }],
+            stream: false,
+            temperature: 0.1,
+          }),
+        });
+        if (!response.ok) throw new Error(`DeepSeek planner API error: ${response.status} ${response.statusText}`);
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content;
+        if (!content) throw new Error('DeepSeek planner returned an empty response.');
+        return extractJson(content);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    let draft = await run(`${buildPlanningPrompt(input)}\n${SCHEMA_INSTRUCTION}`);
+    for (let repair = 0; repair <= 2; repair++) {
+      try {
+        return validateBlueprint(draft, input);
+      } catch (error: any) {
+        if (repair === 2) throw error;
+        draft = await run(`Your previous plan was rejected.\n\nErrors:\n${error.message}\n\nRequirement:\n${input.requirement}\n${SCHEMA_INSTRUCTION}`);
+      }
+    }
+    throw new Error('DeepSeek planner repair loop ended unexpectedly.');
+  }
+}
+
 function requirementHeadings(requirement: string): string[] {
   return [...requirement.matchAll(/^#{2,3}\s+(.+?)\s*$/gm)].map(match => match[1].trim());
 }
@@ -280,6 +347,13 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     ids.add(task.id);
     if (task.acceptance_criteria.length === 0) errors.push(`${task.id} has no acceptance criteria`);
     if (task.verification.length === 0) errors.push(`${task.id} has no verification`);
+    if (task.agent_role === 'test_writer' && task.production_targets.length === 0 && /(?:service|router|navigation|loading|keyboard|async|implement|create|add )/i.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
+      errors.push(`${task.id} requires production_targets or an explicit implementation dependency before tests`);
+    }
+    for (const check of task.verification) {
+      if (/\bvitest\s+list\b/.test(check)) errors.push(`${task.id} uses unsupported Vitest command "vitest list"; use "vitest run --reporter=json" instead`);
+      if (/\bvitest\b.*\s--repeat(?:=|\s)/.test(check)) errors.push(`${task.id} uses unsupported Vitest option --repeat; run the deterministic command twice explicitly`);
+    }
     const created = new Set(task.creates_files);
     for (const file of [...task.files_hint, ...task.creates_files]) {
       if (!isSafeRelativeFile(file)) errors.push(`${task.id} has unsafe file path ${file}`);
@@ -299,9 +373,20 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     }
   }
 
+  const taskById = new Map(blueprint.tasks.map(task => [task.id, task]));
+  // A behavior-creating test task must depend on a production task. This
+  // prevents sending a test writer to invent behavior that the repository does
+  // not provide yet (the recurring T03 failure pattern).
+  for (const task of blueprint.tasks.filter(t => t.agent_role === 'test_writer')) {
+    const deps = [...task.dependencies, ...task.blockedBy].map(id => taskById.get(id));
+    const needsImplementation = /(?:service|router|navigation|loading|keyboard|async|implement|create|add )/i.test(`${task.description} ${task.acceptance_criteria.join(' ')}`);
+    if (needsImplementation && task.production_targets.length === 0 && !deps.some(dep => dep && dep.agent_role !== 'test_writer')) {
+      errors.push(`${task.id} behavior tests have no non-test implementation dependency; split implementation before tests`);
+    }
+  }
+
   const visiting = new Set<string>();
   const visited = new Set<string>();
-  const taskById = new Map(blueprint.tasks.map(task => [task.id, task]));
   const visit = (id: string) => {
     if (visiting.has(id)) { errors.push(`dependency cycle includes ${id}`); return; }
     if (visited.has(id)) return;

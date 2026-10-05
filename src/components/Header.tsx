@@ -1,5 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import { SOFTFACTORY_VERSION } from '../version.js';
 
 interface HeaderProps {
   feature: string;
@@ -21,7 +22,7 @@ export function Header({ feature, status }: HeaderProps) {
       <Box>
         <Text bold color="cyan">{'>>> '}</Text>
         <Text bold>SoftFactory</Text>
-        <Text dimColor> v2.0</Text>
+        <Text dimColor> v{SOFTFACTORY_VERSION}</Text>
       </Box>
       <Box>
         <Text dimColor>Feature: </Text>

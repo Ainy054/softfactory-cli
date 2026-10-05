@@ -23,6 +23,9 @@ export interface VerifierResult {
   output: string;
   isCompileError?: boolean;
   counts?: SuiteCounts;
+  scope?: 'node' | 'go' | 'python' | 'rust' | 'make';
+  /** Whether the command covered the complete ecosystem suite or a task subset. */
+  fullSuite?: boolean;
 }
 
 export class TaskVerifier {
@@ -79,9 +82,18 @@ export class TaskVerifier {
 
   async verify(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {
     const result = await this.runVerification(worktreePath, task, fullSuite);
-    return result.executed && !result.counts
+    const scope = this.scopeForTask(task);
+    const enriched = result.executed && !result.counts
       ? { ...result, counts: this.parseCounts(result.output) }
       : result;
+    return { ...enriched, ...(scope ? { scope } : {}), fullSuite };
+  }
+
+  private scopeForTask(task?: Task): VerifierResult['scope'] {
+    const hints = task?.files_hint || [];
+    if (hints.some(file => /(^|[\\/])frontend([\\/]|$)|\.(tsx?|jsx?)$/i.test(file))) return 'node';
+    if (hints.some(file => /(^|[\\/])backend([\\/]|$)|\.go$/i.test(file))) return 'go';
+    return undefined;
   }
 
   private async runVerification(worktreePath: string, task?: Task, fullSuite = false): Promise<VerifierResult> {

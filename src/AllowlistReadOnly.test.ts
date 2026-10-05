@@ -5,6 +5,20 @@ import { LocalAgentWorker } from './LocalAgentWorker.js';
 const guard = (c: string) => (new LocalAgentWorker() as any).assertAllowedCommand(c);
 
 describe('read-only inspection is allowed', () => {
+  it('can temporarily disable command blocking for an explicit experiment', async () => {
+    const previous = process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING;
+    process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING = '1';
+    try {
+      assert.doesNotThrow(() => guard('printf first && printf second'));
+      const result = await (new LocalAgentWorker() as any).runSafeCommand(
+        'printf first && printf second', process.cwd());
+      assert.equal(result.stdout, 'firstsecond');
+    } finally {
+      if (previous === undefined) delete process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING;
+      else process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING = previous;
+    }
+  });
+
   it('permits the commands the worker actually reached for', () => {
     // Both were rejected mid-run, costing turns with no alternative.
     for (const c of ['ls -R', 'grep -r "vi." frontend', 'cat package.json',
@@ -43,7 +57,8 @@ describe('read-only inspection is allowed', () => {
     }
   });
 
-  it('still blocks shell operators and npx', () => {
+  it('allows safe read-only pipelines but blocks unsafe shell operators and npx', () => {
+    assert.doesNotThrow(() => guard('rg TODO src | head -20'));
     for (const c of ['ls && curl x', 'cat a | sh', 'grep x file; rm y', 'npx cowsay']) {
       assert.throws(() => guard(c), `must reject: ${c}`);
     }

@@ -65,6 +65,9 @@ softfactory --strategy=cloud --cloud-provider=openai-api --cloud-model=gpt-5.4 "
 # Use the Anthropic Messages API directly (requires ANTHROPIC_API_KEY)
 softfactory --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4 "refactor ledger engine"
 
+# Use DeepSeek Cloud (requires DEEPSEEK_API_KEY)
+softfactory --strategy=hybrid --cloud-provider=deepseek --cloud-model=deepseek-v4-flash --frontier-model=deepseek-v4-pro "refactor ledger engine"
+
 # Non-interactive / CI mode
 softfactory --no-tui "implement transaction reversal endpoint"
 
@@ -80,12 +83,14 @@ softfactory --resume
 | :--- | :--- | :--- |
 | `--strategy` | Execution strategy (`hybrid`, `local`, `cloud`) | `hybrid` |
 | `--local-model` | Local model name for Ollama | `qwen2.5-coder:7b` |
-| `--planner-provider` | Blueprint planner (`openai`, `agy`, or offline `local`) | `openai` (local strategy defaults to `local`) |
+| `--planner-provider` | Blueprint planner (`openai`, `agy`, `deepseek`, or offline `local`) | `openai` (local strategy defaults to `local`) |
 | `--cloud-model` | Cloud model name; optional for Codex CLI, which uses its configured default | `Gemini 3.7 Flash (High)` |
 | `--frontier-model` | Escalation model after repeated cloud-worker failures; optional for Codex CLI | `Gemini 3.1 Pro (High)` |
-| `--cloud-provider` | Cloud execution backend: `agy`, `openai` (Codex CLI), `openai-api`, or `anthropic` | `agy` |
+| `--cloud-provider` | Cloud execution backend: `agy`, `openai` (Codex CLI), `openai-api`, `anthropic`, or `deepseek` | `agy` |
 | `--no-tui` | Plain stdout console output without Ink TUI | Interactive default |
 | `--no-docker` | Skip post-build docker verification | Docker auto-detect |
+| `DEEPSEEK_API_KEY` | API key for DeepSeek cloud workers/planner | Not set |
+| `SOFTFACTORY_TRAINING_CAPTURE=0` | Opt out of sanitized verified candidates and failure lessons in `.softfactory/training-*.jsonl` | Enabled |
 | `--plan` | Generate and save plan without immediate execution | `false` |
 | `--resume` | Resume active or planned feature build | `false` |
 | `--refine` | Modify an in-progress plan mid-flight | `false` |

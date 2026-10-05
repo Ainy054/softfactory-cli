@@ -72,6 +72,42 @@ describe('a task may not make the suite worse', () => {
     f.baseline = v.parseCounts(BASELINE_OUT);
     assert.equal(f.detectRegression({}), null);
   });
+
+  it('compares a frontend task only with the node baseline', () => {
+    const f = factory();
+    f.baseline = { filesFailed: 5, filesPassed: 30, testsFailed: 5, testsPassed: 378 };
+    f.baselines = {
+      node: { filesFailed: 5, filesPassed: 30, testsFailed: 5, testsPassed: 374 },
+      go: { filesFailed: 0, filesPassed: 0, testsFailed: 0, testsPassed: 4 },
+    };
+    assert.equal(f.detectRegression({ scope: 'node', counts: { filesFailed: 5, filesPassed: 30, testsFailed: 5, testsPassed: 374 } }), null);
+  });
+
+  it('does not compare a scoped task run with a full-suite baseline', () => {
+    const f = factory();
+    f.baseline = v.parseCounts(BASELINE_OUT);
+    f.baselines = {};
+    const scoped = { scope: 'node', fullSuite: false, counts: { filesFailed: 0, filesPassed: 1, testsFailed: 0, testsPassed: 4 } };
+    assert.equal(f.detectRegression(scoped), null);
+  });
+
+  it('includes scope and exact before/after counts in feedback', () => {
+    const f = factory();
+    f.baselines = { node: { filesFailed: 5, filesPassed: 30, testsFailed: 5, testsPassed: 374 } };
+    assert.match(f.detectRegression({ scope: 'node', counts: { filesFailed: 6, filesPassed: 29, testsFailed: 5, testsPassed: 374 } }),
+      /scope=node; before=5F\/30P files.*after=6F\/29P files/);
+  });
+
+  it('tags verifier results with the ecosystem inferred from task files', async () => {
+    const verifier: any = new TaskVerifier();
+    verifier.runVerification = async () => ({
+      executed: true, passed: true, testSummary: 'ok', output: BASELINE_OUT,
+    });
+    assert.equal((await verifier.verify('/tmp', { files_hint: ['frontend/x.tsx'] } as any)).scope, 'node');
+    assert.equal((await verifier.verify('/tmp', { files_hint: ['frontend/x.tsx'] } as any)).fullSuite, false);
+    assert.equal((await verifier.verify('/tmp', { files_hint: ['frontend/x.tsx'] } as any, true)).fullSuite, true);
+    assert.equal((await verifier.verify('/tmp', { files_hint: ['backend/x.go'] } as any)).scope, 'go');
+  });
 });
 
 // Real vitest output is coloured and enormous; its summary is the last line.

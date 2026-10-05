@@ -74,11 +74,13 @@ describe('stall detection catches all three shapes', () => {
 });
 
 /** Mirrors the progress rule: calls since the last successful edit. */
-function runProgressDetector(calls: Array<{ tool: string; ok?: boolean }>): number | null {
+function runProgressDetector(calls: Array<{ tool: string; ok?: boolean; result?: string }>): number | null {
   let since = 0;
   for (let i = 0; i < calls.length; i++) {
     const c = calls[i];
-    const mutated = ['write_file', 'replace_content', 'replace_lines'].includes(c.tool) && c.ok !== false;
+    const mutated = ['write_file', 'replace_content', 'replace_lines'].includes(c.tool)
+      && c.ok !== false
+      && !c.result?.startsWith('Tool execution failed:');
     if (mutated || c.tool === 'finish_task') since = 0;
     else if (++since >= W.NO_PROGRESS_ABORT) return i;
   }
@@ -113,6 +115,13 @@ describe('progress-based stall detection catches shapes the pattern checks miss'
   it('counts a rejected edit as no progress', () => {
     // A model retrying an edit that keeps failing is not making progress.
     const calls = Array.from({ length: 12 }, () => ({ tool: 'replace_content', ok: false }));
+    assert.equal(runProgressDetector(calls), W.NO_PROGRESS_ABORT - 1);
+  });
+
+  it('counts a tool exception as no progress', () => {
+    const calls = Array.from({ length: 12 }, () => ({
+      tool: 'write_file', result: 'Tool execution failed: Write path is outside declared task scope',
+    }));
     assert.equal(runProgressDetector(calls), W.NO_PROGRESS_ABORT - 1);
   });
 

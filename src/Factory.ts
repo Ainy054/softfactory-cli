@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { FactoryStateSchema, TaskSchema, type FactoryState, type FeatureHistoryEntry } from './types.js';
+import { createHash } from 'node:crypto';
+import { FactoryStateSchema, TaskSchema, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
 import { GeminiClient } from './GeminiClient.js';
 import { WorkerRegistry, type CloudProvider } from './WorkerRegistry.js';
@@ -10,7 +11,9 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { AgyPlanner, CodexPlanner, LocalPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { AgyPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { shouldRecommendSplit } from './FailurePolicy.js';
+import { TrainingDataManager } from './TrainingDataManager.js';
 export class Factory extends EventEmitter {
     static readonly MAX_TASK_ATTEMPTS = 5;
     baseDir;
@@ -35,6 +38,16 @@ export class Factory extends EventEmitter {
     environmentFault: string | undefined;
     /** Suite health on the base branch, so a task can be judged against it. */
     baseline: import('./TaskVerifier.js').SuiteCounts | undefined;
+    /** Per-ecosystem baselines; task results must only be compared like-for-like. */
+    baselines: Partial<Record<string, import('./TaskVerifier.js').SuiteCounts>> = {};
+    /** Last verifier-rejected diff per task, used to stop blind identical retries. */
+    rejectedDiffs = new Map<string, string>();
+    /** Last failure fingerprint per task, used to stop identical retries. */
+    failureFingerprints = new Map<string, string>();
+    autoReplanCounts = new Map<string, number>();
+    trainingData: TrainingDataManager;
+    trainingCaptureEnabled: boolean;
+    private runtimeConfig: { strategy: 'hybrid' | 'local' | 'cloud'; local_model?: string; cloud_provider?: string; cloud_model?: string; frontier_model?: string };
     constructor(baseDir, apiKey, options: any = {}) {
         super();
         this.baseDir = baseDir;
@@ -49,6 +62,8 @@ export class Factory extends EventEmitter {
         this.gemini = new GeminiClient(apiKey, proModel, flashModel);
         this.planner = plannerProvider === 'openai'
             ? new CodexPlanner(plannerModel)
+            : plannerProvider === 'deepseek'
+                ? new DeepSeekPlanner(plannerModel || 'deepseek-v4-pro')
             : plannerProvider === 'local'
                 ? new LocalPlanner(plannerModel || (localModel === 'auto' ? 'qwen2.5-coder:14b' : localModel))
                 : new AgyPlanner(this.gemini);
@@ -58,8 +73,14 @@ export class Factory extends EventEmitter {
         // replaced by qwen2.5-coder:14b on every retry.
         const pinnedLocal = localModel && localModel !== 'auto' && localModel !== 'tiered' ? localModel : undefined;
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
+        this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
         this.taskVerifier = new TaskVerifier();
         this.lessons = new LessonManager(baseDir);
+        this.trainingData = new TrainingDataManager(baseDir);
+        // Capture is enabled by default so verified trajectories are not lost.
+        // Set SOFTFACTORY_TRAINING_CAPTURE=0 for an explicit opt-out (useful
+        // for sensitive repositories or dry-run investigations).
+        this.trainingCaptureEnabled = process.env.SOFTFACTORY_TRAINING_CAPTURE !== '0';
         this.streamToTerminal = streamToTerminal;
     }
     async init() {
@@ -80,6 +101,14 @@ export class Factory extends EventEmitter {
         if (await this.exists(this.statePath)) {
             const content = await fs.readFile(this.statePath, 'utf-8');
             this.state = FactoryStateSchema.parse(JSON.parse(content));
+            // The command-line configuration is authoritative for the
+            // process that is resuming the run. Older state files recorded
+            // the original provider (often OpenAI) even when the resumed
+            // process was explicitly started with DeepSeek, making status
+            // reports and future retries disagree with reality.
+            this.state.strategy = this.strategy;
+            this.state.cloud_provider = this.workerRegistry.getCloudProvider();
+            this.state.planner_provider = this.planner.provider;
             if (!this.state.feature_id) {
                 this.state.feature_id = this.generateFeatureId();
             }
@@ -89,6 +118,7 @@ export class Factory extends EventEmitter {
                 }
             }
             await this.saveState();
+            await this.reconcileTaskAssignments();
         }
     }
     getState() {
@@ -215,6 +245,7 @@ export class Factory extends EventEmitter {
             task.escalation_level = 0;
             task.error_history = [];
             task.last_feedback = undefined;
+            task.replan_reason = undefined;
         }
         // Pending tasks are not the same as runnable tasks: a pending task whose
         // dependency is blocked can never start. Say so, rather than entering the
@@ -310,7 +341,7 @@ export class Factory extends EventEmitter {
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'local' ? 'local' : 'cloud' });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local' });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -322,7 +353,8 @@ export class Factory extends EventEmitter {
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
             tasks: blueprint.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })),
-            memory_patterns: []
+            memory_patterns: [],
+            state_revision: 0
         };
         await this.saveState();
         await this.updateHistory('planned');
@@ -362,7 +394,7 @@ export class Factory extends EventEmitter {
         const featureHistory = history.length > 0
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'local' ? 'local' : 'cloud' });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local' });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -374,7 +406,8 @@ export class Factory extends EventEmitter {
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
             tasks: blueprint.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })),
-            memory_patterns: []
+            memory_patterns: [],
+            state_revision: 0
         };
         await this.saveState();
         await this.updateHistory('active');
@@ -382,8 +415,15 @@ export class Factory extends EventEmitter {
         await this.runWorkshopLoop();
     }
     async runWorkshopLoop() {
+        await this.logBackendPreflight();
+        if (this.environmentFault) {
+            this.log(`HALTED: ${this.environmentFault}`);
+            this.log('No task state was changed. Fix the backend configuration and run --resume.');
+            return;
+        }
         if (!this.baseline) await this.captureBaseline();
         while (this.hasUnfinishedTasks()) {
+            await this.autoReplanBlockedTasks();
             const readyCandidates = this.getReadyTasks();
             if (readyCandidates.length === 0) {
                 this.log('No ready tasks — possible deadlock or all retries exhausted.');
@@ -516,6 +556,9 @@ export class Factory extends EventEmitter {
             const currentError = feedback.trim().substring(0, 500);
             const lastError = task.error_history.length > 0 ? task.error_history[task.error_history.length - 1] : '';
             const sameError = lastError && lastError.length > 50 && currentError.includes(lastError.substring(0, 50));
+            const fingerprint = createHash('sha256').update(currentError).digest('hex');
+            const repeatedFailure = this.failureFingerprints.get(task.id) === fingerprint;
+            this.failureFingerprints.set(task.id, fingerprint);
             if (sameError) {
                 task.escalation_level++;
             }
@@ -524,11 +567,22 @@ export class Factory extends EventEmitter {
             // Keep retries actionable without recursively embedding entire failed
             // command lines and earlier prompts into every subsequent prompt.
             task.last_feedback = feedback.trim().substring(0, 4000);
-            if (task.attempts >= Factory.MAX_TASK_ATTEMPTS) {
+            const splitRecommended = shouldRecommendSplit(task, currentError);
+            if (repeatedFailure && splitRecommended) {
                 task.status = 'blocked';
+                task.replan_reason = 'repeated_fit_failure';
+                task.last_feedback = `${task.last_feedback}\nThe same failure repeated. This task appears too broad for one worker; decompose it into independent subtasks with non-overlapping files and separate verification before retrying.`.slice(0, 4000);
+                this.log(`DECOMPOSITION RECOMMENDED: ${task.id} — repeated scope failure; blind retry stopped.`);
+            } else if (task.attempts >= Factory.MAX_TASK_ATTEMPTS) {
+                task.status = 'blocked';
+                if (splitRecommended) {
+                    task.replan_reason = 'terminal_fit_failure';
+                    task.last_feedback = `${task.last_feedback}\nAutomatic re-plan is required: repeated implementation/test-fit failure reached the attempt limit; decompose into smaller independently verifiable tasks.`.slice(0, 4000);
+                }
                 this.log(`BLOCKED: ${task.id} — maximum ${Factory.MAX_TASK_ATTEMPTS} attempts reached.`);
             } else if (task.escalation_level > 2 && sameError) {
                 task.status = 'blocked';
+                if (splitRecommended) task.replan_reason = 'escalation_fit_failure';
                 this.log(`BLOCKED: ${task.id} — Task is permanently blocked due to identical repeated failures at highest escalation level.`);
             } else {
                 task.status = 'failed';
@@ -554,6 +608,7 @@ export class Factory extends EventEmitter {
                 this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Analyzing previous failure...` });
             }
             await this.saveState();
+            await this.recordTaskAssignment(task);
             const projectContext = await this.getProjectContext(worktreePath, task);
             const preparation = await this.taskVerifier.prepare(worktreePath, task);
             if (!preparation.ok) {
@@ -636,11 +691,26 @@ export class Factory extends EventEmitter {
             // instead whether this change made it worse: three merges here took
             // the suite from 21 failures to 68 while every gate stayed green,
             // because failing-before and failing-after look identical.
+            // Task verification is intentionally scoped for ordinary workers.
+            // Its counts cannot be compared with a full-suite baseline: a task
+            // may run one test file while the baseline covers the whole project.
+            // Full-suite regression checking happens for builder tasks and in
+            // the final gate below.
             const regression = this.detectRegression(verifierResult);
             if (regression) {
-                this.log(`REGRESSION: ${task.id} — ${regression}`);
-                processFailure(`This change makes the test suite worse: ${regression}. Fix it rather than adding to it.`);
-                await this.recordAttempt(task, 'regression', regression);
+                const fingerprint = createHash('sha256').update(earlyDiff).digest('hex');
+                const repeated = this.rejectedDiffs.get(task.id) === fingerprint;
+                this.rejectedDiffs.set(task.id, fingerprint);
+                const tail = verifierResult.output
+                    ? `\nVerifier output tail:\n${verifierResult.output.slice(-1200)}`
+                    : '';
+                const duplicate = repeated
+                    ? '\nThis diff is identical to the previous rejected attempt. Do not submit it again; change the implementation or report a concrete blocker.'
+                    : '';
+                const feedback = `${regression}${tail}${duplicate}`;
+                this.log(`REGRESSION: ${task.id} — ${regression}${repeated ? ' (identical rejected diff)' : ''}`);
+                processFailure(`This change makes the test suite worse: ${feedback}`);
+                await this.recordAttempt(task, repeated ? 'duplicate_regression' : 'regression', feedback);
                 return null;
             }
             this.emitEvent({
@@ -668,6 +738,13 @@ export class Factory extends EventEmitter {
             if (!diff.trim()) {
                 this.log(`EMPTY DIFF: ${task.id} — commit succeeded but diff is empty (possible git state issue)`);
                 processFailure('Changes were committed but diff against target branch is empty. This is likely a git state desync.');
+                return null;
+            }
+            const testEvidence = this.validateTestWriterEvidence(task, diff);
+            if (testEvidence) {
+                this.log(`INCOMPLETE: ${task.id} — ${testEvidence}`);
+                processFailure(testEvidence);
+                await this.recordAttempt(task, 'missing_test_evidence', testEvidence);
                 return null;
             }
             // A task must not be able to pass by removing the thing that checks
@@ -698,6 +775,11 @@ export class Factory extends EventEmitter {
                     } catch (e: any) {
                         this.log(`Epiphany synthesis failed: ${e.message}`);
                     }
+                }
+
+                if (this.trainingCaptureEnabled) {
+                    const captured = await this.trainingData.addVerified({ task, diff, verification: verifierResult.testSummary, resolution: handoff.summary });
+                    if (captured) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Training candidate saved (sanitized, verified)` });
                 }
 
                 return { task, branchName };
@@ -741,6 +823,14 @@ export class Factory extends EventEmitter {
         return missing;
     }
 
+    /** Prevent a test-writer task from passing with an empty/placeholder test file. */
+    validateTestWriterEvidence(task: { agent_role?: string }, diff: string): string | null {
+        if (task.agent_role !== 'test_writer') return null;
+        const added = diff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).join('\n');
+        const looksLikeTest = /(?:\b(?:describe|it|test|pytest|unittest)\s*\(|\bfunc\s+Test[A-Z]|\bTest\s*\()/m.test(added);
+        return looksLikeTest ? null : 'Test-writer changes contain no test cases. Add executable assertions instead of a placeholder file.';
+    }
+
     /**
      * True when a suite failed for reasons that pre-date this build: an
      * unreachable service, or a suite where the failures are assertions rather
@@ -763,23 +853,28 @@ export class Factory extends EventEmitter {
      * More failures, or fewer passes, or a suite that suddenly collects far
      * more files than the branch it started from.
      */
-    detectRegression(result: { counts?: import('./TaskVerifier.js').SuiteCounts }): string | null {
-        const before = this.baseline;
+    detectRegression(result: { counts?: import('./TaskVerifier.js').SuiteCounts; scope?: string; output?: string; fullSuite?: boolean }): string | null {
+        // A scoped task result is not comparable to a project/ecosystem
+        // baseline. The final/builder full-suite gate remains responsible for
+        // detecting regressions across the complete test suite.
+        if (result.fullSuite === false) return null;
+        const before = result.scope ? this.baselines[result.scope] : this.baseline;
         const after = result.counts;
         if (!before || !after) return null;
+        const context = ` [scope=${result.scope || 'legacy'}; before=${before.filesFailed}F/${before.filesPassed}P files, ${before.testsFailed}F/${before.testsPassed}P tests; after=${after.filesFailed}F/${after.filesPassed}P files, ${after.testsFailed}F/${after.testsPassed}P tests]`;
         if (after.testsFailed > before.testsFailed) {
-            return `failing tests went from ${before.testsFailed} to ${after.testsFailed}`;
+            return `failing tests went from ${before.testsFailed} to ${after.testsFailed}${context}`;
         }
         if (after.filesFailed > before.filesFailed) {
-            return `failing test files went from ${before.filesFailed} to ${after.filesFailed}`;
+            return `failing test files went from ${before.filesFailed} to ${after.filesFailed}${context}`;
         }
         if (before.testsPassed > 0 && after.testsPassed < before.testsPassed) {
-            return `passing tests dropped from ${before.testsPassed} to ${after.testsPassed}`;
+            return `passing tests dropped from ${before.testsPassed} to ${after.testsPassed}${context}`;
         }
         const beforeTotal = before.filesFailed + before.filesPassed;
         const afterTotal = after.filesFailed + after.filesPassed;
         if (beforeTotal > 0 && afterTotal > beforeTotal * 1.5) {
-            return `the suite now collects ${afterTotal} files where the baseline collected ${beforeTotal}`;
+            return `the suite now collects ${afterTotal} files where the baseline collected ${beforeTotal}${context}`;
         }
         return null;
     }
@@ -789,6 +884,10 @@ export class Factory extends EventEmitter {
             const results = await this.taskVerifier.verifyAll(this.baseDir);
             const counted = results.filter(r => r.counts);
             if (counted.length === 0) return;
+            this.baselines = {};
+            for (const result of counted) {
+                if (result.scope) this.baselines[result.scope] = result.counts!;
+            }
             const totals = counted.reduce((acc, r) => ({
                 filesFailed: acc.filesFailed + r.counts!.filesFailed,
                 filesPassed: acc.filesPassed + r.counts!.filesPassed,
@@ -823,6 +922,98 @@ export class Factory extends EventEmitter {
                 category, detail: String(detail).slice(0, 2000),
             }) + '\n');
         } catch { /* diagnostics must never fail a build */ }
+        if (this.trainingCaptureEnabled) {
+            await this.trainingData.addFailureLesson({ task, category, detail: String(detail) });
+        }
+    }
+    async recordTaskAssignment(task) {
+        try {
+            const journalPath = path.join(this.baseDir, '.softfactory', 'task-events.jsonl');
+            await fs.appendFile(journalPath, JSON.stringify({
+                timestamp: new Date().toISOString(), event: 'task:assigned', task_id: task.id,
+                attempt: task.attempts, escalation_level: task.escalation_level || 0,
+                model: task.model, provider: task.provider,
+            }) + '\n');
+        } catch { /* diagnostics must never fail a build */ }
+    }
+    private async recordTaskEvent(event: Record<string, unknown>) {
+        try {
+            const journalPath = path.join(this.baseDir, '.softfactory', 'task-events.jsonl');
+            await fs.appendFile(journalPath, JSON.stringify({ timestamp: new Date().toISOString(), ...event }) + '\n');
+        } catch { /* diagnostics must never fail a build */ }
+    }
+    private async autoReplanBlockedTasks() {
+        const candidates = this.state.tasks.filter(task => task.status === 'blocked' && (task.replan_reason || shouldRecommendSplit(task, task.last_feedback || '') || /decompose|rewrite the last valid|no progress/i.test(task.last_feedback || '')));
+        for (const task of candidates) {
+            const count = this.autoReplanCounts.get(task.id) || 0;
+            if (count >= 2) continue;
+            this.autoReplanCounts.set(task.id, count + 1);
+            try {
+                this.log(`AUTO-REPLAN: ${task.id} — requesting smaller tasks after repeated fit/progress failure`);
+                const context = await this.getRepoContext(`${task.title}\n${task.description}`);
+                const memoryPatterns = await this.lessons.getForPlanning();
+                const blueprint = await this.planner.generateBlueprint({
+                    requirement: `Re-plan blocked task ${task.id}: ${task.title}\n${task.description}\nFailure: ${task.last_feedback || ''}`,
+                    codebaseContext: context,
+                    memoryPatterns,
+                    featureHistory: '',
+                    repositoryFiles: new Set(await this.getRepositoryFiles()),
+                    workerCapability: 'local',
+                });
+                const replacements = blueprint.tasks.map((replacement, index) => TaskSchema.parse({
+                    ...replacement,
+                    id: `${task.id}.${index + 1}`,
+                    dependencies: [...new Set([...(task.dependencies || []), ...(replacement.dependencies || [])])].filter(id => id !== task.id),
+                    blockedBy: [], status: 'pending', attempts: 0, escalation_level: 0, error_history: [],
+                }));
+                if (replacements.length === 0 || replacements.length >= 8) throw new Error('planner returned an unusable replacement set');
+                this.validateAutoReplanScope(task, replacements);
+                this.state.tasks = this.state.tasks.filter(existing => existing.id !== task.id).concat(replacements);
+                await this.saveState();
+                this.emitEvent({ type: 'state:update', state: this.state });
+                this.emitEvent({ type: 'task:auto-replan', task_id: task.id, reason: task.replan_reason || 'fit_failure', replacements: replacements.map(item => item.id) });
+                await this.recordTaskEvent({ event: 'task:auto-replan', task_id: task.id, reason: task.replan_reason || 'fit_failure', replacements: replacements.map(item => item.id) });
+                this.log(`AUTO-REPLAN: replaced ${task.id} with ${replacements.map(item => item.id).join(', ')}`);
+            } catch (error: any) {
+                task.last_feedback = `${task.last_feedback || ''}\nAutomatic re-plan failed: ${error?.message || 'unknown planner error'}`.slice(-4000);
+                this.log(`AUTO-REPLAN FAILED: ${task.id} — ${error?.message || 'unknown planner error'}`);
+                this.emitEvent({ type: 'task:auto-replan-failed', task_id: task.id, reason: task.replan_reason || 'fit_failure', error: error?.message || 'unknown planner error' });
+                await this.recordTaskEvent({ event: 'task:auto-replan-failed', task_id: task.id, reason: task.replan_reason || 'fit_failure', error: error?.message || 'unknown planner error' });
+            }
+        }
+    }
+    validateAutoReplanScope(parent: Task, replacements: Task[]) {
+        const allowed = new Set([...(parent.files_hint || []), ...(parent.creates_files || [])]);
+        const expanded = replacements.flatMap(replacement =>
+            [...(replacement.files_hint || []), ...(replacement.creates_files || [])]
+                .filter(file => !allowed.has(file)));
+        if (expanded.length > 0) {
+            throw new Error(`automatic re-plan expanded task scope outside ${parent.id}: ${[...new Set(expanded)].join(', ')}`);
+        }
+    }
+    private async reconcileTaskAssignments() {
+        try {
+            const journalPath = path.join(this.baseDir, '.softfactory', 'task-events.jsonl');
+            const rows = (await fs.readFile(journalPath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+            const cutoff = Date.parse(this.state.last_updated);
+            const latest = new Map<string, any>();
+            for (const row of rows) {
+                if (row.event !== 'task:assigned' || Date.parse(row.timestamp) <= cutoff) continue;
+                const previous = latest.get(row.task_id);
+                if (!previous || row.timestamp > previous.timestamp) latest.set(row.task_id, row);
+            }
+            let changed = false;
+            for (const task of this.state.tasks) {
+                const assignment = latest.get(task.id);
+                if (!assignment) continue;
+                task.attempts = Math.max(task.attempts, Number(assignment.attempt) || 0);
+                task.escalation_level = Math.max(task.escalation_level || 0, Number(assignment.escalation_level) || 0);
+                task.model = assignment.model || task.model;
+                task.provider = assignment.provider || task.provider;
+                changed = true;
+            }
+            if (changed) await this.saveState();
+        } catch { /* missing or malformed event journal is non-fatal */ }
     }
     generateFeatureId() {
         const now = new Date();
@@ -1069,13 +1260,31 @@ export class Factory extends EventEmitter {
     }
     async saveState() {
         this.saveLock = this.saveLock.then(async () => {
+            this.state.state_revision = (this.state.state_revision || 0) + 1;
             this.state.last_updated = new Date().toISOString();
+            this.state.runtime = this.runtimeConfig;
             const tmpPath = this.statePath + '.tmp';
             await fs.writeFile(tmpPath, JSON.stringify(this.state, null, 2));
             await fs.rename(tmpPath, this.statePath);
             this.emitEvent({ type: 'state:update', state: this.state });
         });
         await this.saveLock;
+    }
+
+    private async logBackendPreflight() {
+        try {
+            const health = await this.workerRegistry.preflight();
+            this.log(`Backend preflight: local ${health.local ? 'ready' : 'unavailable'} (${health.localModel}), cloud ${health.cloud ? 'ready' : 'unavailable'} (${this.workerRegistry.getCloudProvider()}/${health.cloudModel || 'configured default'})`);
+            if (this.strategy === 'local' && !health.local) {
+                this.environmentFault = `Configured local model "${health.localModel}" is unavailable.`;
+            } else if (this.strategy === 'cloud' && !health.cloud) {
+                this.environmentFault = `Configured cloud provider "${this.workerRegistry.getCloudProvider()}" is unavailable.`;
+            } else if (this.strategy === 'hybrid' && !health.local && !health.cloud) {
+                this.environmentFault = 'Neither the configured local nor cloud worker is available.';
+            }
+        } catch (error: any) {
+            this.log(`Backend preflight could not complete: ${error?.message || 'unknown error'}`);
+        }
     }
     hasUnfinishedTasks() {
         return this.state.tasks.some(t => t.status === 'pending' || t.status === 'active' || (t.status === 'failed' && t.attempts < Factory.MAX_TASK_ATTEMPTS));

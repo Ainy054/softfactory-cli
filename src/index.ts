@@ -10,7 +10,7 @@ const KNOWN_FLAGS = [
   '--planner-provider', '--planner-model'
 ];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--cloud-provider=agy|openai|openai-api|anthropic] [--planner-provider=openai|agy|local] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -55,19 +55,19 @@ async function main() {
   const strategyArg = (getFlagValue(args, '--strategy') || 'hybrid') as WorkerStrategy;
   const localModelArg = getFlagValue(args, '--local-model') || 'qwen2.5-coder:7b';
   const cloudProviderArg = (getFlagValue(args, '--cloud-provider') || 'agy') as CloudProvider;
-  if (!['agy', 'openai', 'openai-api', 'anthropic'].includes(cloudProviderArg)) {
-    throw new Error(`Unsupported --cloud-provider "${cloudProviderArg}". Use agy, openai, openai-api, or anthropic.`);
+  if (!['agy', 'openai', 'openai-api', 'anthropic', 'deepseek'].includes(cloudProviderArg)) {
+    throw new Error(`Unsupported --cloud-provider "${cloudProviderArg}". Use agy, openai, openai-api, anthropic, or deepseek.`);
   }
-  const plannerProviderArg = getFlagValue(args, '--planner-provider') || (strategyArg === 'local' ? 'local' : 'openai');
-  if (!['openai', 'agy', 'local'].includes(plannerProviderArg)) {
-    throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, or local.`);
+  const plannerProviderArg = getFlagValue(args, '--planner-provider') || (strategyArg === 'local' ? 'local' : cloudProviderArg === 'deepseek' ? 'deepseek' : 'openai');
+  if (!['openai', 'agy', 'local', 'deepseek'].includes(plannerProviderArg)) {
+    throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use openai, agy, local, or deepseek.`);
   }
   const plannerModelArg = getFlagValue(args, '--planner-model') || '';
   // The Codex CLI already has an authenticated, user-configured default model.
   // Do not accidentally pass Antigravity's Gemini defaults to it.  Supplying
   // either option remains useful for explicitly choosing fast/frontier tiers.
-  const cloudModelArg = getFlagValue(args, '--cloud-model') || (cloudProviderArg === 'openai' ? '' : 'Gemini 3.7 Flash (High)');
-  const frontierModelArg = getFlagValue(args, '--frontier-model') || (cloudProviderArg === 'openai' ? '' : 'Gemini 3.1 Pro (High)');
+  const cloudModelArg = getFlagValue(args, '--cloud-model') || (cloudProviderArg === 'openai' ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-flash' : 'Gemini 3.7 Flash (High)');
+  const frontierModelArg = getFlagValue(args, '--frontier-model') || (cloudProviderArg === 'openai' ? '' : cloudProviderArg === 'deepseek' ? 'deepseek-v4-pro' : 'Gemini 3.1 Pro (High)');
 
   if (historyMode) {
     const factory = new Factory(process.cwd(), apiKey, {

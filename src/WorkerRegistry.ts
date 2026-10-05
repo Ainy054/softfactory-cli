@@ -2,11 +2,12 @@ import { Task } from './types.js';
 import { IWorker } from './IWorker.js';
 import { AgyWorker } from './AgyWorker.js';
 import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { DeepSeekCloudWorker } from './DeepSeekCloudWorker.js';
 import { ApiWorker } from './ApiWorker.js';
 import { CodexWorker } from './CodexWorker.js';
 
 export type WorkerStrategy = 'hybrid' | 'local' | 'cloud';
-export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic';
+export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek';
 
 export class WorkerRegistry {
   private localWorker: IWorker;
@@ -37,6 +38,7 @@ export class WorkerRegistry {
     this.cloudProvider = cloudProvider;
     this.localWorker = new LocalAgentWorker(localModel === 'auto' ? lightLocalModel : localModel);
     this.cloudWorker = cloudProvider === 'agy' ? new AgyWorker(cloudModel)
+      : cloudProvider === 'deepseek' ? new DeepSeekCloudWorker(cloudModel || 'deepseek-v4-flash')
       : cloudProvider === 'openai' ? new CodexWorker(cloudModel)
       : new ApiWorker(cloudProvider === 'openai-api' ? 'openai' : cloudProvider, cloudModel);
   }
@@ -53,8 +55,26 @@ export class WorkerRegistry {
     return touched.size <= 1 && (task.phase || 1) <= 2;
   }
 
+  /** Tasks that are too broad or ambiguous for a first-pass small local model. */
+  shouldPreferCloud(task: Task): boolean {
+    const files = new Set([...(task.files_hint || []), ...(task.creates_files || [])]);
+    return files.size > 2 || (task.acceptance_criteria?.length || 0) > 3 ||
+      (task.agent_role === 'test_writer' && files.size > 1) ||
+      task.agent_role === 'architect' || task.agent_role === 'builder';
+  }
+
   getCloudProvider(): CloudProvider {
     return this.cloudProvider;
+  }
+
+  /** Check configured backends once before a run starts. */
+  async preflight(): Promise<{ local: boolean; cloud: boolean; localModel: string; cloudModel: string }> {
+    const localModel = this.localModel === 'auto' || this.localModel === 'tiered'
+      ? this.heavyLocalModel : this.localModel;
+    const local = this.strategy === 'cloud' ? false : await this.localWorker.isAvailable(localModel);
+    const cloudModel = this.cloudModel;
+    const cloud = this.strategy === 'local' ? false : await this.cloudWorker.isAvailable(cloudModel);
+    return { local, cloud, localModel, cloudModel };
   }
 
   resolveLocalModel(task: Task, isRetry: boolean): string {
@@ -97,6 +117,13 @@ export class WorkerRegistry {
     if (task.agent_role === 'architect' || task.worker_type === 'cloud') {
       const model = escalation >= 2 ? this.frontierModel : this.cloudModel;
       return { worker: this.cloudWorker, model, provider: this.cloudProvider, escalated: escalation >= 2 };
+    }
+
+    // Avoid spending a local retry budget on work that exceeds the small-model
+    // envelope. Hybrid mode still prefers Qwen for bounded tasks.
+    if (escalation === 0 && this.shouldPreferCloud(task)) {
+      const cloudAvailable = await this.cloudWorker.isAvailable();
+      if (cloudAvailable) return { worker: this.cloudWorker, model: this.cloudModel, provider: this.cloudProvider, escalated: true };
     }
 
     // Escalation 0: Local Fast Model (7B for light tasks, 14B for heavy coding tasks)
