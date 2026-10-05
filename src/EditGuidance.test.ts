@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 
 // godo's frontend/package.json, the file 14 of 15 edits failed to match.
 const PKG = [

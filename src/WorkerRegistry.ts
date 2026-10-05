@@ -1,10 +1,9 @@
 import { Task } from './types.js';
 import { IWorker } from './IWorker.js';
 import { AgyWorker } from './AgyWorker.js';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
-import { DeepSeekCloudWorker } from './DeepSeekCloudWorker.js';
-import { ApiWorker } from './ApiWorker.js';
 import { CodexWorker } from './CodexWorker.js';
+import { ToolLoopWorker } from './ToolLoopWorker.js';
+import { createChatTransport } from './ChatTransport.js';
 
 export type WorkerStrategy = 'hybrid' | 'local' | 'cloud';
 export type CloudProvider = 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek';
@@ -36,11 +35,12 @@ export class WorkerRegistry {
     this.lightLocalModel = lightLocalModel;
     this.heavyLocalModel = heavyLocalModel;
     this.cloudProvider = cloudProvider;
-    this.localWorker = new LocalAgentWorker(localModel === 'auto' ? lightLocalModel : localModel);
+    // Every model-API backend runs the same tool loop; only the transport differs.
+    this.localWorker = new ToolLoopWorker(createChatTransport('local'), localModel === 'auto' ? lightLocalModel : localModel);
     this.cloudWorker = cloudProvider === 'agy' ? new AgyWorker(cloudModel)
-      : cloudProvider === 'deepseek' ? new DeepSeekCloudWorker(cloudModel || 'deepseek-v4-flash')
       : cloudProvider === 'openai' ? new CodexWorker(cloudModel)
-      : new ApiWorker(cloudProvider === 'openai-api' ? 'openai' : cloudProvider, cloudModel);
+      : cloudProvider === 'deepseek' ? new ToolLoopWorker(createChatTransport('deepseek'), cloudModel || 'deepseek-v4-flash')
+      : new ToolLoopWorker(createChatTransport(cloudProvider), cloudModel);
   }
 
   /**

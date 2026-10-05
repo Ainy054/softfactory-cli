@@ -1,134 +1,168 @@
 # SoftFactory CLI
 
-Multi-agent software delivery factory. Decomposes requirements into dependency-ordered phases, executes tasks in parallel inside isolated Git worktrees via local Ollama models and a cloud provider of your choice, runs each task's tests and acceptance command, reviews the diff, and merges passing work.
+A software delivery factory for one repository. You give it a requirement. A planner decomposes it into dependency-ordered tasks with an acceptance command each. Workers, local Ollama models or a cloud model, implement each task in its own git worktree, running every command inside a sandbox. Mechanical gates (the project's tests, the task's acceptance command, scope and sabotage checks) and a reviewer decide what merges. Everything it decides is written down: evidence logs, per-run metrics, and a state file you can resume from.
 
-**What the isolation boundary actually is.** Workers edit files only inside their git worktree. Every command a model chooses to run, and every test the verifier runs, executes in a throwaway Docker container with the network off, no capabilities, and the worktree as the only writable mount (the main repository is mounted read-only so `git status` works). Without Docker, softfactory refuses to start workers unless you pass `--sandbox=none`, in which case commands run on the host under an allowlist (no shell, no network git, no interpreter preloads, every path argument inside the worktree). The allowlist is a filter, not a boundary; treat `--sandbox=none` as running the model's commands yourself.
+**What the isolation boundary actually is.** Workers edit files only inside their git worktree. Every command a model chooses to run, and every test the verifier runs, executes in a throwaway Docker container with the network off, no capabilities, a read-only root filesystem, and the worktree as the only writable mount (the main repository is mounted read-only so `git status` works). Without Docker, softfactory refuses to start workers unless you pass `--sandbox=none`, in which case commands run on the host under an allowlist (no shell, no network git, no interpreter preloads, every path argument inside the worktree). The allowlist is a filter, not a boundary; treat `--sandbox=none` as running the model's commands yourself.
 
-## Architecture
+## How a run works
 
 ```
-softfactory "add user authentication"
-        │
-   [BLUEPRINT]          Antigravity agy (Gemini 3.1 Pro High)
-        │                Outputs structured phase plan with graph safety
-        ▼
-   [WORKSHOP]           Hybrid Parallel Workers in isolated git worktrees
-   ┌─────────────────┬──────────────────┬─────────────────┐
-   │ T001 (devops)   │ T002 (coder)     │ T003 (tests)    │
-   │ Local Qwen 2.5  │ Local Qwen 2.5   │ Local Qwen 2.5  │  (Zero API cost)
-   └─────────────────┴──────────────────┴─────────────────┘
-        │                    │                   │
-   [AUTO-VERIFIER]      Runs language test suite in worktree (go test, npm test, pytest)
-        │
-   [INSPECTION]         Antigravity agy (Gemini 3.7 Flash) reviews diff + test output
-        │
-   [MERGE]              Sequential merge of verified tasks + FACTORY_MEMORY.md update
+softfactory "add a farewell endpoint"
+     │
+     ▼
+ PLAN        one planner (Codex CLI, Antigravity, DeepSeek, or a local model) returns a
+             validated blueprint: phases, files, acceptance criteria, a runnable
+             verification_command per task, an executor (agent / orchestrator / user),
+             review questions for protected code. Each acceptance command is run once
+             here; one that cannot run at all rejects the plan.
+     │
+     ▼
+ WORKSHOP    ready agent tasks of the earliest open phase run in parallel, one git
+             worktree each. Orchestrator and user tasks are parked for a person and
+             the run pauses when nothing else can proceed.
+     │         worker = the tool loop (read_file, replace_lines, replace_content,
+     │                  write_file, run_command, finish_task) over a chat transport:
+     │                  Ollama, DeepSeek, OpenAI, Anthropic; or the Codex / Antigravity CLI
+     ▼
+ GATES       commit the worktree → declared files exist → no verification sabotage →
+             the project's tests, judged against a per-ecosystem baseline → the task's
+             acceptance command, executed verbatim, evidence log must end RESULT: PASS
+     │
+     ▼
+ REVIEW      ordinary diff: the configured provider's model reviews diff + evidence
+             protected diff: an independent review on the frontier model that never
+                             sees the worker's own summary, checking review_answers
+             local strategy: no reviewer; the merge is recorded as "mechanical gates only"
+     │
+     ▼
+ MERGE       --no-ff merge of each passing branch, state saved after every step,
+             a failed task retries with feedback up the escalation ladder, metrics
+             written per run, Ctrl-C reconciles worktrees.
 ```
 
-### What each gate does
-1. **Local-first execution:** routine coding and test writing run on local Ollama models; oversized, protected, or repeatedly failing tasks escalate to the configured cloud provider.
-2. **Verifier:** the task's scoped tests run in the sandbox, with a per-ecosystem regression baseline so a task is judged on whether it made the suite worse, not on whether an already-red project is red.
-3. **Executed acceptance:** the task's own `verification_command` runs verbatim and its evidence log must end in PASS.
-4. **Review:** the configured provider's model reviews the diff; protected diffs get an independent review on the frontier model that never sees the worker's summary; a local run records "mechanical gates only" rather than a review it did not have.
-5. **Graph safety and recovery:** same-phase tasks with overlapping files are serialized, state is persisted after every step, and Ctrl-C reconciles worktrees.
+### The gates, and what each one actually checks
 
----
+1. **Executor routing.** `agent` tasks go to a worker. `orchestrator` (secrets, deploys, host config, pushes) and `user` (product decisions) tasks never do; the run pauses with status `paused` and continues after `softfactory --mark-done <id> "note" --resume`.
+2. **Verifier.** The task's scoped tests run in the sandbox. A task is judged on whether it made the suite worse than the base branch, not on whether an already-red project is red.
+3. **Executed acceptance.** The task's `verification_command` runs verbatim under the command policy, in the sandbox, and is logged to `.softfactory/evidence/<feature>/<task>-attempt<N>.log` ending in `RESULT: PASS` or `RESULT: FAIL`. No PASS, no merge. A test writer's command is allowed to be red; an unrunnable command is not allowed for anyone.
+4. **Review.** Hybrid and cloud runs require the configured reviewer to be reachable before anything starts; the verdict records which model issued it. Diffs touching a path in `.softfactory/protected-paths.txt` (or planned as protected) get the blind frontier review. A local run merges on mechanical gates alone and says so.
+5. **Graph safety and recovery.** Same-phase tasks claiming the same files are serialized. State carries a schema version and is refused rather than misread when written by a newer softfactory. Blocked tasks can be auto-replanned; a failure category seen in two of the last three runs is handed to the planner as something it must change.
 
 ## Prerequisites
 
-- Git
-- Node.js 20+
-- Docker (for the sandbox; or pass `--sandbox=none` and accept host execution)
-- For local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b`
-- For cloud workers, one of: Antigravity CLI (`agy`), Codex CLI, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
-
----
+- Git, Node.js 20+
+- Docker, for the sandbox (or `--sandbox=none` and accept host execution)
+- Local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b` (or any tool-capable model via `--local-model`)
+- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
 
 ## Usage
 
 ```bash
-# Default Hybrid Mode (Local Qwen for coders/tests + agy for Blueprint/Review)
+# Hybrid (default): local Ollama for bounded tasks, the cloud provider for large, protected or retried ones
 softfactory "add REST API with user CRUD"
 
-# Force 100% Local (Ollama planner, worker, and verifier)
+# Fully offline: local planner, local workers, mechanical gates only
 softfactory --strategy=local --planner-provider=local "add unit tests for auth module"
 
-# Force Cloud-only via agy
+# Cloud only, via the Antigravity CLI
 softfactory --strategy=cloud --cloud-model="Gemini 3.7 Flash (High)" "refactor ledger engine"
 
-# Use the authenticated Codex CLI and its configured default model
+# Codex CLI with its configured default model
 softfactory --strategy=hybrid --cloud-provider=openai --resume
 
-# Or explicitly choose its fast and frontier tiers
-softfactory --strategy=cloud --cloud-provider=openai --cloud-model=<fast-model> --frontier-model=<pro-model> "refactor ledger engine"
-
-# Use the OpenAI Responses API directly (requires OPENAI_API_KEY)
+# The OpenAI, Anthropic or DeepSeek APIs directly, each on the same tool loop
 softfactory --strategy=cloud --cloud-provider=openai-api --cloud-model=gpt-5.4 "refactor ledger engine"
-
-# Use the Anthropic Messages API directly (requires ANTHROPIC_API_KEY)
 softfactory --strategy=cloud --cloud-provider=anthropic --cloud-model=claude-sonnet-4 "refactor ledger engine"
-
-# Use DeepSeek Cloud (requires DEEPSEEK_API_KEY)
 softfactory --strategy=hybrid --cloud-provider=deepseek --cloud-model=deepseek-v4-flash --frontier-model=deepseek-v4-pro "refactor ledger engine"
 
-# Non-interactive / CI mode
-softfactory --no-tui "implement transaction reversal endpoint"
-
-# Resume an interrupted build
+# Plan now, execute later; resume; refine a plan mid-flight
+softfactory --plan "implement transaction reversal endpoint"
 softfactory --resume
+softfactory --refine "also reverse the ledger entry"
+
+# A person finished an orchestrator/user task
+softfactory --mark-done T3 "rotated the key in the vault" --resume
+
+# CI: plain stdout, no TUI
+softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 ```
 
----
-
-## CLI Flags
+## CLI flags
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `--strategy` | Execution strategy (`hybrid`, `local`, `cloud`) | `hybrid` |
-| `--local-model` | Local model name for Ollama | `qwen2.5-coder:7b` |
-| `--planner-provider` | Blueprint planner (`openai`, `agy`, `deepseek`, or offline `local`) | `openai` (local strategy defaults to `local`) |
-| `--cloud-model` | Cloud model name; optional for Codex CLI, which uses its configured default | `Gemini 3.7 Flash (High)` |
-| `--frontier-model` | Escalation model after repeated cloud-worker failures; optional for Codex CLI | `Gemini 3.1 Pro (High)` |
-| `--cloud-provider` | Cloud execution backend: `agy`, `openai` (Codex CLI), `openai-api`, `anthropic`, or `deepseek` | `agy` |
-| `--no-tui` | Plain stdout console output without Ink TUI | Interactive default |
-| `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, or `none` (host allowlist only, loud warning) | `auto` |
-| `--no-docker` | Skip post-build docker-compose verification of the finished app | Docker auto-detect |
-| `DEEPSEEK_API_KEY` | API key for DeepSeek cloud workers/planner | Not set |
-| `SOFTFACTORY_TRAINING_CAPTURE=0` | Opt out of sanitized verified candidates and failure lessons in `.softfactory/training-*.jsonl` | Enabled |
-| `--plan` | Generate and save plan without immediate execution | `false` |
-| `--resume` | Resume active, planned, or paused feature build | `false` |
-| `--refine` | Modify an in-progress plan mid-flight | `false` |
-| `--mark-done <task-id> ["note"]` | Record that a person completed an `orchestrator` or `user` task; combine with `--resume` to continue | — |
-| `--history` | View history of completed features | `false` |
+| `--strategy` | `hybrid`, `local`, `cloud` | `hybrid` |
+| `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, `none` (host allowlist only, loud warning) | `auto` |
+| `--cloud-provider` | `agy`, `openai` (Codex CLI), `openai-api`, `anthropic`, `deepseek` | `agy` |
+| `--cloud-model` | Cloud model; optional for Codex CLI, which uses its configured default | provider default |
+| `--frontier-model` | Escalation and blind-review model; optional for Codex CLI | provider default |
+| `--local-model` | Ollama model; pins every local tier when set | `qwen2.5-coder:7b` / `14b` tiers |
+| `--planner-provider` | `openai` (Codex CLI), `agy`, `deepseek`, `local` | follows the cloud provider; `local` for a local run |
+| `--planner-model` | Planner model override | provider default |
+| `--plan` | Save the plan without executing | `false` |
+| `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
+| `--retry-blocked` | With `--resume`, retry blocked and rejected tasks too | `false` |
+| `--refine` | Modify an in-progress plan; done tasks are kept verbatim | `false` |
+| `--mark-done <task-id> ["note"]` | Record that a person completed an `orchestrator` or `user` task | — |
+| `--history` | Completed features | `false` |
+| `--no-tui` | Plain stdout instead of the Ink TUI | TUI when interactive |
+| `--no-docker` | Skip the post-build docker-compose check of the finished app | auto-detect |
 
----
+Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
 
-## Safety and evidence (4.0)
+## What it writes
 
-- **Executor routing.** Every task carries `executor`: `agent` (the default) runs in a worktree worker; `orchestrator` is host or live-system work (secret values, deploys, host config, pushes); `user` is a product decision. Workers never receive the last two. The run prints what is needed, pauses with status `paused`, and continues after `softfactory --mark-done <id> "note" --resume`.
-- **Executed acceptance.** A task's `verification_command` is run verbatim in its worktree under the command policy (one allowlisted executable, no shell operators) and logged to `.softfactory/evidence/<feature>/<task>-attempt<N>.log`, ending in `RESULT: PASS` or `RESULT: FAIL`. No PASS, no merge. Each command is also run once at planning time; one that cannot run at all rejects the plan.
-- **Protected paths.** Globs in `.softfactory/protected-paths.txt` (one per line, `**` crosses directories) mark tasks as protected: they never run on the light local tier, and their diffs get an independent review on the frontier model that sees the diff, the acceptance criteria, the verification output and the worker's `review_answers`, never the worker's own summary. A diff that touches a protected path is reviewed that way even if the plan did not list it.
-- **Per-run metrics.** One JSON line per finished run in `.softfactory/metrics.jsonl`. A failure category seen in two of the last three runs is passed to the planner as an escalation it must answer.
-- **Secrets.** Real `.env` files are no longer copied into worktrees (`.env.example` is). Credential files are never committed, and lessons, journals and training records are redacted before they are written.
-- **State schema.** `factory.json` carries `schema_version`; a state written by a newer softfactory is refused rather than misread.
+All under `.softfactory/` in the repository (git-ignored):
 
----
+| Path | Contents |
+| :--- | :--- |
+| `factory.json` | The run state: feature, tasks, statuses, attempts, inspection results. Versioned. |
+| `evidence/<feature>/<task>-attempt<N>.log` | The acceptance command, its output, and `RESULT: PASS` or `FAIL` |
+| `metrics.jsonl` | One line per finished run: outcomes, attempts, failure categories, escalations |
+| `protected-paths.txt` | Globs (one per line, `**` crosses directories) whose diffs get the blind frontier review |
+| `tool-calls.jsonl` | Every tool call a worker made, with arguments and the result it saw |
+| `lessons.json`, `FACTORY_MEMORY.md` | Verified lessons and architectural memory fed back into planning |
+| `training-*.jsonl` | Sanitized verified trajectories and failure lessons (opt out with the env var) |
+| `history.json`, `archive/` | Finished features |
 
-## Project Structure
+Secrets: real `.env` files are not copied into worktrees (`.env.example` is); credential files are never committed; lessons, journals and training records are redacted before they are written.
+
+## Project structure
 
 ```
 src/
-  index.ts            CLI entry point & signal trap handlers
-  Factory.ts          Orchestrator (Phase DAG, P-85 pre-dispatch, worktree coordination)
-  GeminiClient.ts     AgyClient (Blueprint planning, refinement, memory & inspection)
-  IWorker.ts          Common Worker interface (execute & handoff)
-  WorkerRegistry.ts   Hybrid router (Local Qwen vs Cloud agy)
-  QwenWorker.ts       Local Ollama worker runner
-  AgyWorker.ts        Antigravity CLI cloud worker runner
-  TaskVerifier.ts     Automated in-worktree test runner (Go, Node, Python, Rust)
-  WorktreeManager.ts  Git worktree lifecycle (create/merge/cleanup)
-  DockerVerifier.ts   Post-build container verification
-  types.ts            Zod schemas (Task, FactoryState, Handoff)
+  index.ts             CLI entry: flags, signal handling
+  runMode.ts           Chooses plan / build / resume / refine / mark-done for the TUI and plain modes
+  Factory.ts           Orchestrator: planning, the workshop loop, gates, review, merge, metrics
+  Planner.ts           Planner interface, planning rules, blueprint validation, provider planners
+  WorkerRegistry.ts    Strategy and escalation ladder: which worker and model runs a task
+  ToolLoopWorker.ts    The one tool-calling worker: tools, edit checks, stall detection
+  ChatTransport.ts     Ollama, OpenAI-compatible (DeepSeek, OpenAI) and Anthropic chat transports
+  AgyWorker.ts         Antigravity CLI worker
+  CodexWorker.ts       Codex CLI worker
+  TextModel.ts         One-prompt-in, text-out backends for the inspector and planners
+  Inspector.ts         Diff review, blind review for protected diffs, lesson and memory synthesis
+  TaskVerifier.ts      Test runner per ecosystem, regression baselines, the acceptance runner
+  commandPolicy.ts     The command allowlist and path policy
+  Sandbox.ts           Host and Docker command runners; sandbox mode and image selection
+  WorktreeManager.ts   Git worktree lifecycle: create, hydrate, commit, merge, cleanup
+  ProtectedPaths.ts    protected-paths.txt globs
+  Metrics.ts           Per-run metrics and the recurring-failure rule
+  FailurePolicy.ts     Failure categories and when to split or escalate
+  LessonManager.ts     Verified lessons
+  TrainingDataManager.ts  Sanitized training capture
+  DockerVerifier.ts    Post-build docker-compose check of the finished application
+  redact.ts            Secret redaction for everything written to disk
+  types.ts             Zod schemas: Task, FactoryState, Handoff, events
+  components/          Ink TUI
+```
+
+## Development
+
+```bash
+npm install
+npm test          # node:test over src/*.test.ts, including an end-to-end run on a temp git repo
+npm run build     # tsc → dist/
 ```
 
 ## License

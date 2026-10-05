@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { execa } from 'execa';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 import { Factory } from './Factory.js';
 
 const CTX = 4096;                       // a 14B on a 16 GB host

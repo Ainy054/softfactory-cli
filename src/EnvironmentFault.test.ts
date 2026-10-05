@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 import { WorkerEnvironmentError, isEnvironmentFailure } from './IWorker.js';
 import { Factory } from './Factory.js';
 import { Task } from './types.js';

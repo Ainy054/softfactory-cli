@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 
 const task: any = {
   id: 'T1', files_hint: ['src/app.ts'], creates_files: [],
@@ -35,12 +35,14 @@ describe('LocalAgentWorker safety and context controls', () => {
 
   it('parses Qwen textual tool calls as well as native calls', () => {
     const worker: any = new LocalAgentWorker();
-    const parsed = worker.extractToolCalls({ content: '<tool_call>{"name":"read_file","arguments":{"filepath":"x"}}</tool_call>' });
+    const parsed = worker.extractToolCalls('<tool_call>{"name":"read_file","arguments":{"filepath":"x"}}</tool_call>', []);
     assert.equal(parsed[0].function.name, 'read_file');
     assert.equal(parsed[0].function.arguments.filepath, 'x');
-    assert.equal(worker.extractToolCalls({ content: 'plain response' }).length, 0);
-    const bare = worker.extractToolCalls({ content: '{"name":"read_file","arguments":{"filepath":"probe.txt"}}' });
+    assert.equal(worker.extractToolCalls('plain response', []).length, 0);
+    const bare = worker.extractToolCalls('{"name":"read_file","arguments":{"filepath":"probe.txt"}}', []);
     assert.equal(bare[0].function.name, 'read_file');
+    const native = [{ id: 'c1', type: 'function', function: { name: 'write_file', arguments: '{}' } }];
+    assert.equal(worker.extractToolCalls('<tool_call>{"name":"read_file","arguments":{}}</tool_call>', native), native, 'structured calls win over text');
   });
 
   it('does not duplicate the conversation head during short-history compaction', () => {

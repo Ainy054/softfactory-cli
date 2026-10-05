@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 
 const guard = (c: string) => (new LocalAgentWorker() as any).assertAllowedCommand(c);
 

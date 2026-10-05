@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { DeepSeekCloudWorker } from './DeepSeekCloudWorker.js';
+import { DeepSeekCloudWorker } from './ToolLoopWorker.js';
 
 type Turn = { content?: string; calls?: Array<{ id: string; name: string; args: Record<string, unknown> }> };
 

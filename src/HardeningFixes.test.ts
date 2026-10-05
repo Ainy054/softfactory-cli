@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { WorkerRegistry } from './WorkerRegistry.js';
-import { LocalAgentWorker } from './LocalAgentWorker.js';
+import { LocalAgentWorker } from './ToolLoopWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { Inspector } from './Inspector.js';
 import { isEnvironmentFailure } from './IWorker.js';

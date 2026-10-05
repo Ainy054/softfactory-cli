@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalAgentWorker as W } from './LocalAgentWorker.js';
+import { LocalAgentWorker as W } from './ToolLoopWorker.js';
 
 /**
  * Mirrors the detector in execute(): three independent stall shapes, each of

@@ -9,9 +9,6 @@ export interface VerifyResult {
 }
 
 export class DockerVerifier {
-  private provisionedServices: string[] = [];
-  private composeFile: string | null = null;
-
   async detect(): Promise<boolean> {
     // 1. Direct check if docker daemon is running
     try {
@@ -26,63 +23,6 @@ export class DockerVerifier {
     } catch {
       return false;
     }
-  }
-
-  async ensureTestServicesRunning(projectDir: string, onOutput?: (msg: string) => void): Promise<boolean> {
-    const composeFile = await this.getComposeFile(projectDir);
-    if (!composeFile) return false;
-    this.composeFile = composeFile;
-
-    try {
-      const content = await fs.readFile(composeFile, 'utf-8');
-
-      // Candidate database / cache services used during testing
-      const candidateServices = ['postgres_test', 'db_test', 'postgres', 'redis', 'mysql', 'mariadb', 'mongo'];
-      const targetServices: string[] = [];
-
-      for (const s of candidateServices) {
-        const regex = new RegExp(`^\\s{2}${s}:`, 'm');
-        if (regex.test(content) && !targetServices.includes(s)) {
-          targetServices.push(s);
-        }
-      }
-
-      // If postgres_test exists, prefer postgres_test (+ redis if available)
-      const servicesToStart = targetServices.includes('postgres_test')
-        ? targetServices.filter(s => s === 'postgres_test' || s === 'redis')
-        : targetServices;
-
-      if (servicesToStart.length === 0) return false;
-
-      onOutput?.(`[Docker] Provisioning test services: ${servicesToStart.join(', ')}...`);
-
-      await execa('docker', ['compose', '-f', composeFile, 'up', '-d', ...servicesToStart], {
-        cwd: projectDir,
-        timeout: 60000,
-      });
-
-      this.provisionedServices = servicesToStart;
-
-      // Wait 3 seconds for containers to be ready
-      await new Promise(r => setTimeout(r, 3000));
-      onOutput?.(`[Docker] Test services ready (${servicesToStart.join(', ')})`);
-      return true;
-    } catch (e: any) {
-      onOutput?.(`[Docker] Warning: Could not start test services: ${e.message}`);
-      return false;
-    }
-  }
-
-  async stopTestServices(projectDir: string): Promise<void> {
-    if (!this.composeFile || this.provisionedServices.length === 0) return;
-
-    try {
-      await execa('docker', ['compose', '-f', this.composeFile, 'stop', ...this.provisionedServices], {
-        cwd: projectDir,
-        timeout: 30000,
-        reject: false,
-      });
-    } catch {}
   }
 
   async verify(projectDir: string): Promise<VerifyResult> {

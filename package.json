@@ -1,6 +1,6 @@
 {
   "name": "softfactory-cli",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -18,19 +18,18 @@
   ],
   "author": "VCP",
   "license": "ISC",
-  "description": "Multi-agent code generation factory: Gemini plans, Claude builds, Gemini reviews.",
+  "description": "Software delivery factory: a planner decomposes a requirement, local or cloud models implement each task in an isolated git worktree and a sandbox, mechanical gates and a reviewer decide what merges.",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "execa": "^9.6.1",
     "ink": "^7.0.5",
     "jsonrepair": "^3.15.0",
     "react": "^19.2.7",
-    "tsx": "^4.22.4",
-    "typescript": "^6.0.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "@types/react": "^19.2.0"
+    "@types/react": "^19.2.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
   }
 }

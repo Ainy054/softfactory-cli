@@ -193,18 +193,6 @@ export class WorktreeManager {
     return { committed: false, filesChanged: 0 };
   }
 
-  async hasCommitsAhead(branchName: string, targetBranch: string): Promise<boolean> {
-    try {
-      const { stdout } = await execa(
-        'git', ['rev-list', '--count', `${targetBranch}..${branchName}`],
-        { cwd: this.baseDir }
-      );
-      return parseInt(stdout.trim(), 10) > 0;
-    } catch {
-      return false;
-    }
-  }
-
   async merge(taskId: string, branchName: string, targetBranch?: string): Promise<string> {
     const defaultBranch = await this.getDefaultBranch();
     const branch = (targetBranch && targetBranch !== 'master') ? targetBranch : defaultBranch;
