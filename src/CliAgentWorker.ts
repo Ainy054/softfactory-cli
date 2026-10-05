@@ -3,9 +3,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
 import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
-import type { AgentSpec } from './AgentContainer.js';
+import os from 'node:os';
+import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
-export type CliAgentId = 'claude-code' | 'gemini-cli';
+export type CliAgentId = 'claude-code' | 'gemini-cli' | 'muse';
 
 /** Where the agent runs decides how much it may do on its own. */
 export type Placement = 'host' | 'container';
@@ -26,6 +27,13 @@ export interface CliAgentDefinition extends AgentSpec {
   parse(stdout: string): ParsedAgentResult;
   /** Output that means the agent could not authenticate: an environment fault, not a task fault. */
   authFailure: RegExp;
+  /** One streamed event to a progress line, when the agent's events differ from Claude Code's. */
+  relay?(event: any): string | undefined;
+}
+
+/** Where Muse keeps the account login; META_API_KEY takes priority when set. */
+export function museAuthPath(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(env.XDG_CONFIG_HOME || path.join(env.HOME || os.homedir(), '.config'), 'muse', 'auth.json');
 }
 
 /** On the host, Claude Code's own permission system is the only filter, so it is kept narrow. */
@@ -45,7 +53,7 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
     name: 'Claude Code Worker',
     label: 'ClaudeCode',
     executable: 'claude',
-    npmPackage: '@anthropic-ai/claude-code',
+    install: npmInstall('@anthropic-ai/claude-code'),
     versionArgs: ['--version'],
     passEnv: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'],
     baseUrlEnv: 'ANTHROPIC_BASE_URL',
@@ -82,7 +90,7 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
     name: 'Gemini CLI Worker',
     label: 'GeminiCLI',
     executable: 'gemini',
-    npmPackage: '@google/gemini-cli',
+    install: npmInstall('@google/gemini-cli'),
     versionArgs: ['--version'],
     passEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
     egress: ['generativelanguage.googleapis.com'],
@@ -102,6 +110,64 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
       } catch {
         return { text: stdout.trim(), isError: false, denials: [] };
       }
+    },
+  },
+  'muse': {
+    id: 'muse',
+    name: 'Muse Code Worker',
+    label: 'Muse',
+    executable: 'muse',
+    // Muse ships as a launcher that downloads a platform binary, with the
+    // account's token when the login file carries one, so that file is
+    // offered to the build as a BuildKit secret (never a layer). Inside the
+    // container only META_API_KEY authenticates: on macOS the login file is
+    // schema 2, a pointer into the keychain, which the Linux binary rejects.
+    // Updates are off inside: the root filesystem is read-only.
+    install: {
+      dockerfile: [
+        'RUN mkdir -p /opt/muse && curl -fsSL https://api.meta.ai/muse-launcher.sh -o /opt/muse/muse && chmod 755 /opt/muse/muse && ln -s /opt/muse/muse /usr/local/bin/muse',
+        'RUN --mount=type=secret,id=muse-auth,target=/root/.config/muse/auth.json MUSE_LAUNCHER_INSTALL=1 /opt/muse/muse && chmod -R a+rX /opt/muse',
+        'ENV MUSE_NO_AUTO_UPDATE=1',
+      ],
+      buildSecrets: [{ id: 'muse-auth', host: museAuthPath() }],
+    },
+    versionArgs: ['--version'],
+    passEnv: ['META_API_KEY'],
+    runtimeEnv: { MUSE_NO_AUTO_UPDATE: '1' },
+    egress: ['api.meta.ai'],
+    authFailure: /not logged in|login required|run `?muse login|unauthori[sz]ed|401|invalid api key|authentication/i,
+    args(prompt, model, placement) {
+      // On the host Muse's own sandbox stays on, but a probe showed it does
+      // not stop a network call or a read outside the workspace, so the host
+      // placement is still reported as unsandboxed. Inside the container
+      // --yolo turns its sandbox and approvals off: the container is the boundary.
+      const base = ['exec', '--json', '--no-session-log', '--disable-web-tools', ...(model ? ['--model', model] : [])];
+      return placement === 'container'
+        ? [...base, '--yolo', prompt]
+        : [...base, '--approval-mode', 'never', prompt];
+    },
+    parse(stdout) {
+      let text = '';
+      let isError = false;
+      for (const line of stdout.split('\n')) {
+        if (!line.trim().startsWith('{')) continue;
+        let event: any;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (typeof event.payload_type === 'string' && event.payload_type.startsWith('run.terminal.')) {
+          const terminal = event.payload?.terminal || event.payload_type.slice('run.terminal.'.length);
+          text = String(event.payload?.text ?? event.payload?.reason ?? '');
+          isError = terminal !== 'completed';
+          if (isError && !text) text = `run ${terminal}`;
+        }
+      }
+      return { text, isError, denials: [] };
+    },
+    relay(event) {
+      const type = String(event.payload_type || '');
+      if (type === 'run.output.delta') { const text = String(event.payload?.text || '').trim(); return text ? text.slice(0, 300) : undefined; }
+      if (type.startsWith('tool.call')) return `▸ ${event.payload?.name || event.payload?.tool_name || event.payload?.tool || 'tool'}`;
+      if (type.startsWith('run.terminal.')) return `${event.payload?.terminal === 'completed' ? '✓' : '✗'} ${String(event.payload?.text || event.payload?.reason || '').trim().slice(0, 300)}`;
+      return undefined;
     },
   },
 };
@@ -184,11 +250,15 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
     }
     const parsed = this.definition.parse(result.stdout);
     if (parsed.usage) options.onUsage?.(parsed.usage);
-    if (parsed.isError && this.definition.authFailure.test(parsed.text)) {
-      throw new WorkerEnvironmentError(`${this.definition.name} could not authenticate: ${parsed.text.slice(0, 200)}. No task retry was consumed.`);
-    }
-    if (result.exitCode !== 0 && !result.stdout.trim() && this.definition.authFailure.test(result.stderr)) {
-      throw new WorkerEnvironmentError(`${this.definition.name} could not authenticate: ${result.stderr.trim().slice(0, 200)}. No task retry was consumed.`);
+    // An agent that could not authenticate did no work: that is the
+    // environment's fault, not the task's, wherever the agent said so.
+    if (parsed.isError || result.exitCode !== 0) {
+      const said = `${parsed.text}\n${result.stderr}`;
+      const match = said.match(this.definition.authFailure);
+      if (match) {
+        const line = said.split('\n').find(l => this.definition.authFailure.test(l)) || match[0];
+        throw new WorkerEnvironmentError(`${this.definition.name} could not authenticate: ${line.trim().slice(0, 200)}. No task retry was consumed.`);
+      }
     }
     if (parsed.denials.length) onOutput(`[${this.definition.label}] Refused by the agent's permission rules: ${parsed.denials.slice(0, 5).join('; ')}`);
 
@@ -214,6 +284,11 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
     if (!line.trim().startsWith('{')) { onOutput(`[${this.definition.label}] ${line.trim()}`); return; }
     let event: any;
     try { event = JSON.parse(line); } catch { return; }
+    if (this.definition.relay) {
+      const text = this.definition.relay(event);
+      if (text) onOutput(`[${this.definition.label}] ${text}`);
+      return;
+    }
     if (event.type === 'assistant') {
       for (const block of event.message?.content || []) {
         if (block.type === 'text' && block.text?.trim()) onOutput(`[${this.definition.label}] ${String(block.text).trim().slice(0, 300)}`);

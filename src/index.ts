@@ -18,7 +18,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|claude-code|gemini-cli] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|claude-code|gemini-cli] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -89,7 +89,7 @@ async function main() {
     : ['deepseek', 'anthropic', 'openai-api', ...AGENT_PROVIDERS].includes(cloudProviderArg) ? cloudProviderArg
     : 'openai';
   const plannerProviderArg = (getFlagValue(args, '--planner-provider') || defaultPlanner) as PlannerProvider;
-  const PLANNERS = ['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api', 'claude-code', 'gemini-cli'];
+  const PLANNERS = ['openai', 'agy', 'local', 'deepseek', 'anthropic', 'openai-api', 'claude-code', 'gemini-cli', 'muse'];
   if (!PLANNERS.includes(plannerProviderArg)) {
     throw new Error(`Unsupported --planner-provider "${plannerProviderArg}". Use one of ${PLANNERS.join(', ')}.`);
   }

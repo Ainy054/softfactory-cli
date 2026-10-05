@@ -1,9 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { AgentContainer } from './AgentContainer.js';
 import { CLI_AGENTS } from './CliAgentWorker.js';
 
 const claude = CLI_AGENTS['claude-code'];
+const muse = CLI_AGENTS['muse'];
 
 describe('the agent image and its egress', () => {
   it('builds the agent CLI onto the node base image', () => {
@@ -21,10 +25,31 @@ describe('the agent image and its egress', () => {
     assert.deepEqual(AgentContainer.egressFor(CLI_AGENTS['gemini-cli'], {}), ['generativelanguage.googleapis.com']);
   });
 
-  it('refuses to run an agent in the container without a key it can use there', () => {
-    assert.match(AgentContainer.credentialProblem(claude, {})!, /needs one of ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN/);
-    assert.match(AgentContainer.credentialProblem(claude, {})!, /--sandbox=none/);
-    assert.equal(AgentContainer.credentialProblem(claude, { ANTHROPIC_API_KEY: 'k' }), null);
+  it('refuses to run an agent in the container without a key it can use there', async () => {
+    assert.match((await AgentContainer.credentialProblem(claude, {}))!, /needs one of ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN/);
+    assert.match((await AgentContainer.credentialProblem(claude, {}))!, /--sandbox=none/);
+    assert.equal(await AgentContainer.credentialProblem(claude, { ANTHROPIC_API_KEY: 'k' }), null);
+  });
+
+  it('builds Muse from its launcher with the login as a build secret, and mounts the login file read-only', async () => {
+    const dockerfile = AgentContainer.dockerfileFor(muse);
+    assert.match(dockerfile, /^# syntax=docker\/dockerfile:1\n/, 'secret mounts need the BuildKit frontend');
+    assert.match(dockerfile, /curl -fsSL https:\/\/api\.meta\.ai\/muse-launcher\.sh/);
+    assert.match(dockerfile, /--mount=type=secret,id=muse-auth,target=\/root\/\.config\/muse\/auth\.json MUSE_LAUNCHER_INSTALL=1/);
+    assert.match(dockerfile, /ENV MUSE_NO_AUTO_UPDATE=1/);
+    assert.deepEqual(AgentContainer.egressFor(muse, {}), ['api.meta.ai']);
+
+    // No key and no login file: refused. A login file alone: allowed, and mounted.
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-muse-home-'));
+    const spec = { ...muse, credentialFiles: [{ host: path.join(home, 'auth.json'), container: '/tmp/.config/muse/auth.json' }] };
+    assert.match((await AgentContainer.credentialProblem(spec, {}))!, /needs one of META_API_KEY in the environment, or a login file at .*auth\.json/);
+    await fs.writeFile(path.join(home, 'auth.json'), '{}');
+    assert.equal(await AgentContainer.credentialProblem(spec, {}), null);
+    const mounts = await AgentContainer.credentialMounts(spec);
+    assert.deepEqual(mounts, [{ host: path.join(home, 'auth.json'), container: '/tmp/.config/muse/auth.json', readOnly: true }]);
+    const args = AgentContainer.buildRunArgs(spec, 'img', { root: '/w', cwd: '/w', args: ['exec'] }, {}, mounts).join(' ');
+    assert.match(args, new RegExp(`-v ${path.join(home, 'auth.json')}:/tmp/.config/muse/auth.json:ro `));
+    assert.match(args, /-e MUSE_NO_AUTO_UPDATE=1/, 'runtime env from the spec');
   });
 });
 
@@ -70,6 +95,8 @@ describe('the agent container run', () => {
     assert.ok(run.includes('--network') && run[run.indexOf('--network') + 1] === 'softfactory-egress');
     assert.ok(run.includes('EGRESS_ALLOW=api.anthropic.com'));
     assert.ok(run.some(a => /EgressProxy\.(js|ts):\/proxy\/egress-proxy\.mjs:ro$/.test(a)), run.join(' '));
+    const build = calls.find(c => c[0] === 'build')!;
+    assert.ok(!build.includes('--secret'), 'Claude Code has no build secret');
     assert.deepEqual(calls.find(c => c[0] === 'network' && c[1] === 'connect'), ['network', 'connect', 'bridge', 'softfactory-egress-proxy']);
 
     await container.ensureEgress(['api.anthropic.com', 'extra.example']);

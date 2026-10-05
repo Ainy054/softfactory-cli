@@ -14,17 +14,32 @@ import { SandboxManager, type Mount } from './Sandbox.js';
  * an allowlisting CONNECT proxy, so the agent can reach its model API and
  * nothing else.
  */
+export interface AgentInstall {
+  /** Dockerfile instructions that put the CLI on the image, after the base and its packages. */
+  dockerfile: string[];
+  /** Host files offered to the build as BuildKit secrets when they exist (never baked into a layer). */
+  buildSecrets?: Array<{ id: string; host: string }>;
+}
+
 export interface AgentSpec {
   id: string;
-  /** The npm package that provides the CLI, installed when the agent image is built. */
-  npmPackage: string;
+  install: AgentInstall;
   executable: string;
   /** Environment variables carried from the host into the container; the credential among them. */
   passEnv: string[];
+  /** Credential files mounted read-only into the container when present; the other way to authenticate. */
+  credentialFiles?: Array<{ host: string; container: string }>;
   /** Hosts the agent must reach; the proxy admits these and nothing else. */
   egress: string[];
   /** An env var that can redirect the agent's API; its host is admitted when set. */
   baseUrlEnv?: string;
+  /** Fixed environment for the agent inside the container. */
+  runtimeEnv?: Record<string, string>;
+}
+
+/** The npm case, the common one. */
+export function npmInstall(npmPackage: string): AgentInstall {
+  return { dockerfile: [`RUN npm install -g ${npmPackage} && npm cache clean --force`] };
 }
 
 export interface AgentRunOptions {
@@ -52,15 +67,25 @@ export class AgentContainer {
 
   constructor(private readonly log: (line: string) => void = () => {}, private readonly docker: (args: string[], options?: { input?: string; timeout?: number }) => Promise<{ stdout: string; stderr: string; exitCode: number }> = defaultDocker) {}
 
-  /** The Dockerfile for an agent: the project's node base plus the agent's own CLI. */
+  /** The Dockerfile for an agent: the node base plus the agent's own CLI. */
   static dockerfileFor(spec: AgentSpec, baseImage = BASE_IMAGE): string {
     return [
+      ...(spec.install.buildSecrets?.length ? ['# syntax=docker/dockerfile:1'] : []),
       `FROM ${baseImage}`,
-      'RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*',
-      `RUN npm install -g ${spec.npmPackage} && npm cache clean --force`,
+      'RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl && rm -rf /var/lib/apt/lists/*',
+      ...spec.install.dockerfile,
       'ENV HOME=/tmp',
       'WORKDIR /work',
     ].join('\n') + '\n';
+  }
+
+  /** Credential files that exist on this host, as read-only mounts. */
+  static async credentialMounts(spec: AgentSpec): Promise<Mount[]> {
+    const mounts: Mount[] = [];
+    for (const file of spec.credentialFiles || []) {
+      if (await fs.access(file.host).then(() => true, () => false)) mounts.push({ host: file.host, container: file.container, readOnly: true });
+    }
+    return mounts;
   }
 
   static imageNameFor(spec: AgentSpec): string {
@@ -79,10 +104,11 @@ export class AgentContainer {
   }
 
   /** The credential an agent needs inside the container, or why it cannot run there. */
-  static credentialProblem(spec: AgentSpec, env: NodeJS.ProcessEnv = process.env): string | null {
-    const present = spec.passEnv.filter(name => env[name]);
-    if (present.length > 0) return null;
-    return `${spec.id} inside the container needs one of ${spec.passEnv.join(', ')} in the environment; a login kept in the home directory is not available there. Set the key, or run with --sandbox=none to use the host login (unsandboxed).`;
+  static async credentialProblem(spec: AgentSpec, env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+    if (spec.passEnv.some(name => env[name])) return null;
+    if ((await AgentContainer.credentialMounts(spec)).length > 0) return null;
+    const files = (spec.credentialFiles || []).map(f => f.host);
+    return `${spec.id} inside the container needs one of ${spec.passEnv.join(', ')} in the environment${files.length ? `, or a login file at ${files.join(' or ')}` : '; a login kept in the home directory is not available there'}. Set the key, or run with --sandbox=none to use the host login (unsandboxed).`;
   }
 
   /**
@@ -98,14 +124,14 @@ export class AgentContainer {
   }
 
   /** The docker run arguments for an agent process; pure, for tests. */
-  static buildRunArgs(spec: AgentSpec, image: string, options: AgentRunOptions, env: NodeJS.ProcessEnv = process.env, cacheMounts: Mount[] = []): string[] {
+  static buildRunArgs(spec: AgentSpec, image: string, options: AgentRunOptions, env: NodeJS.ProcessEnv = process.env, extraMounts: Mount[] = []): string[] {
     const args = ['run', '--rm', '--init', '--network', NETWORK,
       '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--read-only', '--tmpfs', '/tmp:rw,exec,size=4g',
       '--memory', '4g', '--cpus', '2', '--pids-limit', '1024',
       '--user', AgentContainer.userFor(),
       '-w', options.cwd];
-    for (const mount of [...SandboxManager.mountsFor(options.root), ...cacheMounts]) {
+    for (const mount of [...SandboxManager.mountsFor(options.root), ...extraMounts]) {
       args.push('-v', `${mount.host}:${mount.container}${mount.readOnly ? ':ro' : ''}`);
     }
     const proxy = `http://${PROXY_ALIAS}:${PROXY_PORT}`;
@@ -113,6 +139,7 @@ export class AgentContainer {
       HOME: '/tmp', CI: 'true', TERM: 'dumb',
       HTTP_PROXY: proxy, HTTPS_PROXY: proxy, http_proxy: proxy, https_proxy: proxy, NO_PROXY: 'localhost,127.0.0.1',
       npm_config_cache: '/tmp/.npm', npm_config_update_notifier: 'false',
+      ...(spec.runtimeEnv || {}),
       ...(options.env || {}),
     };
     for (const name of spec.passEnv) if (env[name]) vars[name] = env[name]!;
@@ -129,11 +156,15 @@ export class AgentContainer {
     if (this.builtImages.has(image)) return image;
     const inspect = await this.docker(['image', 'inspect', image], { timeout: 15_000 });
     if (inspect.exitCode !== 0) {
-      this.log(`Agent container: building ${image} (${spec.npmPackage} on ${BASE_IMAGE}; first use)...`);
+      this.log(`Agent container: building ${image} (${spec.id} on ${BASE_IMAGE}; first use)...`);
       const context = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-agent-image-'));
       try {
         await fs.writeFile(path.join(context, 'Dockerfile'), AgentContainer.dockerfileFor(spec));
-        const build = await this.docker(['build', '-q', '-t', image, context], { timeout: 15 * 60_000 });
+        const secrets: string[] = [];
+        for (const secret of spec.install.buildSecrets || []) {
+          if (await fs.access(secret.host).then(() => true, () => false)) secrets.push('--secret', `id=${secret.id},src=${secret.host}`);
+        }
+        const build = await this.docker(['build', '-q', ...secrets, '-t', image, context], { timeout: 15 * 60_000 });
         if (build.exitCode !== 0) throw new Error(`docker build of ${image} failed: ${build.stderr.trim().split('\n').slice(-3).join(' ')}`);
       } finally {
         await fs.rm(context, { recursive: true, force: true });
@@ -176,11 +207,11 @@ export class AgentContainer {
   }
 
   async run(spec: AgentSpec, options: AgentRunOptions, extraEgress: string[] = []): Promise<AgentRunResult> {
-    const problem = AgentContainer.credentialProblem(spec);
+    const problem = await AgentContainer.credentialProblem(spec);
     if (problem) throw new Error(problem);
     const image = await this.ensureImage(spec, options.root);
     await this.ensureEgress(AgentContainer.egressFor(spec, process.env, extraEgress));
-    const args = AgentContainer.buildRunArgs(spec, image, options, process.env, await SandboxManager.cacheMounts());
+    const args = AgentContainer.buildRunArgs(spec, image, options, process.env, [...await SandboxManager.cacheMounts(), ...await AgentContainer.credentialMounts(spec)]);
     const proc = execa('docker', args, { timeout: options.timeout ?? 60 * 60_000, all: true, reject: false, ...(options.signal ? { cancelSignal: options.signal } : {}) });
     if (options.onOutput) proc.all?.on('data', chunk => { for (const line of chunk.toString().split('\n')) if (line.trim()) options.onOutput!(line); });
     const result = await proc;

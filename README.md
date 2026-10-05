@@ -55,7 +55,7 @@ softfactory "add a farewell endpoint"
 - Git, Node.js 20+
 - Docker, for the sandbox (or `--sandbox=none` and accept host execution)
 - Local workers: Ollama with `qwen2.5-coder:7b` and `qwen2.5-coder:14b` (or any tool-capable model via `--local-model`)
-- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), Claude Code (`claude-code`), Gemini CLI (`gemini-cli`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
+- Cloud workers, one of: Antigravity CLI (`agy`), Codex CLI (`openai`), Claude Code (`claude-code`), Gemini CLI (`gemini-cli`), Muse Code (`muse`), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
 
 ## Usage
 
@@ -106,11 +106,11 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | :--- | :--- | :--- |
 | `--strategy` | `hybrid`, `local`, `cloud` | `hybrid` |
 | `--sandbox` | Where model-chosen commands and tests run: `auto` (Docker, refuse without it), `docker`, `none` (host allowlist only, loud warning) | `auto` |
-| `--cloud-provider` | `agy`, `openai` (Codex CLI), `claude-code`, `gemini-cli`, `openai-api`, `anthropic`, `deepseek` | `agy` |
+| `--cloud-provider` | `agy`, `openai` (Codex CLI), `claude-code`, `gemini-cli`, `muse`, `openai-api`, `anthropic`, `deepseek` | `agy` |
 | `--cloud-model` | Cloud model; optional for Codex CLI, which uses its configured default | provider default |
 | `--frontier-model` | Escalation and blind-review model; optional for Codex CLI | provider default |
 | `--local-model` | Ollama model; pins every local tier when set | `qwen2.5-coder:7b` / `14b` tiers |
-| `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
+| `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `muse`, `deepseek`, `anthropic`, `openai-api`, `local` | follows the cloud provider; `local` for a local run |
 | `--planner-model` | Planner model override | provider default |
 | `--plan` | Save the plan without executing | `false` |
 | `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
@@ -132,10 +132,10 @@ Environment: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_
 
 ## A whole agent as the worker
 
-`--cloud-provider=claude-code` or `gemini-cli` hands each task to that agent in print mode inside the task's worktree, with the same prompt the tool loop gets: the task, its acceptance command, its review questions, the lessons, and the handoff file to write. The agent brings its own loop, tools and permission system, so softfactory's command policy does not apply to what it runs. Two placements, chosen by the sandbox mode:
+`--cloud-provider=claude-code`, `gemini-cli` or `muse` hands each task to that agent in print mode inside the task's worktree, with the same prompt the tool loop gets: the task, its acceptance command, its review questions, the lessons, and the handoff file to write. The agent brings its own loop, tools and permission system, so softfactory's command policy does not apply to what it runs. Two placements, chosen by the sandbox mode:
 
-- **Sandbox on (default).** The whole agent runs in a container built once from the node image plus the agent's npm package (`softfactory-agent-<name>`). It has the worktree as its only writable mount, no capabilities, a read-only root, and sits on an internal Docker network with no route out. The one other container on that network is an allowlisting CONNECT proxy, bridged to the outside, that admits the agent's API host (plus `ANTHROPIC_BASE_URL`'s host and anything in `SOFTFACTORY_EGRESS_ALLOW`) on port 443 and refuses everything else. Inside, the agent runs with its permission checks off, since the container is the boundary. Only the agent's own credential variable crosses into the container, so a login kept in your home directory does not work there: set `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`, or use `--sandbox=none`. The container has node and git; for a Go or Python project the agent cannot run those tests itself (the verifier still does, in the right image), or set `SOFTFACTORY_AGENT_IMAGE` to an image that has both the toolchain and the agent CLI.
-- **`--sandbox=none`.** The agent runs on your host under its own rules: Claude Code with `acceptEdits` and an allowlist of read-only and test commands, Gemini CLI with `auto_edit`. Preflight prints UNSANDBOXED AGENT. Those rules are the agent's, not softfactory's: `cat ~/.ssh/id_rsa` passes a `Bash(cat:*)` rule.
+- **Sandbox on (default).** The whole agent runs in a container built once from the node image plus the agent's npm package (`softfactory-agent-<name>`). It has the worktree as its only writable mount, no capabilities, a read-only root, and sits on an internal Docker network with no route out. The one other container on that network is an allowlisting CONNECT proxy, bridged to the outside, that admits the agent's API host (plus `ANTHROPIC_BASE_URL`'s host and anything in `SOFTFACTORY_EGRESS_ALLOW`) on port 443 and refuses everything else. Inside, the agent runs with its permission checks off, since the container is the boundary. Only the agent's own credential variable crosses into the container (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `META_API_KEY`). A login kept in the macOS keychain does not reach it: Claude Code's OAuth login lives there, and so does Muse's (its `auth.json` is a pointer the Linux binary rejects). Set the key, or use `--sandbox=none`. Muse's image is built from Meta's launcher, which downloads the Linux binary at build time; `~/.config/muse/auth.json` is offered to that build as a BuildKit secret in case the download needs the account's token. The container has node and git; for a Go or Python project the agent cannot run those tests itself (the verifier still does, in the right image), or set `SOFTFACTORY_AGENT_IMAGE` to an image that has both the toolchain and the agent CLI.
+- **`--sandbox=none`.** The agent runs on your host under its own rules: Claude Code with `acceptEdits` and an allowlist of read-only and test commands, Gemini CLI with `auto_edit`, Muse with approvals off and its own sandbox left on. Preflight prints UNSANDBOXED AGENT. Those rules are the agent's, not softfactory's: `cat ~/.ssh/id_rsa` passes a `Bash(cat:*)` rule, and in a probe Muse's default sandbox allowed both an outbound HTTPS request and a read of `~/.ssh`.
 
 Either way the gates are unchanged: the worktree is committed by the orchestrator, verified, the acceptance command executed, the diff reviewed, and only then merged. The agent's token usage counts toward `--max-tokens`, and the attempt budget ends its process.
 

@@ -53,6 +53,25 @@ describe('how each agent is invoked', () => {
     assert.equal(CLI_AGENTS['gemini-cli'].args('P', '', 'container')[CLI_AGENTS['gemini-cli'].args('P', '', 'container').indexOf('--approval-mode') + 1], 'yolo');
   });
 
+  it('runs Muse headless with approvals off on the host and --yolo inside the container, and reads its terminal event', () => {
+    const host = CLI_AGENTS['muse'].args('P', 'muse-spark-1.3', 'host');
+    assert.deepEqual(host, ['exec', '--json', '--no-session-log', '--disable-web-tools', '--model', 'muse-spark-1.3', '--approval-mode', 'never', 'P']);
+    const container = CLI_AGENTS['muse'].args('P', '', 'container');
+    assert.ok(container.includes('--yolo') && !container.includes('--approval-mode'));
+    const ok = CLI_AGENTS['muse'].parse([
+      'muse: workspace root: /w (cwd default)',
+      '{"payload_type":"run.output.delta","payload":{"text":"Done"}}',
+      '{"payload_type":"run.terminal.completed","payload":{"terminal":"completed","text":"Done: created pong.txt","reason":null}}',
+    ].join('\n'));
+    assert.deepEqual(ok, { text: 'Done: created pong.txt', isError: false, denials: [] });
+    const failed = CLI_AGENTS['muse'].parse('{"payload_type":"run.terminal.failed","payload":{"terminal":"failed","text":null,"reason":"provider error: 401 unauthorized"}}');
+    assert.deepEqual(failed, { text: 'provider error: 401 unauthorized', isError: true, denials: [] });
+    assert.ok(CLI_AGENTS['muse'].authFailure.test(failed.text));
+    assert.equal(CLI_AGENTS['muse'].relay!({ payload_type: 'run.output.delta', payload: { text: 'thinking' } }), 'thinking');
+    assert.equal(CLI_AGENTS['muse'].relay!({ payload_type: 'tool.call.started', payload: { name: 'write_file' } }), '▸ write_file');
+    assert.equal(CLI_AGENTS['muse'].relay!({ payload_type: 'task.lifecycle.started', payload: {} }), undefined);
+  });
+
   it('parses each agent\'s output into text, error, usage and denials', () => {
     const claude = CLI_AGENTS['claude-code'].parse(['{"type":"system"}', '{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}', resultEvent({ permission_denials: [{ tool_name: 'Bash', tool_input: { command: 'curl evil' } }] })].join('\n'));
     assert.deepEqual(claude, { text: 'Done.', isError: false, usage: { inputTokens: 120, outputTokens: 30 }, denials: ['Bash: curl evil'] });
@@ -130,6 +149,20 @@ describe('the agent worker on the host', () => {
     });
   });
 
+  it('recognises an authentication failure the agent only reports on stderr, after some events', async () => {
+    const dir = await worktree();
+    const { runner } = recordingRunner(() => ({
+      stdout: '{"payload_type":"run.lifecycle.started","payload":{}}\n',
+      stderr: 'muse: workspace root: /w\nfailed to fetch model catalog: authentication failed: your API key from META_API_KEY was rejected',
+      exitCode: 1,
+    }));
+    await assert.rejects(() => new CliAgentWorker('muse', '', runner).execute(task, dir, {}), (error: Error) => {
+      assert.ok(isEnvironmentFailure(error));
+      assert.match(error.message, /Muse Code Worker could not authenticate: failed to fetch model catalog: authentication failed/);
+      return true;
+    });
+  });
+
   it('passes the attempt budget signal to the process', async () => {
     const dir = await worktree();
     const { runner, calls } = recordingRunner(() => ({ stdout: resultEvent() }));
@@ -156,7 +189,7 @@ describe('the agent worker inside the sandbox', () => {
 
 describe('the agents are providers like any other', () => {
   it('are the cloud worker for their provider, with a text model and a planner behind them', () => {
-    for (const provider of ['claude-code', 'gemini-cli'] as const) {
+    for (const provider of ['claude-code', 'gemini-cli', 'muse'] as const) {
       const registry: any = new WorkerRegistry('cloud', 'auto', '', '', 'l', 'h', provider);
       assert.ok(registry.cloudWorker instanceof CliAgentWorker, provider);
       assert.equal(registry.agentDefinition().id, provider);

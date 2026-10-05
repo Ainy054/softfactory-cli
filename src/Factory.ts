@@ -146,7 +146,7 @@ export class Factory extends EventEmitter {
                 ? new LocalPlanner(plannerModel || heavyLocal)
             : plannerProvider === 'anthropic' || plannerProvider === 'openai-api'
                 ? new ApiPlanner(plannerProvider, plannerModel)
-            : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli'
+            : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli' || plannerProvider === 'muse'
                 ? new CliPlanner(plannerProvider, plannerModel, baseDir)
                 : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
         // The reviewer is the configured cloud provider's model, and nothing
@@ -1821,7 +1821,7 @@ export class Factory extends EventEmitter {
         const agent = this.strategy === 'local' ? undefined : this.workerRegistry.agentDefinition();
         if (agent) {
             if (this.sandbox.active) {
-                const problem = AgentContainer.credentialProblem(agent);
+                const problem = await AgentContainer.credentialProblem(agent);
                 if (problem) {
                     this.environmentFault = problem;
                     return;

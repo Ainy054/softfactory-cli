@@ -8,7 +8,7 @@ import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type
 import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
-export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api' | 'claude-code' | 'gemini-cli';
+export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek' | 'anthropic' | 'openai-api' | 'claude-code' | 'gemini-cli' | 'muse';
 
 const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
@@ -351,7 +351,7 @@ export class DeepSeekPlanner extends TextModelPlanner {
 
 /** Planning through an installed coding agent's print mode, so its login is the only credential needed. */
 export class CliPlanner extends TextModelPlanner {
-  constructor(provider: 'claude-code' | 'gemini-cli', model = '', cwd: string = process.cwd()) {
+  constructor(provider: 'claude-code' | 'gemini-cli' | 'muse', model = '', cwd: string = process.cwd()) {
     super(provider, createTextModel(provider, model, { cwd }));
   }
 }

@@ -25,7 +25,7 @@ export interface ITextModel {
   complete(prompt: string, options?: CompletionOptions): Promise<string>;
 }
 
-export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli';
+export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'claude-code' | 'gemini-cli' | 'muse';
 
 /**
  * Size a local window against the host, not the model's name. A 14B at 8192
@@ -190,6 +190,41 @@ export class GeminiCliTextModel implements ITextModel {
   }
 }
 
+/** One prompt through Muse's headless mode with every tool off; the final text is the answer. */
+export class MuseTextModel implements ITextModel {
+  readonly provider = 'muse';
+  constructor(readonly model: string, private readonly cwd: string = process.cwd()) {}
+
+  async isAvailable(): Promise<boolean> {
+    try { await execa('muse', ['--version'], { timeout: 10000 }); return true; } catch { return false; }
+  }
+
+  async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
+    let stdout: string;
+    try {
+      ({ stdout } = await execa('muse', ['exec', '--json', '--no-session-log', '--disable-web-tools', '--disable-shell', '--disable-write', '--approval-mode', 'never', '--max-model-steps', '1', ...(this.model ? ['--model', this.model] : []), prompt],
+        { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 }));
+    } catch (error: any) {
+      throw new WorkerEnvironmentError(`Muse failed for ${this.model || 'its default model'}: ${(error?.shortMessage || error?.message || 'unknown error').slice(0, 300)}`);
+    }
+    let text = '';
+    let terminal = '';
+    for (const line of stdout.split('\n')) {
+      if (!line.trim().startsWith('{')) continue;
+      try {
+        const event = JSON.parse(line);
+        if (typeof event.payload_type === 'string' && event.payload_type.startsWith('run.terminal.')) {
+          terminal = event.payload?.terminal || event.payload_type.slice('run.terminal.'.length);
+          text = String(event.payload?.text ?? event.payload?.reason ?? '').trim();
+        }
+      } catch { /* not an event line */ }
+    }
+    if (terminal && terminal !== 'completed') throw new WorkerEnvironmentError(`Muse run ${terminal}: ${text.slice(0, 300)}`);
+    if (!text) throw new Error('Muse returned no text.');
+    return text;
+  }
+}
+
 export class OpenAiTextModel implements ITextModel {
   readonly provider = 'openai-api';
   constructor(readonly model: string, private readonly fetchImpl: typeof fetch = fetch) {}
@@ -285,5 +320,6 @@ export function createTextModel(provider: TextModelProvider, model: string, opti
     case 'deepseek': return new DeepSeekTextModel(model, options.fetchImpl);
     case 'claude-code': return new ClaudeCodeTextModel(model, options.cwd);
     case 'gemini-cli': return new GeminiCliTextModel(model, options.cwd);
+    case 'muse': return new MuseTextModel(model, options.cwd);
   }
 }
