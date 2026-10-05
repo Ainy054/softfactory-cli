@@ -6,6 +6,7 @@ import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { safeLocalContextWindow } from './TextModel.js';
+import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline } from './commandPolicy.js';
 
 interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -108,6 +109,12 @@ ${projectContext}
         userPrompt += `\nSCOPED VERIFICATION: Run the focused tests for these files first (for example, npm test -- ${tests.join(' ')} from the package root). Do not use unrelated suite failures to justify edits outside the declared scope.\n`;
       }
     }
+    if (task.verification_command) {
+      userPrompt += `\nACCEPTANCE COMMAND (the orchestrator runs this verbatim after you finish; make it pass): ${task.verification_command}\n`;
+    }
+    if (task.review_questions?.length) {
+      userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
+    }
 
     let messages: Message[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
@@ -204,7 +211,8 @@ ${projectContext}
             properties: {
               summary: { type: 'string', description: 'Summary of the changes made' },
               test_summary: { type: 'string', description: 'Summary of the testing performed' },
-              status: { type: 'string', enum: ['success', 'failure'] }
+              status: { type: 'string', enum: ['success', 'failure'] },
+              review_answers: { type: 'array', items: { type: 'string' }, description: 'One answer per REVIEW QUESTION, each citing file:line' }
             },
             required: ['summary', 'test_summary', 'status']
           }
@@ -412,7 +420,8 @@ ${projectContext}
                 }
               } else {
                 onOutput(`[LocalAgent] ✅ Task finished: ${args.status}`);
-                handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles) };
+                handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles),
+                  review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {
@@ -709,109 +718,12 @@ ${projectContext}
     }
   }
 
-  private assertAllowedCommand(command: unknown): asserts command is string {
-    if (process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING === '1') {
-      if (typeof command !== 'string' || !command.trim()) throw new Error('Invalid command.');
-      return;
-    }
-    if (typeof command !== 'string' || command.length > 300) throw new Error('Invalid command.');
-    if (/[;&`$<>\n\r]/.test(command) || /\|\|/.test(command)) throw new Error('Shell operators are not allowed.');
-    const segments = this.splitPipeline(command);
-    if (segments.length > 1 && segments.some(part => !this.isReadOnlyCommand(part))) throw new Error('Only read-only commands may be piped.');
-    if (!segments.length) throw new Error('Invalid command.');
-    for (const segment of segments) this.assertAllowedCommandSegment(segment);
-    return;
-  }
-  private assertAllowedCommandSegment(command: string) {
-    const executable = command.trim().split(/\s+/, 1)[0];
-    // Read-only inspection. A worker naturally reaches for these to orient
-    // itself, and refusing them burned whole turns on `ls -R` and `grep -r`
-    // with no working alternative, unlike `cd` which working_dir replaced.
-    const readOnly = new Set(['ls', 'cat', 'grep', 'egrep', 'rg', 'find', 'head', 'tail', 'wc', 'pwd', 'file', 'stat']);
-    const allowed = new Set(['npm', 'npx', 'pnpm', 'yarn', 'node', 'go', 'pytest', 'python', 'python3', 'cargo', 'git', 'tsc', 'eslint', 'vitest']);
-    if (!allowed.has(executable) && !readOnly.has(executable)) {
-      throw new Error(`Command is not allowlisted: ${executable}`);
-    }
-    // find can execute: -exec ... + needs no shell metacharacter to fire.
-    if (executable === 'find' && /(^|\s)-(?:exec|execdir|ok|okdir|delete|fls|fprint)\b/.test(command)) {
-      throw new Error('find may only search, not execute or delete.');
-    }
-    // Scoped to interpreters. Applied to everything it also rejected `grep -c`,
-    // `head -c` and `ls -p`, which are ordinary read-only flags.
-    if (['node', 'python', 'python3'].includes(executable)
-        && /(^|\s)-(?:e|c|p|-eval|-print|-command)\b/.test(command)) {
-      throw new Error('Inline interpreter execution is not permitted.');
-    }
-    if (executable === 'git' && /(^|\s)-c\s|alias\.|!\s*\w/.test(command)) {
-      throw new Error('git -c / alias execution is not permitted.');
-    }
-    if (executable === 'npx') throw new Error('npx is not permitted because it can download and execute arbitrary packages.');
-  }
-  private isReadOnlyCommand(command: string) {
-    const executable = command.trim().split(/\s+/, 1)[0];
-    return new Set(['ls', 'cat', 'grep', 'egrep', 'rg', 'find', 'head', 'tail', 'wc', 'pwd', 'file', 'stat']).has(executable);
-  }
-  private async runSafeCommand(command: string, cwd: string) {
-    if (process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING === '1') {
-      const result = await execa('/bin/zsh', ['-lc', command], {
-        cwd, timeout: 30000, env: this.safeCommandEnv(),
-      });
-      return { stdout: result.stdout, stderr: result.stderr };
-    }
-    const segments = this.splitPipeline(command);
-    let input: string | undefined;
-    let stderr = '';
-    for (const segment of segments) {
-      this.assertAllowedCommandSegment(segment);
-      const [executable, ...commandArgs] = this.parseCommand(segment);
-      const result = await execa(executable, commandArgs, { cwd, timeout: 30000, env: this.safeCommandEnv(), input });
-      input = result.stdout;
-      stderr += result.stderr;
-    }
-    return { stdout: input || '', stderr };
-  }
-
-  /**
-   * Splits on `|` outside quotes. A plain split turned `rg 'foo|bar' src` into
-   * the segments `rg 'foo` and `bar' src`, and rejected the second as not
-   * allowlisted.
-   */
-  private splitPipeline(command: string): string[] {
-    const segments: string[] = [];
-    let current = '';
-    let quote: '"' | "'" | null = null;
-    for (const ch of command) {
-      if (quote) {
-        current += ch;
-        if (ch === quote) quote = null;
-      } else if (ch === '"' || ch === "'") {
-        quote = ch;
-        current += ch;
-      } else if (ch === '|') {
-        segments.push(current);
-        current = '';
-      } else {
-        current += ch;
-      }
-    }
-    segments.push(current);
-    return segments.map(part => part.trim()).filter(Boolean);
-  }
-
-  private parseCommand(command: string): string[] {
-    const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-    // Strip each quoted run down to its contents. The old `^(["'])|\1$`
-    // removed only the opening quote, so programs received `foo bar"`.
-    return parts.map(part => part.replace(/"([^"]*)"|'([^']*)'/g, (_m, d, s) => d ?? s));
-  }
-
-  private safeCommandEnv(): NodeJS.ProcessEnv {
-    const env = { ...process.env };
-    for (const key of Object.keys(env)) {
-      if (/TOKEN|SECRET|PASSWORD|PRIVATE|API_KEY|AUTH/i.test(key)) delete env[key];
-    }
-    return { ...env, CI: 'true' };
-  }
+  // The command policy is shared with the acceptance runner and the DeepSeek
+  // worker (commandPolicy.ts); these thin wrappers keep the call sites local.
+  private assertAllowedCommand(command: unknown): asserts command is string { assertAllowedCommand(command); }
+  private splitPipeline(command: string): string[] { return splitPipeline(command); }
+  private parseCommand(command: string): string[] { return parseCommand(command); }
+  private runSafeCommand(command: string, cwd: string) { return runSafeCommand(command, cwd, 30000); }
 
   private truncateToolResult(result: string): string {
     return result.length > this.maxToolOutput ? `${result.slice(0, this.maxToolOutput)}\n...[truncated]` : result;

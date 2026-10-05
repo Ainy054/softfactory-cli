@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Task } from './types.js';
+import { redactSecrets } from './redact.js';
 
 export interface TrainingCandidateInput {
   task: Pick<Task, 'id' | 'title' | 'description' | 'agent_role' | 'files_hint' | 'attempts' | 'model' | 'provider' | 'error_history'>;
@@ -29,10 +30,8 @@ export interface FailureLesson {
   error: string; prior_failures: string[];
 }
 
-const SECRET = /(?:sk-[A-Za-z0-9_-]{16,}|(?:api[_ -]?key|authorization|bearer|password|passwd|secret|token)\s*[:=]\s*)(?:Bearer\s+)?[^\s,;"'`}]+/gi;
-
 export function redactTrainingText(value: string, limit = 40000): string {
-  return value.replace(SECRET, '[REDACTED_SECRET]').slice(0, limit);
+  return redactSecrets(value).slice(0, limit);
 }
 
 /** Stores only verified, sanitized examples; raw attempts remain diagnostics. */

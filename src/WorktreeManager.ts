@@ -74,26 +74,20 @@ export class WorktreeManager {
   }
 
   async hydrate(worktreePath: string, taskId?: string): Promise<void> {
+    // Real .env files are not on this list on purpose. They hold the user's
+    // credentials, and copying them put every secret within reach of every
+    // worker's commands and, when a worker edited one, into history. A
+    // worker that needs environment shape gets the committed .env.example
+    // via the fallbacks below; environment values are orchestrator work.
     const CANDIDATE_FILES = [
-      '.env',
-      '.env.local',
-      '.env.test',
-      '.env.development',
       'config.yaml',
       'config.json',
       '.air.toml',
       'settings.json',
       'docker-compose.yml',
       'compose.yml',
-      'backend/.env',
-      'backend/.env.test',
-      'backend/.env.local',
       'backend/config.yaml',
       'backend/.air.toml',
-      'frontend/.env',
-      'frontend/.env.local',
-      'frontend/.env.test',
-      'frontend/.env.development',
     ];
 
     for (const relFile of CANDIDATE_FILES) {

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { Lesson, LessonSchema, Task } from './types.js';
+import { redactSecrets } from './redact.js';
 export class LessonManager {
   private path: string;
   constructor(baseDir: string) { this.path = path.join(baseDir, '.softfactory', 'lessons.json'); }
@@ -12,7 +13,14 @@ export class LessonManager {
     if (selected.length) await this.write(lessons.map(l => selected.some(x => x.l.id === l.id) ? { ...l, lastUsedAt: new Date().toISOString(), useCount: l.useCount + 1 } : l));
     return selected.map(x => x.l.lesson);
   }
-  async add(candidate: Omit<Lesson, 'id' | 'createdAt' | 'useCount' | 'status'>): Promise<boolean> {
+  async add(raw: Omit<Lesson, 'id' | 'createdAt' | 'useCount' | 'status'>): Promise<boolean> {
+    // Evidence quotes failure output and worker summaries verbatim; neither
+    // may carry a credential into a file that every future prompt reads.
+    const candidate = {
+      ...raw,
+      lesson: redactSecrets(raw.lesson),
+      evidence: { ...raw.evidence, failure: redactSecrets(raw.evidence.failure), resolution: redactSecrets(raw.evidence.resolution) },
+    };
     if (candidate.confidence < 0.65 || /ignore (previous|all)|system prompt|api[_ -]?key/i.test(candidate.lesson)) return false;
     const lessons = await this.read(); const normalized = candidate.lesson.toLowerCase().replace(/\W+/g, ' ').trim();
     if (lessons.some(l => l.lesson.toLowerCase().replace(/\W+/g, ' ').trim() === normalized)) return false;

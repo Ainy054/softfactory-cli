@@ -37,7 +37,7 @@ Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
 Acceptance Criteria: ${task.acceptance_criteria.join('; ')}
 Verification: ${task.verification.join('; ')}
-`;
+${task.verification_command ? `Acceptance Command (run verbatim by the orchestrator after you finish; make it pass): ${task.verification_command}\n` : ''}${task.review_questions?.length ? `Review Questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n` : ''}`;
 
     // Proactive context injection: read files_hint contents
     const fileContents: string[] = [];
@@ -96,7 +96,8 @@ The JSON must follow this exact schema:
   "status": "success" | "failure",
   "files_changed": ["path/1", "path/2"],
   "test_summary": "Summary of tests executed or added",
-  "summary": "Concise summary of changes made"
+  "summary": "Concise summary of changes made",
+  "review_answers": ["one answer per review question, citing file:line"]
 }
 `;
 

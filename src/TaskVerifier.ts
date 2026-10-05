@@ -2,6 +2,20 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task } from './types.js';
+import { commandPolicyViolation, runSafeCommand } from './commandPolicy.js';
+
+export interface AcceptanceResult {
+  /** False when the task declares no command; nothing was checked. */
+  ran: boolean;
+  passed: boolean;
+  exitCode: number | null;
+  output: string;
+  command: string;
+  cwd?: string;
+  evidencePath?: string;
+  /** The command cannot run here at all: refused by policy, or not installed. */
+  unrunnable: boolean;
+}
 
 export interface ProjectTestConfig {
   testEnv: Record<string, string>;
@@ -600,6 +614,78 @@ export class TaskVerifier {
     if (text.length <= limit) return text;
     const head = Math.floor(limit * 0.4);
     return `${text.slice(0, head)}\n...[trimmed]...\n${text.slice(-(limit - head))}`;
+  }
+
+  /**
+   * Executes a task's own acceptance command under the command policy and
+   * writes the evidence log. The planner has always been required to emit
+   * one; until now nothing ran it, so it was a claim rather than a gate.
+   */
+  async runAcceptance(
+    worktreePath: string,
+    task: Pick<Task, 'id' | 'verification_command' | 'attempts'>,
+    options: { evidenceDir?: string; timeoutMs?: number; note?: string } = {},
+  ): Promise<AcceptanceResult> {
+    const command = (task.verification_command || '').trim();
+    if (!command) return { ran: false, passed: true, exitCode: null, output: '', command: '', unrunnable: false };
+    const cwd = await this.acceptanceCwd(worktreePath, command);
+    const violation = commandPolicyViolation(command);
+    let exitCode: number | null = null;
+    let output = '';
+    let passed = false;
+    let unrunnable = false;
+    if (violation) {
+      output = `Acceptance command refused by the command policy: ${violation}`;
+      unrunnable = true;
+    } else {
+      try {
+        const result = await runSafeCommand(command, cwd, options.timeoutMs ?? 180000);
+        exitCode = result.exitCode;
+        output = `${result.stdout}\n${result.stderr}`.trim();
+        passed = true;
+      } catch (error: any) {
+        exitCode = typeof error?.exitCode === 'number' ? error.exitCode : null;
+        const timedOut = Boolean(error?.timedOut);
+        output = `${error?.stdout || ''}\n${error?.stderr || ''}\n${exitCode === null ? (timedOut ? `timed out after ${options.timeoutMs ?? 180000}ms` : (error?.shortMessage || error?.message || '')) : ''}`.trim();
+        // A missing binary or a spawn failure means the gate can never fire;
+        // a slow suite that timed out is red, not absent.
+        unrunnable = (exitCode === null && !timedOut) || exitCode === 127;
+      }
+    }
+    let evidencePath: string | undefined;
+    if (options.evidenceDir) {
+      evidencePath = path.join(options.evidenceDir, `${task.id}-attempt${(task.attempts ?? 0) + 1}.log`);
+      await fs.mkdir(options.evidenceDir, { recursive: true });
+      await fs.writeFile(evidencePath, [
+        '# softfactory acceptance evidence',
+        `task: ${task.id}`,
+        `command: ${command}`,
+        `cwd: ${path.relative(worktreePath, cwd) || '.'}`,
+        `exit_code: ${exitCode ?? 'n/a'}`,
+        `timestamp: ${new Date().toISOString()}`,
+        ...(options.note ? [`note: ${options.note}`] : []),
+        '',
+        this.clip(output, 20000),
+        '',
+        `RESULT: ${passed ? 'PASS' : 'FAIL'}`,
+        '',
+      ].join('\n'), 'utf8');
+    }
+    return { ran: true, passed, exitCode, output: this.clip(output), command, cwd, evidencePath, unrunnable };
+  }
+
+  /** A command that names its ecosystem runs from that ecosystem's root in a split repo. */
+  private async acceptanceCwd(worktreePath: string, command: string): Promise<string> {
+    const executable = command.trim().split(/\s+/, 1)[0];
+    if (executable === 'go' && !await this.exists(path.join(worktreePath, 'go.mod')) && await this.exists(path.join(worktreePath, 'backend', 'go.mod'))) {
+      return path.join(worktreePath, 'backend');
+    }
+    if (['npm', 'pnpm', 'yarn', 'node', 'vitest', 'tsc', 'eslint'].includes(executable)
+        && !await this.exists(path.join(worktreePath, 'package.json'))
+        && await this.exists(path.join(worktreePath, 'frontend', 'package.json'))) {
+      return path.join(worktreePath, 'frontend');
+    }
+    return worktreePath;
   }
 
   private stripAnsi(raw: string): string {

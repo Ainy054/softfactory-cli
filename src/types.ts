@@ -12,7 +12,21 @@ export const TaskSchema = z.object({
   creates_files: z.array(z.string()).default([]),
   acceptance_criteria: z.array(z.string()).default([]),
   verification: z.array(z.string()).default([]),
-  status: z.enum(['pending', 'active', 'done', 'failed', 'rejected', 'blocked']).default('pending'),
+  /**
+   * Who performs the task. Only "agent" tasks reach a worker. "orchestrator"
+   * is host or live-system work (secrets, deploys, host config, pushes) and
+   * "user" is a decision; both pause the run until --mark-done.
+   */
+  executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  /** Touches a path in .softfactory/protected-paths.txt: never the light tier, always the blind review. */
+  protected: z.boolean().default(false),
+  /** Questions the blind reviewer will verify; the worker answers each with file:line. */
+  review_questions: z.array(z.string()).default([]),
+  /** Relative path of the acceptance evidence log for the latest attempt. */
+  evidence: z.string().optional(),
+  /** What the acceptance command did against the base branch at planning time. */
+  acceptance_baseline: z.object({ exit_code: z.number().nullable(), summary: z.string() }).optional(),
+  status: z.enum(['pending', 'active', 'done', 'failed', 'rejected', 'blocked', 'manual']).default('pending'),
   worktree_branch: z.string().optional(),
   attempts: z.number().default(0),
   escalation_level: z.number().default(0),
@@ -29,16 +43,23 @@ export const TaskSchema = z.object({
   allocation_reason: z.string().optional(),
   replan_reason: z.string().optional(),
   /** How the last merge decision was reached: a model reviewed the diff, or only mechanical gates ran. */
-  inspection: z.enum(['model', 'mechanical-only']).optional(),
+  inspection: z.enum(['model', 'mechanical-only', 'blind-review']).optional(),
   inspector_model: z.string().optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
 
+/**
+ * Bumped when factory.json gains a field an older softfactory would misread.
+ * 2: executor routing, protected tasks, acceptance evidence, manual/paused.
+ */
+export const CURRENT_SCHEMA_VERSION = 2;
+
 export const FactoryStateSchema = z.object({
+  schema_version: z.number().int().positive().default(1),
   feature_id: z.string().default(''),
   feature: z.string(),
-  status: z.enum(['planning', 'planned', 'active', 'completed', 'failed']),
+  status: z.enum(['planning', 'planned', 'active', 'paused', 'completed', 'failed']),
   strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
   cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic', 'deepseek']).default('agy'),
   planner_provider: z.enum(['openai', 'agy', 'local', 'deepseek']).default('openai'),
@@ -83,6 +104,8 @@ export const HandoffSchema = z.object({
   test_summary: z.string().optional(),
   unresolved_issues: z.string().optional(),
   summary: z.string(),
+  /** One answer per review question, each citing file:line. */
+  review_answers: z.array(z.string()).optional(),
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;
@@ -103,4 +126,5 @@ export type FactoryEvent =
   | { type: 'phase:start'; phase: number }
   | { type: 'task:auto-replan'; task_id: string; reason: string; replacements: string[] }
   | { type: 'task:auto-replan-failed'; task_id: string; reason: string; error: string }
-  | { type: 'build:complete'; status: 'completed' | 'failed' | 'planned'; feature: string };
+  | { type: 'task:manual'; task: Task }
+  | { type: 'build:complete'; status: 'completed' | 'failed' | 'planned' | 'paused'; feature: string };

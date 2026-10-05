@@ -11,6 +11,7 @@ const statusColors: Record<string, string> = {
   planning: 'yellow',
   planned: 'blue',
   active: 'cyan',
+  paused: 'yellow',
   completed: 'green',
   failed: 'red',
 };

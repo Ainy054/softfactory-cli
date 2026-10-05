@@ -156,8 +156,8 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
 
       {state.done && (
         <Box marginTop={1}>
-          <Text bold color={state.status === 'completed' ? 'green' : 'red'}>
-            Build {state.status}!
+          <Text bold color={state.status === 'completed' ? 'green' : state.status === 'paused' || state.status === 'planned' ? 'yellow' : 'red'}>
+            {state.status === 'paused' ? 'Build paused: finish the manual task(s) above, then softfactory --mark-done <id> --resume' : `Build ${state.status}!`}
           </Text>
         </Box>
       )}

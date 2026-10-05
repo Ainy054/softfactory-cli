@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
-import { FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
+import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
 import { isEnvironmentFailure } from './IWorker.js';
@@ -15,6 +15,9 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
 import { createTextModel, OllamaTextModel } from './TextModel.js';
+import { ProtectedPaths } from './ProtectedPaths.js';
+import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
+import { redactSecrets } from './redact.js';
 
 export interface FactoryOptions {
     streamToTerminal?: boolean;
@@ -39,6 +42,9 @@ export class Factory extends EventEmitter {
     worktreeManager: WorktreeManager;
     /** Reviews diffs on the configured provider's model; the merge gate for hybrid and cloud runs. */
     inspector: Inspector;
+    /** The frontier-tier reviewer for protected diffs; it never sees the worker's summary. */
+    frontierInspector: Inspector;
+    protectedPaths = new ProtectedPaths([]);
     workerRegistry: WorkerRegistry;
     taskVerifier: TaskVerifier;
     lessons: LessonManager;
@@ -95,6 +101,11 @@ export class Factory extends EventEmitter {
         this.inspector = new Inspector(strategy === 'local'
             ? new OllamaTextModel(heavyLocal)
             : createTextModel(cloudProvider, cloudModel, { cwd: baseDir }));
+        // Protected diffs get the strongest model configured. A local run has
+        // only its heavy local model, which still beats no review at all.
+        this.frontierInspector = new Inspector(strategy === 'local'
+            ? new OllamaTextModel(heavyLocal)
+            : createTextModel(cloudProvider, frontierModel || cloudModel, { cwd: baseDir }));
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
         this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
         this.taskVerifier = new TaskVerifier();
@@ -109,6 +120,8 @@ export class Factory extends EventEmitter {
     async init() {
         await fs.mkdir(path.join(this.baseDir, '.softfactory'), { recursive: true });
         await fs.mkdir(this.archiveDir, { recursive: true });
+        this.protectedPaths = await ProtectedPaths.load(this.baseDir);
+        if (this.protectedPaths.size > 0) this.log(`Protected paths: ${this.protectedPaths.size} pattern(s) from ${ProtectedPaths.FILE}`);
         await this.worktreeManager.init();
         this.defaultBranch = await this.worktreeManager.getDefaultBranch();
         if (this.useDocker) {
@@ -123,7 +136,7 @@ export class Factory extends EventEmitter {
         }
         if (await this.exists(this.statePath)) {
             const content = await fs.readFile(this.statePath, 'utf-8');
-            this.state = FactoryStateSchema.parse(JSON.parse(content));
+            this.state = this.loadState(content);
             // The command-line configuration is authoritative for the
             // process that is resuming the run. Older state files recorded
             // the original provider (often OpenAI) even when the resumed
@@ -170,7 +183,7 @@ export class Factory extends EventEmitter {
             repositoryFiles: new Set(await this.getRepositoryFiles()),
             workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local',
         });
-        const newTasks: Task[] = refined.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 }));
+        const newTasks: Task[] = this.annotateTasks(refined.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })));
         // Done tasks are merged code; whatever the planner returned for them,
         // the original record stands.
         for (const done of doneTasks) {
@@ -212,7 +225,7 @@ export class Factory extends EventEmitter {
             const archivePath = path.join(this.archiveDir, `${featureId}.json`);
             if (await this.exists(archivePath)) {
                 const content = await fs.readFile(archivePath, 'utf-8');
-                this.state = FactoryStateSchema.parse(JSON.parse(content));
+                this.state = this.loadState(content);
                 await this.saveState();
                 await fs.unlink(archivePath);
                 this.log(`Restored archived feature: ${this.state.feature}`);
@@ -245,7 +258,17 @@ export class Factory extends EventEmitter {
 
         const failed = this.state.tasks.filter(t => t.status === 'failed' || (retryBlocked && (t.status === 'rejected' || t.status === 'blocked')));
         const pending = this.state.tasks.filter(t => t.status === 'pending');
+        const awaitingHuman = this.state.tasks.filter(t => t.status === 'manual');
 
+        if (failed.length === 0 && pending.length === 0 && awaitingHuman.length > 0) {
+            this.log(`Still waiting on ${awaitingHuman.length} manual task(s): ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}.`);
+            this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
+            this.state.status = 'paused';
+            await this.saveState();
+            await this.updateHistory('paused');
+            this.emitEvent({ type: 'build:complete', status: 'paused', feature: this.state.feature });
+            return;
+        }
         if (failed.length === 0 && pending.length === 0) {
             const allDone = this.state.tasks.length > 0 && this.state.tasks.every(t => t.status === 'done');
             if (allDone) {
@@ -320,6 +343,9 @@ export class Factory extends EventEmitter {
         for (const task of this.state.tasks) {
             if (task.status !== 'done')
                 continue;
+            // A manual task is completed by a person, not a merge.
+            if (task.executor !== 'agent')
+                continue;
             // Check if a merge commit for this task exists in git history
             const mergeExists = await this.mergeExistsInHistory(task.id);
             if (!mergeExists) {
@@ -366,7 +392,7 @@ export class Factory extends EventEmitter {
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local' });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -377,9 +403,10 @@ export class Factory extends EventEmitter {
             strategy: this.strategy,
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
-            tasks: blueprint.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })),
+            tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
-            state_revision: 0
+            state_revision: 0,
+            schema_version: CURRENT_SCHEMA_VERSION,
         };
         await this.saveState();
         await this.updateHistory('planned');
@@ -419,7 +446,7 @@ export class Factory extends EventEmitter {
         const featureHistory = history.length > 0
             ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
             : '';
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local' });
+        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -430,9 +457,10 @@ export class Factory extends EventEmitter {
             strategy: this.strategy,
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
-            tasks: blueprint.tasks.map((t) => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })),
+            tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
-            state_revision: 0
+            state_revision: 0,
+            schema_version: CURRENT_SCHEMA_VERSION,
         };
         await this.saveState();
         await this.updateHistory('active');
@@ -449,8 +477,14 @@ export class Factory extends EventEmitter {
         if (!this.baseline) await this.captureBaseline();
         while (this.hasUnfinishedTasks()) {
             await this.autoReplanBlockedTasks();
-            const readyCandidates = this.getReadyTasks();
+            const allReady = this.getReadyTasks();
+            // Orchestrator and user tasks never reach a worker. They are
+            // parked for a person, and the run pauses once nothing else can
+            // proceed without them.
+            for (const task of allReady.filter(t => t.executor !== 'agent')) await this.parkManualTask(task);
+            const readyCandidates = allReady.filter(t => t.executor === 'agent');
             if (readyCandidates.length === 0) {
+                if (this.state.tasks.some(t => t.status === 'manual')) break;
                 this.log('No ready tasks — possible deadlock or all retries exhausted.');
                 break;
             }
@@ -536,6 +570,18 @@ export class Factory extends EventEmitter {
             this.emitEvent({ type: 'build:complete', status: 'failed', feature: this.state.feature });
             return;
         }
+        const awaitingHuman = this.state.tasks.filter(t => t.status === 'manual');
+        if (awaitingHuman.length > 0) {
+            // Not a failure: the plan reached work only a person may do.
+            this.state.status = 'paused';
+            await this.saveState();
+            await this.updateHistory('paused');
+            this.log(`PAUSED: ${awaitingHuman.length} task(s) need a person: ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}`);
+            this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
+            if (failedTasks.length > 0) this.log(`Also unresolved: ${failedTasks.map(t => `${t.id}:${t.status}`).join(', ')}`);
+            this.emitEvent({ type: 'build:complete', status: 'paused', feature: this.state.feature });
+            return;
+        }
         this.state.status = failedTasks.length > 0 || this.state.tasks.some(t => t.status !== 'done') ? 'failed' : 'completed';
         await this.saveState();
         await this.updateHistory(this.state.status);
@@ -563,6 +609,7 @@ export class Factory extends EventEmitter {
             await this.runDockerVerification();
             if (this.state.status === 'completed') await this.synthesizeMemory();
         }
+        await this.writeRunMetrics();
         this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
         if (failedTasks.length > 0) {
             this.log(`Build partial: ${doneTasks.length}/${this.state.tasks.length} tasks completed, ${failedTasks.length} failed/skipped`);
@@ -762,6 +809,29 @@ export class Factory extends EventEmitter {
             }
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: expectedTddFailure ? `Verifier expected TDD failure: ${verifierResult.testSummary}` : `Verifier PASSED: ${verifierResult.testSummary}` });
 
+            // The task's own acceptance command, executed and logged. Without
+            // this the planner's verification_command was emitted on every
+            // task and never run by anything.
+            let reviewEvidence = verifierResult.output || '';
+            const acceptance = await this.taskVerifier.runAcceptance(worktreePath, task, {
+                evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
+                note: task.agent_role === 'test_writer' ? 'test_writer: a red acceptance is expected before implementation' : undefined,
+            });
+            if (acceptance.ran) {
+                task.evidence = acceptance.evidencePath ? path.relative(this.baseDir, acceptance.evidencePath) : undefined;
+                const tolerated = !acceptance.passed && task.agent_role === 'test_writer' && !acceptance.unrunnable;
+                reviewEvidence += `\n\nAcceptance command: ${acceptance.command} (exit ${acceptance.exitCode ?? 'n/a'}, ${acceptance.passed ? 'PASS' : tolerated ? 'expected red for test_writer' : 'FAIL'})\n${acceptance.output.slice(-2000)}`;
+                if (!acceptance.passed && !tolerated) {
+                    this.log(`ACCEPTANCE FAILED: ${task.id} — ${acceptance.command} exited ${acceptance.exitCode ?? 'without running'} (evidence: ${task.evidence})`);
+                    this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Acceptance FAILED: ${acceptance.command}` });
+                    processFailure(`The task's acceptance command failed (exit ${acceptance.exitCode ?? 'n/a'}): ${acceptance.command}\n${acceptance.unrunnable ? 'The command could not run at all; it was not a test failure.\n' : ''}${acceptance.output.slice(-1200)}`);
+                    await this.recordAttempt(task, acceptance.unrunnable ? 'acceptance_unrunnable' : 'acceptance', acceptance.output.slice(-1200));
+                    return null;
+                }
+                this.log(`ACCEPTANCE ${acceptance.passed ? 'PASS' : 'expected red (test_writer)'}: ${task.id} — ${acceptance.command} (evidence: ${task.evidence})`);
+                this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Acceptance ${acceptance.passed ? 'PASSED' : 'red as expected'}: ${acceptance.command}` });
+            }
+
             const diff = await this.getDiff(branchName);
             if (!diff.trim()) {
                 this.log(`EMPTY DIFF: ${task.id} — commit succeeded but diff is empty (possible git state issue)`);
@@ -781,18 +851,30 @@ export class Factory extends EventEmitter {
             // merged with its acceptance criteria unmet.
             this.log(`Inspection: Reviewing ${task.id}`);
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector reviewing diff...` });
-            // Local mode stays offline: no model reviews the diff, and the
-            // record says so instead of reporting a PASS nobody issued.
-            const mechanicalOnly = this.strategy === 'local';
-            const review = mechanicalOnly
-                ? { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }
-                : await this.inspector.inspect(task, diff, handoff.summary, verifierResult.output);
-            task.inspection = mechanicalOnly ? 'mechanical-only' : 'model';
+            // Protection is decided by what the diff touched, not only by what
+            // the plan expected it to touch.
+            const protectedHits = this.protectedPaths.touched(this.filesInDiff(diff));
+            if (protectedHits.length > 0 && !task.protected) {
+                task.protected = true;
+                this.log(`PROTECTED: ${task.id} diff touches ${[...new Set(protectedHits.map(h => h.file))].join(', ')}`);
+            }
+            // Three kinds of merge decision, each recorded as what it was:
+            // a blind review of protected code on the frontier model, a
+            // model review of ordinary code, or, offline, mechanical gates only.
+            const blind = task.protected;
+            const mechanicalOnly = !blind && this.strategy === 'local';
+            if (blind) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Independent review (${this.frontierInspector.provider}/${this.frontierInspector.model}) of protected diff...` });
+            const review = blind
+                ? await this.frontierInspector.inspectBlind(task, diff, reviewEvidence, handoff.review_answers)
+                : mechanicalOnly
+                    ? { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }
+                    : await this.inspector.inspect(task, diff, handoff.summary, reviewEvidence);
+            task.inspection = blind ? 'blind-review' : mechanicalOnly ? 'mechanical-only' : 'model';
             task.inspector_model = mechanicalOnly ? undefined : `${review.provider}/${review.model}`;
-            await this.recordTaskEvent({ event: 'task:inspected', task_id: task.id, attempt: task.attempts, verdict: review.verdict, inspection: task.inspection, provider: review.provider, model: review.model });
+            await this.recordTaskEvent({ event: 'task:inspected', task_id: task.id, attempt: task.attempts, verdict: review.verdict, inspection: task.inspection, provider: review.provider, model: review.model, protected: task.protected });
             if (review.verdict === 'PASS') {
-                this.log(mechanicalOnly ? `PASSED (mechanical gates only, no reviewer): ${task.id}` : `PASSED (${task.inspector_model}): ${task.id}`);
-                this.emitEvent({ type: 'worker:output', taskId: task.id, line: mechanicalOnly ? `Mechanical gates passed; no model reviewed this diff` : `Quality Inspector (${task.inspector_model}): PASSED` });
+                this.log(mechanicalOnly ? `PASSED (mechanical gates only, no reviewer): ${task.id}` : `PASSED (${blind ? 'independent review' : 'inspector'} ${task.inspector_model}): ${task.id}`);
+                this.emitEvent({ type: 'worker:output', taskId: task.id, line: mechanicalOnly ? `Mechanical gates passed; no model reviewed this diff` : `${blind ? 'Independent reviewer' : 'Quality Inspector'} (${task.inspector_model}): PASSED` });
 
                 // Epiphany Hook: Extract generalized learnings from fixed bugs
                 if (!mechanicalOnly && task.error_history && task.error_history.length > 0) {
@@ -959,11 +1041,11 @@ export class Factory extends EventEmitter {
             await fs.appendFile(journalPath, JSON.stringify({
                 timestamp: new Date().toISOString(), task_id: task.id, attempt: task.attempts,
                 escalation_level: task.escalation_level || 0, model: task.model, provider: task.provider,
-                category, detail: String(detail).slice(0, 2000),
+                category, detail: redactSecrets(String(detail)).slice(0, 2000),
             }) + '\n');
         } catch { /* diagnostics must never fail a build */ }
         if (this.trainingCaptureEnabled) {
-            await this.trainingData.addFailureLesson({ task, category, detail: String(detail) });
+            await this.trainingData.addFailureLesson({ task, category, detail: redactSecrets(String(detail)) });
         }
     }
     async recordTaskAssignment(task: Task) {
@@ -1008,6 +1090,7 @@ export class Factory extends EventEmitter {
                 }));
                 if (replacements.length === 0 || replacements.length >= 8) throw new Error('planner returned an unusable replacement set');
                 this.validateAutoReplanScope(task, replacements);
+                this.annotateTasks(replacements);
                 this.state.tasks = this.state.tasks.filter(existing => existing.id !== task.id).concat(replacements);
                 await this.saveState();
                 this.emitEvent({ type: 'state:update', state: this.state });
@@ -1055,6 +1138,110 @@ export class Factory extends EventEmitter {
             if (changed) await this.saveState();
         } catch { /* missing or malformed event journal is non-fatal */ }
     }
+    /** Parses a persisted state and refuses one written by a newer softfactory. */
+    loadState(content: string): FactoryState {
+        const parsed = FactoryStateSchema.parse(JSON.parse(content));
+        if (parsed.schema_version > CURRENT_SCHEMA_VERSION) {
+            throw new Error(`.softfactory/factory.json was written by a newer softfactory (state schema ${parsed.schema_version}; this build reads ${CURRENT_SCHEMA_VERSION}). Upgrade softfactory before resuming.`);
+        }
+        if (parsed.schema_version < CURRENT_SCHEMA_VERSION) {
+            // 1 → 2: every added field has a default, so parsing is the migration.
+            this.log(`Migrating state schema ${parsed.schema_version} → ${CURRENT_SCHEMA_VERSION}`);
+            parsed.schema_version = CURRENT_SCHEMA_VERSION;
+        }
+        return parsed;
+    }
+
+    /** Marks protected tasks; every new or replaced task passes through here. */
+    annotateTasks(tasks: Task[]): Task[] {
+        for (const task of tasks) {
+            const hits = this.protectedPaths.touched([...task.files_hint, ...task.creates_files]);
+            if (hits.length > 0 && !task.protected) {
+                task.protected = true;
+                this.log(`PROTECTED: ${task.id} touches ${[...new Set(hits.map(h => h.file))].join(', ')}`);
+            }
+        }
+        return tasks;
+    }
+
+    /**
+     * New tasks from a blueprint: annotated, and each acceptance command run
+     * once against the base branch. Red is the expected result; a command
+     * that cannot run here at all could never gate a merge, so it rejects
+     * the plan now rather than passing silently later.
+     */
+    async prepareTasks(blueprintTasks: Array<Record<string, unknown>>): Promise<Task[]> {
+        const tasks = this.annotateTasks(blueprintTasks.map(t => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })));
+        const unrunnable: string[] = [];
+        for (const task of tasks) {
+            if (!task.verification_command || task.executor !== 'agent') continue;
+            const probe = await this.taskVerifier.runAcceptance(this.baseDir, task, { timeoutMs: 90000 });
+            const summary = probe.unrunnable
+                ? `unrunnable: ${probe.output.split('\n')[0].slice(0, 160)}`
+                : probe.passed ? 'already passing on the base branch' : `red (exit ${probe.exitCode})`;
+            task.acceptance_baseline = { exit_code: probe.exitCode, summary };
+            this.log(`Planning-time acceptance ${task.id}: ${task.verification_command} → ${summary}`);
+            if (probe.unrunnable) unrunnable.push(`${task.id}: ${task.verification_command} (${summary})`);
+        }
+        if (unrunnable.length > 0) {
+            throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
+        }
+        return tasks;
+    }
+
+    /** Hands an orchestrator or user task to a person and records that nothing automated will run it. */
+    async parkManualTask(task: Task) {
+        task.status = 'manual';
+        const who = task.executor === 'user' ? 'a decision for the product owner' : 'host or live-system work for the operator';
+        this.log(`MANUAL (${task.executor}): ${task.id} — ${task.title}: ${who}; no worker will run it.`);
+        this.log(`  ${task.description}`);
+        if (task.files_hint.length) this.log(`  files: ${task.files_hint.join(', ')}`);
+        if (task.acceptance_criteria.length) this.log(`  done when: ${task.acceptance_criteria.join('; ')}`);
+        if (task.verification.length) this.log(`  verify with: ${task.verification.join('; ')}`);
+        this.log(`  then: softfactory --mark-done ${task.id} "<what was done>" --resume`);
+        this.emitEvent({ type: 'task:manual', task });
+        this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Waiting on ${task.executor}: ${task.title}. Finish it, then --mark-done ${task.id} --resume` });
+        await this.recordTaskEvent({ event: 'task:manual', task_id: task.id, executor: task.executor });
+    }
+
+    /** Records that a person completed an orchestrator or user task. */
+    async markManualDone(taskId: string, note?: string) {
+        if (!this.state) throw new Error('No build state to update.');
+        const task = this.state.tasks.find(t => t.id === taskId);
+        if (!task) throw new Error(`No task ${taskId} in the current build.`);
+        if (task.executor === 'agent') throw new Error(`${taskId} is an agent task; a worker completes it, not --mark-done.`);
+        if (task.status === 'done') {
+            this.log(`${taskId} is already done.`);
+            return;
+        }
+        task.status = 'done';
+        task.last_feedback = note ? `Completed manually: ${note}` : 'Completed manually.';
+        if (this.state.status === 'paused') this.state.status = 'active';
+        await this.saveState();
+        await this.recordTaskEvent({ event: 'task:manual-done', task_id: taskId, executor: task.executor, note: note || '' });
+        this.log(`DONE (manual): ${taskId} — ${task.title}`);
+    }
+
+    filesInDiff(diff: string): string[] {
+        return [...new Set([...diff.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m => m[1].trim()))];
+    }
+
+    private async recurringFailureCategories(): Promise<string[]> {
+        const recurring = recurringFailures(await readRecentMetrics(this.baseDir));
+        if (recurring.length) this.log(`ESCALATION: ${recurring.join(', ')} recurred in 2 of the last 3 runs; the planner must change its approach for them.`);
+        return recurring;
+    }
+
+    private async writeRunMetrics() {
+        try {
+            const metrics = await computeRunMetrics(this.baseDir, this.state);
+            await appendRunMetrics(this.baseDir, metrics);
+            this.log(`Metrics: ${metrics.done}/${metrics.tasks} done, first-attempt rate ${metrics.first_attempt_rate}, rejections ${JSON.stringify(metrics.rejected_by_category)}`);
+        } catch (e: any) {
+            this.log(`Metrics not written: ${e.message}`);
+        }
+    }
+
     generateFeatureId() {
         const now = new Date();
         const ts = now.toISOString().replace(/[^0-9]/g, '').slice(0, 14);

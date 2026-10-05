@@ -48,6 +48,8 @@ export class WorkerRegistry {
    * had to author a new config to the smallest model, repeatedly.
    */
   isLightTask(task: Task): boolean {
+    // Protected code never goes to the smallest model, whatever its shape.
+    if (task.protected) return false;
     const touched = new Set([...(task.files_hint || []), ...(task.creates_files || [])]);
     if (touched.size > 2) return false;
     if ((task.description?.length || 0) > 600) return false;
@@ -57,6 +59,7 @@ export class WorkerRegistry {
 
   /** Tasks that are too broad or ambiguous for a first-pass small local model. */
   shouldPreferCloud(task: Task): boolean {
+    if (task.protected) return true;
     const files = new Set([...(task.files_hint || []), ...(task.creates_files || [])]);
     return files.size > 2 || (task.acceptance_criteria?.length || 0) > 3 ||
       (task.agent_role === 'test_writer' && files.size > 1) ||
@@ -83,8 +86,8 @@ export class WorkerRegistry {
       return this.localModel;
     }
 
-    // On retries, always escalate to the heavy local model (14B)
-    if (isRetry) {
+    // On retries, and for protected code, always the heavy local model (14B)
+    if (isRetry || task.protected) {
       return this.heavyLocalModel;
     }
 

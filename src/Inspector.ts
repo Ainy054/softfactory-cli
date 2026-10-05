@@ -84,6 +84,70 @@ CRITICAL: Return ONLY a valid JSON object:
     }
   }
 
+  /**
+   * Review for protected code. The reviewer sees the diff, the task's own
+   * acceptance criteria, the verification output and the worker's answers to
+   * the review questions. It never sees the worker's summary, so it verifies
+   * instead of being told. Softhouse measured this as its single most
+   * valuable gate: every failure it raised was a real defect that had
+   * compiled and passed the worker's tests.
+   */
+  async inspectBlind(task: Task, diff: string, verifierOutput: string, reviewAnswers: string[] = []): Promise<InspectionResult> {
+    const questions = task.review_questions || [];
+    const qa = questions.length
+      ? questions.map((q, i) => `Q${i + 1}: ${q}\nWorker's answer: ${reviewAnswers[i] || '(no answer given — treat as unverified)'}`).join('\n\n')
+      : '(none declared; apply the standing questions below)';
+    const prompt = `
+You are an INDEPENDENT reviewer for a change to protected code: authentication, authorization, tenancy, money, cryptography, secrets, or any path this project marked protected.
+You see only the diff, the task's acceptance criteria, the verification output, and the worker's answers to the review questions. You have NOT seen the worker's own account of the work and must not assume good intent. Code that compiles and passes the worker's tests can still be wrong.
+
+Task: ${task.title}
+Description: ${task.description}
+Acceptance Criteria: ${task.acceptance_criteria.join('; ') || '(none declared)'}
+
+Review questions and the worker's answers:
+${qa}
+
+Standing questions for every protected change:
+- Which route, caller or event reaches this code, with which authentication, and which test proves it?
+- Where is the tenant or principal checked before every read and write, and what happens when it is absent?
+- Does any path fail open (an empty list, a missing claim, an error swallowed) where it must fail closed?
+- Is any money or quantity computed here? Re-derive it yourself from the diff; do not read the worker's figure.
+- Could a secret, token or card number reach a log, an event, or a response?
+
+Method: verify each worker answer at the cited file and line in the diff BEFORE anything else; an answer that does not match the diff is a FAIL. Then trace every path the standing questions name. End your feedback with "Checked:" and the list of what you examined, even when you found nothing.
+
+Verification output:
+${verifierOutput || '(none)'}
+
+Diff:
+${diff}
+
+CRITICAL: Return ONLY a valid JSON object:
+{
+  "verdict": "PASS" | "FAIL",
+  "feedback": "findings first (severity, location, what is wrong, the fix), then Checked: ..."
+}
+`;
+    let raw: string;
+    try {
+      raw = await this.textModel.complete(prompt, { timeoutMs: 240000, json: true });
+    } catch (error: any) {
+      throw new WorkerEnvironmentError(`Independent reviewer (${this.provider}/${this.model}) is unavailable: ${error?.message || 'inference failed'}. No protected diff was reviewed, so nothing was merged.`);
+    }
+    try {
+      const parsed = extractJson(raw);
+      return {
+        verdict: parsed.verdict?.toUpperCase() === 'PASS' ? 'PASS' : 'FAIL',
+        feedback: parsed.feedback || 'No feedback provided.',
+        provider: this.provider,
+        model: this.model,
+      };
+    } catch {
+      return { verdict: 'FAIL', feedback: `Independent reviewer returned unreadable output. Raw: ${raw.slice(0, 300)}`, provider: this.provider, model: this.model };
+    }
+  }
+
   async synthesizeEpiphany(task: Task, diff: string): Promise<Epiphany | null> {
     const prompt = `Extract one specific, reusable project lesson from this successfully repaired task. Return only JSON: {"should_save":boolean,"lesson":string,"tags":string[],"scope":"project"|"language"|"path","confidence":number}. Reject generic advice.\nTask: ${task.description}\nFailures: ${(task.error_history || []).join('\n')}\nFinal diff: ${diff.slice(0, 6000)}`;
     try {

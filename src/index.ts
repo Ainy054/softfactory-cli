@@ -8,10 +8,11 @@ import { startFactoryRun } from './runMode.js';
 const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
-  '--planner-provider', '--planner-model'
+  '--planner-provider', '--planner-model', '--mark-done'
 ];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek] [--planner-provider=openai|agy|local|deepseek] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--history] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -103,6 +104,7 @@ async function main() {
   const refineMode = args.includes('--refine');
   const planMode = args.includes('--plan');
   const noDocker = args.includes('--no-docker');
+  const markDoneId = getFlagValue(args, '--mark-done');
 
   let resumeFeatureId: string | undefined;
   if (resumeMode) {
@@ -114,15 +116,15 @@ async function main() {
   }
 
   // Filter out flag values from requirement
-  const requirement = args.filter((a, idx) => {
+  let requirement = args.filter((a, idx) => {
     if (KNOWN_FLAGS.some(f => a === f || a.startsWith(`${f}=`))) return false;
     const prev = args[idx - 1];
-    if (prev && ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model'].includes(prev)) return false;
+    if (prev && VALUE_FLAGS.includes(prev)) return false;
     if (a === resumeFeatureId) return false;
     return true;
   }).join(' ');
 
-  if (!resumeMode && !requirement) {
+  if (!resumeMode && !markDoneId && !requirement) {
     console.error(USAGE);
     process.exit(1);
   }
@@ -152,6 +154,16 @@ async function main() {
   });
   globalFactory = factory;
   await factory.init();
+
+  if (markDoneId) {
+    // The text after the flag is the operator's note, not a requirement.
+    await factory.markManualDone(markDoneId, requirement || undefined);
+    requirement = '';
+    if (!resumeMode) {
+      console.log(`[SoftFactory] Recorded ${markDoneId} as done. Run --resume to continue the build.`);
+      process.exit(0);
+    }
+  }
 
   if (noTui) {
     await startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode });

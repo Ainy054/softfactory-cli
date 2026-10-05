@@ -84,21 +84,23 @@ describe('WorktreeManager', () => {
     await manager.cleanup('T003', 'line/T003');
   });
 
-  it('should hydrate untracked config and env files into the worktree', async () => {
-    // Create an untracked config.yaml in the root repo
+  it('hydrates untracked config, but never the real .env; the example stands in for it', async () => {
     await fs.writeFile(path.join(tmpDir, 'config.yaml'), 'database:\n  host: localhost\n');
     await fs.writeFile(path.join(tmpDir, '.env'), 'APP_SECRET=12345\n');
+    await fs.writeFile(path.join(tmpDir, '.env.example'), 'APP_SECRET=\n');
 
     const worktreePath = await manager.create('T004', 'line/T004');
 
-    // Check that config.yaml and .env were copied to the worktree
     const configContent = await fs.readFile(path.join(worktreePath, 'config.yaml'), 'utf-8');
     assert.equal(configContent, 'database:\n  host: localhost\n');
 
+    // The user's credentials used to be copied within reach of every worker
+    // command. The worker gets the shape of the environment, not its values.
     const envContent = await fs.readFile(path.join(worktreePath, '.env'), 'utf-8');
-    assert.equal(envContent, 'APP_SECRET=12345\n');
+    assert.equal(envContent, 'APP_SECRET=\n', 'the worktree .env must come from .env.example');
 
     await manager.cleanup('T004', 'line/T004');
+    await fs.rm(path.join(tmpDir, '.env.example'));
   });
 
   it('should preserve unrelated untracked files when merging', async () => {

@@ -5,6 +5,7 @@ import { execa } from 'execa';
 import { z } from 'zod';
 import { extractJson } from './extractJson.js';
 import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, type ITextModel } from './TextModel.js';
+import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
 export type PlannerProvider = 'openai' | 'agy' | 'local' | 'deepseek';
@@ -27,6 +28,8 @@ const BlueprintTaskSchema = z.object({
   verification_command: z.string().optional(),
   complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
   allocation_reason: z.string().optional(),
+  executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  review_questions: z.array(z.string()).default([]),
 });
 
 export const BlueprintSchema = z.object({
@@ -45,6 +48,8 @@ export interface PlanningInput {
   repositoryFiles: Set<string>;
   /** Who will execute these tasks. A 7B/14B needs far smaller units than a frontier model. */
   workerCapability?: 'local' | 'cloud';
+  /** Failure categories seen in 2 of the last 3 runs; the plan must change its approach for them. */
+  recurringFailures?: string[];
 }
 
 export interface RefinementInput {
@@ -75,8 +80,10 @@ export const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'review_questions'],
         properties: {
+          executor: { type: 'string', enum: ['agent', 'orchestrator', 'user'] },
+          review_questions: { type: 'array', items: { type: 'string' } },
           id: { type: 'string' },
           title: { type: 'string' },
           description: { type: 'string' },
@@ -119,13 +126,24 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - For every test_writer task, declare test_targets and production_targets. If the criterion requires behavior that is not already present, add a dependency on the implementation task first.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
-- Do not add DevOps work unless the requirement or repository evidence calls for it.`;
+- Do not add DevOps work unless the requirement or repository evidence calls for it.
+- executor routes WHO performs a task, and it is a safety boundary. "agent" (the default) is repository-contained work a worker can verify inside its worktree. "orchestrator" is anything that touches the host or a live system: secret values and .env contents, crontab, host config, deploys, container restarts, git push, migrations against a live database. "user" is a decision only the product owner can make. Workers never receive orchestrator or user tasks, so never fold such work into an agent task; split it out.
+- verification_command is ONE command the orchestrator executes verbatim in the task's worktree as the merge gate. No shell operators (no &&, ;, redirects, cd). The executable must be one of npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another read-only tool. npx is not allowed: write "npm test -- --run src/x.test.ts", not "npx vitest run src/x.test.ts". Choose the narrowest command that proves the acceptance criteria.
+- review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
+
+function escalationBlock(recurring?: string[]): string {
+  if (!recurring?.length) return '';
+  return `
+ESCALATION — these failure categories recurred in 2 of the last 3 runs: ${recurring.join(', ')}.
+Change the approach for tasks prone to them (smaller scope, exact file lists, explicit prohibitions, tests before implementation) and state what changed in each affected task's allocation_reason. A stronger model alone is not a change.
+`;
+}
 
 function buildPlanningPrompt(input: PlanningInput): string {
   return `You are the SoftFactory Blueprint Architect. Produce a repository-grounded implementation plan, not code.
 
 ${PLANNING_RULES(input.workerCapability)}
-
+${escalationBlock(input.recurringFailures)}
 Repository Context:
 ${input.codebaseContext}
 
@@ -195,7 +213,9 @@ Return ONLY a JSON object with exactly these keys:
       "behavior_tags": ["keyboard"],
       "verification_command": "npm test -- path/to/test-file.test.ts",
       "complexity": "simple",
-      "allocation_reason": "single-file bounded change"
+      "allocation_reason": "single-file bounded change",
+      "executor": "agent" | "orchestrator" | "user",
+      "review_questions": []
     }
   ]
 }
@@ -360,6 +380,16 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     for (const check of task.verification) {
       if (/\bvitest\s+list\b/.test(check)) errors.push(`${task.id} uses unsupported Vitest command "vitest list"; use "vitest run --reporter=json" instead`);
       if (/\bvitest\b.*\s--repeat(?:=|\s)/.test(check)) errors.push(`${task.id} uses unsupported Vitest option --repeat; run the deterministic command twice explicitly`);
+    }
+    // The acceptance command is executed verbatim under the command policy.
+    // A command the policy refuses could never gate a merge, so it is a
+    // planning error here rather than a silent pass later.
+    if (task.verification_command?.trim()) {
+      const violation = commandPolicyViolation(task.verification_command.trim());
+      if (violation) errors.push(`${task.id} verification_command cannot run under the command policy (${violation}); use one allowlisted command with no shell operators`);
+    }
+    if (task.executor !== 'agent' && task.agent_role === 'test_writer') {
+      errors.push(`${task.id} is a test_writer task but routed to ${task.executor}; tests are agent work`);
     }
     const created = new Set(task.creates_files);
     for (const file of [...task.files_hint, ...task.creates_files]) {

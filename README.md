@@ -92,9 +92,21 @@ softfactory --resume
 | `DEEPSEEK_API_KEY` | API key for DeepSeek cloud workers/planner | Not set |
 | `SOFTFACTORY_TRAINING_CAPTURE=0` | Opt out of sanitized verified candidates and failure lessons in `.softfactory/training-*.jsonl` | Enabled |
 | `--plan` | Generate and save plan without immediate execution | `false` |
-| `--resume` | Resume active or planned feature build | `false` |
+| `--resume` | Resume active, planned, or paused feature build | `false` |
 | `--refine` | Modify an in-progress plan mid-flight | `false` |
+| `--mark-done <task-id> ["note"]` | Record that a person completed an `orchestrator` or `user` task; combine with `--resume` to continue | — |
 | `--history` | View history of completed features | `false` |
+
+---
+
+## Safety and evidence (4.0)
+
+- **Executor routing.** Every task carries `executor`: `agent` (the default) runs in a worktree worker; `orchestrator` is host or live-system work (secret values, deploys, host config, pushes); `user` is a product decision. Workers never receive the last two. The run prints what is needed, pauses with status `paused`, and continues after `softfactory --mark-done <id> "note" --resume`.
+- **Executed acceptance.** A task's `verification_command` is run verbatim in its worktree under the command policy (one allowlisted executable, no shell operators) and logged to `.softfactory/evidence/<feature>/<task>-attempt<N>.log`, ending in `RESULT: PASS` or `RESULT: FAIL`. No PASS, no merge. Each command is also run once at planning time; one that cannot run at all rejects the plan.
+- **Protected paths.** Globs in `.softfactory/protected-paths.txt` (one per line, `**` crosses directories) mark tasks as protected: they never run on the light local tier, and their diffs get an independent review on the frontier model that sees the diff, the acceptance criteria, the verification output and the worker's `review_answers`, never the worker's own summary. A diff that touches a protected path is reviewed that way even if the plan did not list it.
+- **Per-run metrics.** One JSON line per finished run in `.softfactory/metrics.jsonl`. A failure category seen in two of the last three runs is passed to the planner as an escalation it must answer.
+- **Secrets.** Real `.env` files are no longer copied into worktrees (`.env.example` is). Credential files are never committed, and lessons, journals and training records are redacted before they are written.
+- **State schema.** `factory.json` carries `schema_version`; a state written by a newer softfactory is refused rather than misread.
 
 ---
 

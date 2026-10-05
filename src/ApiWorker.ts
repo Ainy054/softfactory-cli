@@ -32,6 +32,8 @@ Description: ${task.description}
 Files hint: ${task.files_hint.join(', ')}
 Acceptance criteria: ${task.acceptance_criteria.join('; ')}
 Verification: ${task.verification.join('; ')}
+${task.verification_command ? `Acceptance command (run verbatim by the orchestrator after you finish; make it pass): ${task.verification_command}` : ''}
+${task.review_questions?.length ? `Review questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : ''}
 ${task.last_feedback ? `Previous feedback: ${task.last_feedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 
@@ -39,7 +41,7 @@ For every changed file return exactly:
 <<<FILE:relative/path>>>
 full contents
 <<<END_FILE>>>
-Do not use absolute paths or ../. Also return .softfactory/handoff.json with task_id "${task.id}", status, files_changed, and summary.`;
+Do not use absolute paths or ../. Also return .softfactory/handoff.json with task_id "${task.id}", status, files_changed, summary and, if there were review questions, review_answers.`;
     const response = await this.request(prompt, model);
     const files = await this.writeFiles(worktreePath, response, options.onOutput);
 
