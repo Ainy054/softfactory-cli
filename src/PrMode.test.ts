@@ -175,6 +175,28 @@ describe('PR mode merges into an integration branch and opens the pull request',
     }
   });
 
+  it('a resume with nothing left re-runs the final gate and still marks the pull request ready', async () => {
+    const { dir } = await repository();
+    const { factory } = await factoryOn(dir, scriptedTransport(happyTurns()));
+    const { github, calls } = fakeGitHub(dir, { number: 42, url: 'https://github.com/o/r/pull/42', isDraft: true });
+    factory.github = github;
+    try {
+      await factory.build('add a farewell function');
+      const before = calls.length;
+      // A later invocation: fresh process, state read from disk, as a failed final gate would have left it.
+      const again: any = new Factory(dir, '', { strategy: 'local', sandbox: 'none', useDocker: false, plannerProvider: 'local', prMode: true });
+      await again.init();
+      again.github = github;
+      again.state.status = 'failed';
+      await again.resume();
+      assert.equal(again.state.status, 'completed');
+      const later = calls.slice(before).map(c => `${c.file} ${c.args.slice(0, 2).join(' ')}`);
+      assert.ok(later.includes('gh pr ready'), later.join(' | '));
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('finishes the run and names the local branch when gh is not available', async () => {
     const { dir, git } = await repository();
     const { factory, logs } = await factoryOn(dir, scriptedTransport(happyTurns()));

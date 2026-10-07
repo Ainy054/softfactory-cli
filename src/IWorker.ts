@@ -14,6 +14,20 @@ export interface WorkerOptions {
   signal?: AbortSignal;
   /** Token counts per model turn, when the backend reports them. */
   onUsage?: (usage: { inputTokens: number; outputTokens: number }) => void;
+  /**
+   * The user's requirement, verbatim. The planner's task description is a
+   * paraphrase; the first dogfood run lost the sample data the requirement
+   * carried, and the worker went searching the repository for it.
+   */
+  requirement?: string;
+}
+
+/** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */
+export function requirementSection(requirement: string | undefined, limit = 6000): string {
+  const text = requirement?.trim();
+  if (!text) return '';
+  const shown = text.length > limit ? `${text.slice(0, limit)}\n…(truncated; the task description above carries the rest)` : text;
+  return `\nFEATURE REQUIREMENT (verbatim from the user; this task is one part of it, and any sample data, formats or exact names in it are authoritative):\n${shown}\n`;
 }
 
 export interface IWorker {

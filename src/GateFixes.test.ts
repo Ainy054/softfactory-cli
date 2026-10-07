@@ -67,7 +67,7 @@ describe('the test runner is given only flags it understands', () => {
   it('passes --run to vitest only', () => {
     assert.deepEqual(v.testRunnerArgs('vitest', false, ['a.test.ts']).args, ['test', '--', '--run', 'a.test.ts']);
     assert.deepEqual(v.testRunnerArgs('jest', false, ['a.test.ts']).args, ['test', '--', 'a.test.ts']);
-    assert.deepEqual(v.testRunnerArgs('node --test', false, ['src']).args, ['test', '--', 'src']);
+    assert.deepEqual(v.testRunnerArgs('node --test', false, ['src']), { binary: 'npm', args: ['test'] }, 'a directory scope means the script\'s own suite');
   });
 
   it('prefers the local vitest binary when it is installed', () => {

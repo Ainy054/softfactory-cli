@@ -77,8 +77,16 @@ export function assertAllowedCommandSegment(command: string, scope?: CommandScop
   if (/^(?:npm|pnpm|yarn)\s+(?:install|i|add|ci)\b/.test(command) && !/--ignore-scripts\b/.test(command)) {
     throw new Error('Package installation must pass --ignore-scripts.');
   }
-  if (executable === 'node' && /(^|\s)(?:-r|--require|--import|--loader|--experimental-loader)(?:=|\s)/.test(command)) {
-    throw new Error('node preload flags are not permitted.');
+  // Preload flags may name a package (`--import tsx`, `-r ts-node/register`):
+  // that is how Node projects run TypeScript tests, including this one. A
+  // file there (`-r ./evil.js`) is still refused; a path argument elsewhere is
+  // already confined to the worktree below.
+  if (executable === 'node') {
+    for (const [, specifier] of command.matchAll(/(?:^|\s)(?:-r|--require|--import|--loader|--experimental-loader)(?:=|\s+)(\S*)/g)) {
+      if (!/^(?:@[\w.-]+\/)?[\w-][\w.-]*(?:\/[\w.-]+)*$/.test(specifier) || specifier.startsWith('.')) {
+        throw new Error('node preload flags may name an installed package, not a file.');
+      }
+    }
   }
   assertPathArgumentsInside(command, scope);
 }

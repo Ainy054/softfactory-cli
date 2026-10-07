@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection } from './IWorker.js';
 
 /** Runs the authenticated Codex CLI directly inside the isolated worktree. */
 export class CodexWorker implements IWorker {
@@ -32,6 +32,7 @@ ${task.verification_command ? `Acceptance command (run verbatim by the orchestra
 ${task.review_questions?.length ? `Review questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : ''}
 ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
+${requirementSection(options.requirement)}
 Before finishing, write ${handoffPath} as JSON with task_id, status, files_changed, summary and, if there were review questions, review_answers.`;
     options.onOutput?.(`[Codex Worker] Starting ${task.id}${model ? ` with ${model}` : ' with the configured Codex default model'}`);
     const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath, options.signal));

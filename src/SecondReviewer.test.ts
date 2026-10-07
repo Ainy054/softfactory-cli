@@ -54,6 +54,15 @@ describe('--second-reviewer is parsed and required at preflight', () => {
     assert.equal(factory.secondInspector.model, 'claude-sonnet-4');
   });
 
+  it('accepts every text-model provider, not a stale subset (the first dogfood run died on qwen/…)', () => {
+    process.env.SOFTFACTORY_COMPAT_BASE_URL ||= 'https://x/v1';
+    for (const [provider, model] of [['qwen', 'qwen3-coder-plus'], ['openai-compat', 'kimi-k2.7-code-highspeed'], ['claude-code', 'sonnet'], ['muse', 'default'], ['gemini-cli', 'gemini-2.5-pro'], ['local', 'qwen2.5-coder:7b']]) {
+      const factory: any = new Factory('/tmp', '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', secondReviewer: `${provider}/${model}` });
+      assert.equal(factory.secondInspector.provider, provider);
+      assert.equal(factory.secondInspector.model, model);
+    }
+  });
+
   it('rejects a value that is not provider/model', () => {
     assert.throws(() => new Factory('/tmp', '', { secondReviewer: 'claude-sonnet-4' }), /provider\/model/);
     assert.throws(() => new Factory('/tmp', '', { secondReviewer: 'gemini/x' }), /provider one of/);

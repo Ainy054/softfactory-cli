@@ -25,7 +25,8 @@ export interface ITextModel {
   complete(prompt: string, options?: CompletionOptions): Promise<string>;
 }
 
-export type TextModelProvider = 'local' | 'agy' | 'openai' | 'openai-api' | 'anthropic' | 'deepseek' | 'qwen' | 'openai-compat' | 'claude-code' | 'gemini-cli' | 'muse';
+export const TEXT_MODEL_PROVIDERS = ['local', 'agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'qwen', 'openai-compat', 'claude-code', 'gemini-cli', 'muse'] as const;
+export type TextModelProvider = typeof TEXT_MODEL_PROVIDERS[number];
 
 /**
  * Whether a model listing covers a model id. Listings are advisory: DeepSeek

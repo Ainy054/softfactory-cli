@@ -129,6 +129,9 @@ describe('end to end: a requirement becomes a merged, evidenced commit', () => {
       const firstTurn = transport.requests.find(r => r.messages[0].role === 'system')!;
       const userPrompt = firstTurn.messages[1].content;
       assert.match(userPrompt, /ACCEPTANCE COMMAND .*grep farewell app\.ts/);
+      assert.match(userPrompt, /Acceptance criteria:\n- app\.ts exports farewell/, 'the criteria reach the worker, not only the planner');
+      assert.match(userPrompt, /FEATURE REQUIREMENT[\s\S]*add a farewell function/, 'the requirement reaches the worker verbatim');
+      assert.equal(factory.state.requirement, 'add a farewell function', 'and is kept in state for resumes');
       assert.equal(transport.requests[0].tools.length, 1);
 
       // Cleanup: no worktree, no line branch, state and metrics on disk.

@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -226,6 +226,7 @@ ${task.review_questions?.length ? `Review questions (an independent reviewer ver
 ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 ${options.projectContext ? `Project context:\n${options.projectContext}` : ''}
+${requirementSection(options.requirement)}
 Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status ("success" or "failure"), files_changed (relative paths), summary and, if there were review questions, review_answers.`;
   }
 

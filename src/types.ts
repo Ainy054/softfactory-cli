@@ -59,6 +59,8 @@ export const FactoryStateSchema = z.object({
   schema_version: z.number().int().positive().default(1),
   feature_id: z.string().default(''),
   feature: z.string(),
+  /** The user's requirement, verbatim, so every attempt (and every resume) can hand it to the worker. */
+  requirement: z.string().default(''),
   status: z.enum(['planning', 'planned', 'active', 'paused', 'completed', 'failed']),
   strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
   cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'qwen', 'openai-compat', 'claude-code', 'gemini-cli', 'muse']).default('agy'),
