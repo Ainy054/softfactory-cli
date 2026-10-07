@@ -22,6 +22,18 @@ export interface WorkerOptions {
   requirement?: string;
 }
 
+/**
+ * A backend that refused to work for reasons outside the task: a spent usage
+ * limit, a rate limit, a billing stop. Codex answered "You've hit your usage
+ * limit" four times in a row and each one was charged to the task as a crash.
+ * Returns the line that says so, or null.
+ */
+export function backendRefusal(text: string): string | null {
+  const pattern = /usage limit|rate[ _-]?limit|too many requests|(?:status|http|code|error)\D{0,12}\b(?:429|529)\b|insufficient[ _]quota|quota (?:exceeded|exhausted)|out of credits|purchase more credits|billing (?:hard )?limit|overloaded_error/i;
+  const line = String(text || '').split('\n').find(l => pattern.test(l));
+  return line ? line.trim().slice(0, 200) : null;
+}
+
 /** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */
 export function requirementSection(requirement: string | undefined, limit = 6000): string {
   const text = requirement?.trim();

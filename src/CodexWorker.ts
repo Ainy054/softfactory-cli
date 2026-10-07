@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, requirementSection } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, backendRefusal, requirementSection } from './IWorker.js';
 
 /** Runs the authenticated Codex CLI directly inside the isolated worktree. */
 export class CodexWorker implements IWorker {
@@ -37,7 +37,16 @@ Before finishing, write ${handoffPath} as JSON with task_id, status, files_chang
     options.onOutput?.(`[Codex Worker] Starting ${task.id}${model ? ` with ${model}` : ' with the configured Codex default model'}`);
     const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath, options.signal));
     if (options.onOutput) proc.all?.on('data', chunk => options.onOutput?.(chunk.toString().trim()));
-    await proc;
+    try {
+      await proc;
+    } catch (error: any) {
+      const said = String(error?.all || `${error?.stdout || ''}\n${error?.stderr || ''}`);
+      const refusal = backendRefusal(said);
+      if (refusal) throw new WorkerEnvironmentError(`Codex refused to work: ${refusal}. No task retry was consumed; wait for the limit to reset or switch --cloud-provider.`);
+      const auth = said.split('\n').find(l => /not logged in|login required|unauthori[sz]ed|\b401\b|invalid api key/i.test(l));
+      if (auth) throw new WorkerEnvironmentError(`Codex could not authenticate: ${auth.trim().slice(0, 200)}. No task retry was consumed.`);
+      throw error;
+    }
     try { return HandoffSchema.parse(JSON.parse(await fs.readFile(handoffPath, 'utf8'))); }
     catch { return { task_id: task.id, status: 'success', files_changed: task.files_hint, summary: `Completed with Codex/${model || 'default'}` }; }
   }

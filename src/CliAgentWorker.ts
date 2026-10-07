@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -255,6 +255,8 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
     // environment's fault, not the task's, wherever the agent said so.
     if (parsed.isError || result.exitCode !== 0) {
       const said = `${parsed.text}\n${result.stderr}`;
+      const refusal = backendRefusal(said);
+      if (refusal) throw new WorkerEnvironmentError(`${this.definition.name} refused to work: ${refusal}. No task retry was consumed; wait for the limit to reset or switch --cloud-provider.`);
       const match = said.match(this.definition.authFailure);
       if (match) {
         const line = said.split('\n').find(l => this.definition.authFailure.test(l)) || match[0];

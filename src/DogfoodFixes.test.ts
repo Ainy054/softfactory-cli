@@ -223,3 +223,28 @@ describe('the final gate reads tallies, not only its heuristic', () => {
     assert.equal(factory.wasAlreadyFailing({ testSummary: 'npm test failure', output: 'TAP version 13\n# tests 2\n# pass 0\n# fail 2\nError [TransformError]: esbuild' }), false, 'a suite that cannot start');
   });
 });
+
+describe('a backend that refuses to work is the environment, not the task', () => {
+  it('recognises usage and rate limits, and nothing else', async () => {
+    const { backendRefusal } = await import('./IWorker.js');
+    assert.equal(backendRefusal("OpenAI Codex v0.153.4\nERROR: You've hit your usage limit. Upgrade to Pro or try again at 6:12 PM."), "ERROR: You've hit your usage limit. Upgrade to Pro or try again at 6:12 PM.");
+    assert.ok(backendRefusal('{"error":{"type":"rate_limit_error","message":"Too many requests"}}'));
+    assert.ok(backendRefusal('HTTP 429 from api.example'));
+    assert.equal(backendRefusal('TypeError: x is not a function\n    at run (file.ts:1:1)'), null);
+    assert.equal(backendRefusal('Tests failed: 3 of 429 assertions'), null, 'a number inside a word is not a status');
+  });
+
+  it('turns a Codex usage-limit exit into an environment fault that consumes no retry', async () => {
+    const { CodexWorker } = await import('./CodexWorker.js');
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-fake-codex-'));
+    await fs.writeFile(path.join(bin, 'codex'), "#!/bin/sh\necho 'OpenAI Codex v0.153.4'\necho \"ERROR: You've hit your usage limit. Upgrade to Pro, or try again at 6:12 PM.\" >&2\nexit 1\n", { mode: 0o755 });
+    const previous = process.env.PATH;
+    process.env.PATH = `${bin}:${previous}`;
+    try {
+      const dir = await worktree(0);
+      await assert.rejects(new CodexWorker('').execute(task, dir, {}), (error: any) => error.isEnvironmentFailure === true && /refused to work: ERROR: You've hit your usage limit/.test(error.message));
+    } finally {
+      process.env.PATH = previous;
+    }
+  });
+});

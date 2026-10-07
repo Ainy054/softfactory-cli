@@ -896,9 +896,9 @@ export class Factory extends EventEmitter {
             task.model = model;
             task.provider = provider;
             if (escalated) {
-                this.log(`ESCALATION: ${task.id} escalated to ${model} (Iteration ${task.attempts + 1})`);
+                this.log(`ESCALATION: ${task.id} escalated to ${model || 'the provider\'s configured default'} (Iteration ${task.attempts + 1})`);
             } else {
-                this.log(`Worker: ${model}`);
+                this.log(`Worker: ${model || 'the provider\'s configured default'}`);
             }
             this.log(`Workshop: Running ${task.id} - ${task.title}`);
             task.status = 'active';
@@ -1153,7 +1153,7 @@ export class Factory extends EventEmitter {
                     this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Synthesizing Epiphany from ${task.error_history.length} failures...` });
                     try {
                         const epiphany = await this.inspector.synthesizeEpiphany(task, diff);
-                        if (epiphany?.should_save && await this.lessons.add({ lesson: epiphany.lesson, tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
+                        if (epiphany?.should_save && await this.lessons.add({ lesson: String(epiphany.lesson).slice(0, 500), tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
                             this.state.memory_patterns = this.state.memory_patterns || [];
                             this.state.memory_patterns.push(epiphany.lesson);
                             this.addRunNote(task.id, epiphany.lesson);
