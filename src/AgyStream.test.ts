@@ -240,4 +240,35 @@ describe('AgyStreamRelay', () => {
     assert.equal(textLines.length, 1, `expected one agent_response line, got ${JSON.stringify(lines)}`);
     assert.ok(lines.includes('[agy] result SUCCESS (1 turns, 11878 in / 26 out)'), `missing result line in ${JSON.stringify(lines)}`);
   });
+
+  it('invokes onUsage once when the result carries token usage', () => {
+    const usages: Array<{ inputTokens: number; outputTokens: number }> = [];
+    const relay = new AgyStreamRelay(() => {}, (u) => usages.push(u));
+    // Step events with usage do not trigger onUsage
+    relay.push(STEP_DONE_LINE);
+    assert.equal(usages.length, 0);
+
+    // Result event with usage triggers onUsage once
+    relay.push(RESULT_LINE);
+    assert.deepEqual(usages, [{ inputTokens: 11878, outputTokens: 26 }]);
+
+    // Further result events do not trigger onUsage again
+    relay.push(RESULT_LINE);
+    assert.equal(usages.length, 1);
+  });
+
+  it('does not invoke onUsage when result has no token usage', () => {
+    const usages: Array<{ inputTokens: number; outputTokens: number }> = [];
+    const relay = new AgyStreamRelay(() => {}, (u) => usages.push(u));
+    const noUsageResult = JSON.stringify({
+      event: 'result',
+      result: {
+        conversation_id: CONVERSATION_ID,
+        status: 'SUCCESS',
+        response: 'done',
+      },
+    });
+    relay.push(noUsageResult);
+    assert.equal(usages.length, 0);
+  });
 });
