@@ -1,8 +1,76 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { LocalAgentWorker } from './ToolLoopWorker.js';
+import { runSafeCommand, selectHostShell } from './commandPolicy.js';
+import type { CommandRunner } from './Sandbox.js';
 
 const guard = (c: string) => (new LocalAgentWorker() as any).assertAllowedCommand(c);
+
+describe('host experiment shell selection', () => {
+  it('selects a shell that exists on this machine', () => {
+    assert.ok(existsSync(selectHostShell().shell));
+  });
+
+  it('prefers an existing configured shell and uses the appropriate flag', () => {
+    for (const [shell, flag] of [['/custom/zsh', '-lc'], ['/custom/bash', '-lc'],
+                                 ['/bin/sh', '-c'], ['/custom/fish', '-c']]) {
+      assert.deepEqual(selectHostShell({ SHELL: shell }, () => true), { shell, flag });
+    }
+  });
+
+  it('falls back in order for missing, empty, or nonexistent SHELL', () => {
+    const candidates = ['/bin/zsh', '/bin/bash', '/bin/sh'];
+    for (const configured of [undefined, '', '/missing/shell']) {
+      for (let index = 0; index < candidates.length; index++) {
+        const existing = candidates.slice(index);
+        assert.deepEqual(selectHostShell({ SHELL: configured }, file => existing.includes(file)), {
+          shell: candidates[index], flag: index < 2 ? '-lc' : '-c',
+        });
+      }
+    }
+  });
+
+  it('reports clearly when no shell exists', () => {
+    assert.throws(() => selectHostShell({ SHELL: '/missing/shell' }, () => false), /No host shell found/);
+  });
+
+  it('uses shell selection only for host overrides and keeps Docker sh -c', async () => {
+    const previous = process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING;
+    const previousShell = process.env.SHELL;
+    const calls: Array<[string, string[]]> = [];
+    const runner = (kind: CommandRunner['kind']): CommandRunner => ({
+      kind, describe: () => 'recording runner',
+      exec: async (file, args) => {
+        calls.push([file, args]);
+        return { stdout: '', stderr: '', exitCode: 0 };
+      },
+    });
+    try {
+      process.env.SHELL = '/missing/shell';
+      process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING = '1';
+      const command = 'printf first && printf second';
+      const { shell, flag } = selectHostShell();
+      await runSafeCommand(command, process.cwd(), 30000, { runner: runner('host') });
+      await runSafeCommand(command, process.cwd(), 30000, { runner: runner('docker') });
+      assert.deepEqual(calls, [[shell, [flag, command]], ['sh', ['-c', command]]]);
+
+      delete process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING;
+      calls.length = 0;
+      for (const kind of ['host', 'docker'] as const) {
+        await runSafeCommand('pwd', process.cwd(), 30000, { runner: runner(kind) });
+        await assert.rejects(runSafeCommand('curl example.com', process.cwd(), 30000,
+          { runner: runner(kind) }), /not allowlisted/);
+      }
+      assert.deepEqual(calls, [['pwd', []], ['pwd', []]]);
+    } finally {
+      if (previous === undefined) delete process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING;
+      else process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING = previous;
+      if (previousShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = previousShell;
+    }
+  });
+});
 
 describe('read-only inspection is allowed', () => {
   it('can temporarily disable command blocking for an explicit experiment', async () => {
