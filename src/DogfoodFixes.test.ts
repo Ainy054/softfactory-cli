@@ -210,3 +210,16 @@ describe('a merge refused by the user\'s checkout is not the task\'s failure', (
     assert.deepEqual(await manager.uncommittedTrackedFiles(), ['a.txt'], 'untracked files do not block a merge of other paths');
   });
 });
+
+describe('the final gate reads tallies, not only its heuristic', () => {
+  it('treats a run no worse than the baseline as pre-existing red, and recognises a node:test tally', async () => {
+    const { Factory } = await import('./Factory.js');
+    const factory: any = new Factory('/tmp', '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none' });
+    factory.baseline = { filesFailed: 0, filesPassed: 0, testsFailed: 3, testsPassed: 387 };
+    assert.equal(factory.noWorseThanBaseline({ counts: { filesFailed: 0, filesPassed: 0, testsFailed: 2, testsPassed: 405 } }), true, 'fewer failures, more passes');
+    assert.equal(factory.noWorseThanBaseline({ counts: { filesFailed: 0, filesPassed: 0, testsFailed: 4, testsPassed: 405 } }), false, 'one new failure');
+    assert.equal(factory.noWorseThanBaseline({ counts: undefined }), false, 'no tally, no claim');
+    assert.equal(factory.wasAlreadyFailing({ testSummary: 'npm test failure', output: 'TAP version 13\nnot ok 6 - x\n# tests 407\n# pass 405\n# fail 2\n' }), true);
+    assert.equal(factory.wasAlreadyFailing({ testSummary: 'npm test failure', output: 'TAP version 13\n# tests 2\n# pass 0\n# fail 2\nError [TransformError]: esbuild' }), false, 'a suite that cannot start');
+  });
+});

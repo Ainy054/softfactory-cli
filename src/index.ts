@@ -183,6 +183,15 @@ async function main() {
     return true;
   }).join(' ');
 
+  // A flag that is not one of ours is a mistake, not requirement text: an
+  // unsplit "$FLAGS" string once ran a whole build with default providers.
+  const strayFlags = args.filter((a, idx) => a.startsWith('--') && !KNOWN_FLAGS.some(f => a === f || a.startsWith(`${f}=`)) && !(idx > 0 && VALUE_FLAGS.includes(args[idx - 1])));
+  if (strayFlags.length) {
+    console.error(`Error: unknown flag${strayFlags.length > 1 ? 's' : ''}: ${strayFlags.map(f => JSON.stringify(f)).join(', ')}${strayFlags.some(f => /\s/.test(f)) ? ' (several flags arrived as one argument; a quoted variable is not split)' : ''}`);
+    console.error(USAGE);
+    process.exit(1);
+  }
+
   // Ticket in, pull request out. The issue text becomes the requirement;
   // anything typed after the flags is appended as operator instructions.
   const prMode = args.includes('--pr');

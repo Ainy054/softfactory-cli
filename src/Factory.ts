@@ -284,7 +284,10 @@ export class Factory extends EventEmitter {
             this.log(`Removed ${removed.length} task(s): ${removed.map(t => t.id).join(', ')}`);
         if (modified.length)
             this.log(`Modified ${modified.length} task(s): ${modified.map((t) => t.id).join(', ')}`);
-        this.state.feature = refined.feature || this.state.feature;
+        // A refinement adjusts tasks; the feature keeps its name. The planner
+        // otherwise renames it after the refinement text ("Correct the usage
+        // callback field mapping" became the feature of a stream-json relay).
+        if (refined.feature && refined.feature !== this.state.feature) this.log(`Planner renamed the feature to "${refined.feature}"; keeping "${this.state.feature}".`);
         this.state.tasks = newTasks;
         this.state.status = 'active';
         this.buildStartCommit = await this.getCurrentCommit();
@@ -347,6 +350,15 @@ export class Factory extends EventEmitter {
             if (allDone) {
                 this.log('No unfinished tasks to resume; all tasks are already complete.');
                 this.state.status = 'completed';
+                // The previous run may have ended on a failed final gate; it
+                // is re-run here, and the run ends properly (pull request
+                // marked ready) instead of a status flip nobody acts on.
+                await this.finalGate();
+                await this.saveState();
+                await this.updateHistory(this.state.status);
+                await this.endRun();
+                this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
+                return;
             } else {
                 const unresolved = this.state.tasks.filter(t => t.status !== 'done').map(t => `${t.id}:${t.status}`).join(', ');
                 this.log(`No retryable tasks remain. Unresolved tasks: ${unresolved}. Use --retry-blocked to explicitly retry blocked/rejected tasks.`);
@@ -819,26 +831,7 @@ export class Factory extends EventEmitter {
         this.state.status = failedTasks.length > 0 || this.state.tasks.some(t => t.status !== 'done') ? 'failed' : 'completed';
         await this.saveState();
         await this.updateHistory(this.state.status);
-        if (this.state.status === 'completed') {
-            const finalChecks = await this.taskVerifier.verifyAll(this.baseDir);
-            const executed = finalChecks.filter(check => check.executed);
-            // Only failures this build is responsible for. A suite that was
-            // already red — a database that is not running, a pre-existing
-            // panic — is not this feature's doing and must not mark it failed.
-            const blocking = executed.filter(check => !check.passed && !this.wasAlreadyFailing(check));
-            for (const check of executed) {
-                this.log(`Final gate: ${check.passed ? 'PASS' : 'FAIL'} — ${check.testSummary}`);
-            }
-            if (blocking.length > 0) {
-                this.log(`FINAL GATE FAILED on ${this.mergeTarget()}: ${blocking.map(c => c.testSummary).join('; ')}`);
-                this.log(blocking[0].output.slice(0, 1000));
-                this.state.status = 'failed';
-                await this.saveState();
-                await this.updateHistory('failed');
-            } else if (executed.some(check => !check.passed)) {
-                this.log('Final gate: pre-existing failures only, not attributed to this build.');
-            }
-        }
+        if (this.state.status === 'completed') await this.finalGate();
         if (this.state.status === 'completed') {
             await this.runDockerVerification();
             if (this.state.status === 'completed') await this.synthesizeMemory();
@@ -1233,6 +1226,39 @@ export class Factory extends EventEmitter {
     }
 
     /**
+     * The whole suite on the merge target, once every task is in. Only
+     * failures this build introduced block it: a check that is no worse than
+     * the baseline (by tally) or that failed for pre-existing reasons passes.
+     */
+    async finalGate(): Promise<void> {
+            const finalChecks = await this.taskVerifier.verifyAll(this.baseDir);
+            const executed = finalChecks.filter(check => check.executed);
+            // Only failures this build is responsible for. A suite that was
+            // already red — a database that is not running, a pre-existing
+            // panic — is not this feature's doing and must not mark it failed.
+            const blocking = executed.filter(check => !check.passed && !this.noWorseThanBaseline(check) && !this.wasAlreadyFailing(check));
+            for (const check of executed) {
+                this.log(`Final gate: ${check.passed ? 'PASS' : 'FAIL'} — ${check.testSummary}`);
+            }
+            if (blocking.length > 0) {
+                this.log(`FINAL GATE FAILED on ${this.mergeTarget()}: ${blocking.map(c => c.testSummary).join('; ')}`);
+                this.log(blocking[0].output.slice(0, 1000));
+                this.state.status = 'failed';
+                await this.saveState();
+                await this.updateHistory('failed');
+            } else if (executed.some(check => !check.passed)) {
+                this.log('Final gate: pre-existing failures only, not attributed to this build.');
+            }
+    }
+
+    /** Tallies say this run is no worse than the base branch was: pre-existing red, not this build's. */
+    noWorseThanBaseline(check: { counts?: import('./TaskVerifier.js').SuiteCounts; scope?: string; fullSuite?: boolean }): boolean {
+        const before = check.scope ? this.baselines[check.scope] : this.baseline;
+        if (!before || !check.counts) return false;
+        return this.detectRegression({ ...check, fullSuite: true }) === null;
+    }
+
+    /**
      * True when a suite failed for reasons that pre-date this build: an
      * unreachable service, or a suite where the failures are assertions rather
      * than anything that stopped it compiling or collecting.
@@ -1246,7 +1272,7 @@ export class Factory extends EventEmitter {
             return false;
         }
         if (/connection refused|no such host|ECONNREFUSED|dial tcp|could not connect/i.test(text)) return true;
-        return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed/.test(text);
+        return /--- PASS:|\bok\s+\S+\s+[\d.]+s|\d+ passed|^# pass [1-9]\d*/m.test(text);
     }
 
     /**
