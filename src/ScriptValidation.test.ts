@@ -26,11 +26,12 @@ export default defineConfig({
 const GOOD_TS = BROKEN_TS.replace(/^\s+\],\n\s+\],\n/m, '');
 
 /** A worktree with the project's own esbuild, as a real target repo has. */
-async function worktreeWithEsbuild() {
+async function worktreeWithEsbuild(binary?: string) {
   let real: string;
   try {
     const require = createRequire(import.meta.url);
-    real = path.join(path.dirname(require.resolve('esbuild/package.json')), 'bin', 'esbuild');
+    // Resolve from this test module, including dependencies shared by git worktrees.
+    real = binary ?? path.join(path.dirname(require.resolve('esbuild/package.json')), 'bin', 'esbuild');
     await fs.access(real);
     await execa(real, ['--version'], { timeout: 2_000 });
   } catch { return null; }
@@ -40,6 +41,37 @@ async function worktreeWithEsbuild() {
   await fs.symlink(real, path.join(dir, 'frontend', 'node_modules', '.bin', 'esbuild'));
   return dir;
 }
+
+describe('the esbuild fixture requires a runnable dependency', () => {
+  it('skips missing, dangling, and non-runnable binaries before creating a fixture', async (t) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-esbuild-probe-'));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const missing = path.join(dir, 'missing');
+    const dangling = path.join(dir, 'dangling');
+    const nonRunnable = path.join(dir, 'non-runnable');
+    const failedVersion = path.join(dir, 'failed-version');
+    const hungVersion = path.join(dir, 'hung-version');
+    await fs.symlink(missing, dangling);
+    await fs.writeFile(nonRunnable, 'not an executable', { mode: 0o600 });
+    await fs.writeFile(failedVersion, '#!/usr/bin/env node\nprocess.exit(1);\n', { mode: 0o755 });
+    await fs.writeFile(hungVersion, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o755 });
+    const mkdir = t.mock.method(fs, 'mkdir', () => {
+      assert.fail('unavailable binaries must be skipped before fixture creation');
+    });
+    for (const binary of [missing, dangling, nonRunnable, failedVersion, hungVersion]) {
+      assert.equal(await worktreeWithEsbuild(binary), null, binary);
+    }
+    assert.equal(mkdir.mock.callCount(), 0);
+  });
+
+  it('propagates fixture-creation errors after a successful binary probe', async (t) => {
+    const failure = new Error('fixture creation failed');
+    const mkdtemp = t.mock.method(fs, 'mkdtemp', async () => { throw failure; });
+    // Node provides a portable executable that also supports --version.
+    await assert.rejects(worktreeWithEsbuild(process.execPath), (error) => error === failure);
+    assert.equal(mkdtemp.mock.callCount(), 1);
+  });
+});
 
 describe('a script edit that breaks parsing is rejected', () => {
   const w: any = new LocalAgentWorker();
