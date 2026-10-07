@@ -110,9 +110,11 @@ export async function buildPullRequestBody(input: PullRequestBodyInput): Promise
     const open = state.tasks.filter(t => t.status !== 'done');
     lines.push(`Unfinished: ${open.map(t => `${t.id} (${t.status}${t.executor !== 'agent' ? `, ${t.executor}` : ''})`).join(', ')}.`, '');
   }
+  const results = new Map<string, string | undefined>();
+  for (const task of state.tasks) if (task.evidence) results.set(task.id, await readResult(path.join(input.baseDir, task.evidence)));
   lines.push('### Tasks', '', '| Task | Title | Status | Attempts | Review | Acceptance |', '| :-- | :-- | :-- | --: | :-- | :-- |');
   for (const task of state.tasks) {
-    lines.push(`| ${task.id} | ${escapeCell(task.title)} | ${task.status} | ${task.attempts} | ${reviewCell(task)} | ${acceptanceCell(task)} |`);
+    lines.push(`| ${task.id} | ${escapeCell(task.title)} | ${task.status} | ${task.attempts} | ${reviewCell(task)} | ${acceptanceCell(task, results.get(task.id))} |`);
   }
   lines.push('');
   const evidenced = state.tasks.filter(t => t.evidence);
@@ -145,10 +147,18 @@ function reviewCell(task: Task): string {
   return task.inspection === 'mechanical-only' ? 'mechanical gates only' : `${task.inspection} (${task.inspector_model || ''})`;
 }
 
-function acceptanceCell(task: Task): string {
+/** The evidence log's verdict, so the table says what the log says. */
+function acceptanceCell(task: Task, result?: string): string {
   if (!task.verification_command) return 'none declared';
-  if (task.status !== 'done') return `\`${escapeCell(task.verification_command)}\``;
-  return `\`${escapeCell(task.verification_command)}\` PASS`;
+  const command = `\`${escapeCell(task.verification_command)}\``;
+  if (task.status !== 'done') return command;
+  if (result === 'FAIL') return `${command} ${task.agent_role === 'test_writer' ? 'red, as expected before the implementation' : 'FAIL'}`;
+  return `${command} ${result || 'PASS'}`;
+}
+
+async function readResult(file: string): Promise<string | undefined> {
+  try { return (await fs.readFile(file, 'utf8')).match(/^RESULT: (PASS|FAIL)\s*$/m)?.[1]; }
+  catch { return undefined; }
 }
 
 function escapeCell(text: string): string {

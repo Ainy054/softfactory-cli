@@ -1,4 +1,5 @@
 import { execa } from 'execa';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +44,8 @@ export interface DockerRunnerConfig {
   user?: string;
   memory?: string;
   cpus?: string;
+  /** Docker network; `none` unless an orchestrator step (a dependency install) needs the registry. */
+  network?: string;
 }
 
 /**
@@ -59,7 +62,7 @@ export class DockerRunner implements CommandRunner {
   static buildArgs(config: DockerRunnerConfig, file: string, args: string[], options: ExecOptions): string[] {
     // The image's own filesystem is read-only too, so "the worktree is the
     // only writable mount" is literally true; tools get /tmp for caches.
-    const dockerArgs = ['run', '--rm', '--network', 'none', '--init',
+    const dockerArgs = ['run', '--rm', '--network', config.network || 'none', '--init',
       '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--read-only', '--tmpfs', '/tmp:rw,exec,size=2g',
       '--memory', config.memory || '2g', '--cpus', config.cpus || '2', '--pids-limit', '512',
@@ -72,7 +75,10 @@ export class DockerRunner implements CommandRunner {
     for (const [key, value] of Object.entries({ CI: 'true', HOME: '/tmp', ...(config.env || {}) })) {
       dockerArgs.push('-e', `${key}=${value}`);
     }
-    dockerArgs.push(config.image, file, ...args);
+    // An explicit entrypoint: the node image's own entrypoint rewrites an
+    // unknown command into `node <command>`, which hid "rg is not installed"
+    // behind "Cannot find module .../rg".
+    dockerArgs.push('--entrypoint', file, config.image, ...args);
     return dockerArgs;
   }
 
@@ -96,6 +102,65 @@ const IMAGES: Record<string, string> = {
 };
 
 /**
+ * What the allowlist promises a worker and the stock images do not ship:
+ * git (`git diff`, `git status`, and any test suite that shells out to git),
+ * ripgrep (the search tool the prompt names), make. The first dogfood run
+ * burned a third of a worker's tool calls on `rg` failing inside the image.
+ */
+const SANDBOX_TOOLS = ['git', 'ripgrep', 'make', 'ca-certificates'];
+
+export function sandboxDockerfile(base: string): string {
+  return `FROM ${base}\nRUN apt-get update && apt-get install -y --no-install-recommends ${SANDBOX_TOOLS.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
+}
+
+/** The locally built image for a stock base; an override image is used as is. */
+export function derivedImageName(base: string): string | undefined {
+  const key = Object.entries(IMAGES).find(([, value]) => value === base)?.[0];
+  return key ? `softfactory-sandbox-${key}:latest` : undefined;
+}
+
+export interface NodeDependencyPlan {
+  /** The directory holding package.json: the root, or frontend/. */
+  pkgDir: string;
+  lockfile: string;
+  manager: 'npm' | 'pnpm' | 'yarn';
+  /** Named Docker volume, one per lockfile content and CPU architecture. */
+  volume: string;
+  /** The install command, run once inside the Linux image with the network on. */
+  install: string;
+}
+
+const LOCKFILES: Array<[string, NodeDependencyPlan['manager'], string]> = [
+  ['package-lock.json', 'npm', 'npm ci --ignore-scripts --no-audit --no-fund'],
+  ['npm-shrinkwrap.json', 'npm', 'npm ci --ignore-scripts --no-audit --no-fund'],
+  ['pnpm-lock.yaml', 'pnpm', 'corepack enable && corepack pnpm install --frozen-lockfile --ignore-scripts'],
+  ['yarn.lock', 'yarn', 'corepack enable && corepack yarn install --frozen-lockfile --ignore-scripts'],
+];
+
+/**
+ * Node dependencies for the sandbox. Installing them on the host and sharing
+ * the directory put macOS binaries (esbuild, and so tsx and vitest) in front
+ * of a Linux container: every test failed at load, on the base branch too,
+ * and the first run of softfactory on its own repository could not verify a
+ * thing. The plan names a volume per lockfile; the install happens once, in
+ * the Linux image, and the volume shadows <pkgDir>/node_modules thereafter.
+ */
+export async function nodeDependencyPlan(rootPath: string): Promise<NodeDependencyPlan | undefined> {
+  for (const sub of ['', 'frontend']) {
+    const pkgDir = path.join(rootPath, sub);
+    if (!await fs.access(path.join(pkgDir, 'package.json')).then(() => true, () => false)) continue;
+    for (const [lockfile, manager, install] of LOCKFILES) {
+      let content: string;
+      try { content = await fs.readFile(path.join(pkgDir, lockfile), 'utf8'); } catch { continue; }
+      const hash = createHash('sha256').update(`${manager}\n${process.arch}\n${content}`).digest('hex').slice(0, 12);
+      return { pkgDir, lockfile, manager, volume: `softfactory-deps-${hash}`, install };
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
  * Decides where model-chosen commands run. "auto" uses Docker when it is
  * available and refuses to proceed when it is not, so an unsandboxed run is
  * always a choice the user made with --sandbox=none.
@@ -104,6 +169,7 @@ export class SandboxManager {
   available = false;
   private detected = false;
   private readonly ensuredImages = new Set<string>();
+  private readonly dependencyVolumes = new Map<string, Promise<boolean>>();
   private readonly log: (line: string) => void;
   private agents: AgentContainer | undefined;
 
@@ -170,15 +236,24 @@ export class SandboxManager {
     }
   }
 
-  async ensureImage(image: string): Promise<void> {
-    if (this.ensuredImages.has(image)) return;
+  /** Pulls an override image, or builds the tool-complete image on a stock base; returns the image to run. */
+  async ensureImage(image: string): Promise<string> {
+    const derived = derivedImageName(image);
+    const target = derived ?? image;
+    if (this.ensuredImages.has(target)) return target;
     try {
-      await execa('docker', ['image', 'inspect', image], { timeout: 15000 });
+      await execa('docker', ['image', 'inspect', target], { timeout: 15000 });
     } catch {
-      this.log(`Sandbox: pulling ${image} (first use)...`);
-      await execa('docker', ['pull', image], { timeout: 15 * 60_000 });
+      if (derived) {
+        this.log(`Sandbox: building ${target} from ${image} with ${SANDBOX_TOOLS.slice(0, 3).join(', ')} (first use)...`);
+        await execa('docker', ['build', '-q', '-t', target, '-'], { input: sandboxDockerfile(image), timeout: 15 * 60_000 });
+      } else {
+        this.log(`Sandbox: pulling ${image} (first use)...`);
+        await execa('docker', ['pull', image], { timeout: 15 * 60_000 });
+      }
     }
-    this.ensuredImages.add(image);
+    this.ensuredImages.add(target);
+    return target;
   }
 
   /**
@@ -212,6 +287,55 @@ export class SandboxManager {
     return mounts;
   }
 
+  /**
+   * The Linux-installed node_modules for a root, as a mount over the package
+   * directory's own; empty when the project has no lockfile or the install
+   * failed (the log says why), in which case commands see whatever is there.
+   */
+  async nodeDependencyMounts(rootPath: string): Promise<Mount[]> {
+    const plan = await nodeDependencyPlan(rootPath);
+    if (!plan) return [];
+    if (!await this.ensureDependencyVolume(plan)) return [];
+    return [{ host: plan.volume, container: path.join(plan.pkgDir, 'node_modules') }];
+  }
+
+  /** True when the volume exists or was just populated; memoized per volume for the run. */
+  ensureDependencyVolume(plan: NodeDependencyPlan): Promise<boolean> {
+    let pending = this.dependencyVolumes.get(plan.volume);
+    if (!pending) {
+      pending = this.installDependencyVolume(plan);
+      this.dependencyVolumes.set(plan.volume, pending);
+    }
+    return pending;
+  }
+
+  protected async installDependencyVolume(plan: NodeDependencyPlan): Promise<boolean> {
+    try {
+      await execa('docker', ['volume', 'inspect', plan.volume], { timeout: 15000 });
+      return true;
+    } catch { /* not yet */ }
+    const image = await this.ensureImage(IMAGES.node);
+    const started = Date.now();
+    this.log(`Sandbox: installing Node dependencies from ${path.relative(process.cwd(), path.join(plan.pkgDir, plan.lockfile)) || plan.lockfile} into volume ${plan.volume} (Linux, network on for this step only)...`);
+    try {
+      await execa('docker', ['volume', 'create', '--label', 'softfactory.deps=1', '--label', `softfactory.manager=${plan.manager}`, plan.volume], { timeout: 30000 });
+      await execa('docker', [
+        'run', '--rm', '--network', 'bridge', '--init', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--tmpfs', '/tmp:rw,exec,size=2g', '--memory', '4g', '--cpus', '2', '--pids-limit', '512',
+        '-v', `${plan.pkgDir}:/src:ro`, '-v', `${plan.volume}:/pkg/node_modules`, '-w', '/pkg',
+        '-e', 'HOME=/tmp', '-e', 'CI=true', '-e', 'npm_config_cache=/tmp/.npm', '-e', 'npm_config_update_notifier=false', '-e', 'COREPACK_ENABLE_DOWNLOAD_PROMPT=0',
+        '--entrypoint', 'sh', image, '-c', `cp /src/package.json /src/${plan.lockfile} /pkg/ && ${plan.install}`,
+      ], { timeout: 15 * 60_000 });
+      this.log(`Sandbox: dependencies ready in ${Math.round((Date.now() - started) / 1000)}s (${plan.volume})`);
+      return true;
+    } catch (error: any) {
+      await execa('docker', ['volume', 'rm', '-f', plan.volume], { timeout: 30000 }).catch(() => undefined);
+      const tail = String(error?.stderr || error?.stdout || error?.message || error).trim().split('\n').slice(-4).join(' | ');
+      this.log(`Sandbox: dependency install failed; commands will see the project's own node_modules. ${tail}`);
+      return false;
+    }
+  }
+
   /** Where whole CLI agents run when the sandbox is active; built on first use. */
   agentContainer(): AgentContainer {
     if (!this.agents) this.agents = new AgentContainer(this.log);
@@ -225,12 +349,11 @@ export class SandboxManager {
 
   async runnerFor(rootPath: string, executable?: string): Promise<CommandRunner> {
     if (!this.active) return new HostRunner();
-    const image = await this.imageFor(rootPath, executable);
-    await this.ensureImage(image);
+    const image = await this.ensureImage(await this.imageFor(rootPath, executable));
     const user = process.platform === 'linux' && typeof process.getuid === 'function' ? `${process.getuid()}:${process.getgid?.() ?? 0}` : undefined;
     return new DockerRunner({
       image,
-      mounts: [...SandboxManager.mountsFor(rootPath), ...await SandboxManager.cacheMounts()],
+      mounts: [...SandboxManager.mountsFor(rootPath), ...await SandboxManager.cacheMounts(), ...await this.nodeDependencyMounts(rootPath)],
       env: { GOFLAGS: '-mod=mod', GOMODCACHE: '/go/pkg/mod', GOCACHE: '/tmp/gocache', npm_config_cache: '/tmp/.npm', npm_config_update_notifier: 'false', PIP_NO_INDEX: '1' },
       user,
     });

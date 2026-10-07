@@ -15,7 +15,7 @@ import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
-import { createTextModel, OllamaTextModel, type TextModelProvider } from './TextModel.js';
+import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { RunJournal } from './RunJournal.js';
 import { GitHub, buildPullRequestBody } from './PullRequest.js';
 import { SOFTFACTORY_VERSION } from './version.js';
@@ -30,7 +30,6 @@ import { SandboxManager, type SandboxMode } from './Sandbox.js';
 class AttemptTimeoutError extends Error {
   constructor(minutes: number) { super(`Attempt exceeded its ${minutes}-minute budget and the worker did not stop when asked.`); this.name = 'AttemptTimeoutError'; }
 }
-const TEXT_MODEL_PROVIDERS: TextModelProvider[] = ['local', 'agy', 'openai', 'openai-api', 'anthropic', 'deepseek'];
 
 export interface FactoryOptions {
     streamToTerminal?: boolean;
@@ -149,6 +148,7 @@ export class Factory extends EventEmitter {
             : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli' || plannerProvider === 'muse'
                 ? new CliPlanner(plannerProvider, plannerModel, baseDir)
                 : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
+        this.planner.log = line => this.log(line);
         // The reviewer is the configured cloud provider's model, and nothing
         // else. It used to be the Antigravity CLI regardless of provider, with
         // a silent fallback to a local 7B when that failed, so a DeepSeek run
@@ -166,7 +166,7 @@ export class Factory extends EventEmitter {
             const slash = secondReviewer.indexOf('/');
             const provider = secondReviewer.slice(0, slash) as TextModelProvider;
             const model = secondReviewer.slice(slash + 1);
-            if (slash <= 0 || !model || !TEXT_MODEL_PROVIDERS.includes(provider)) {
+            if (slash <= 0 || !model || !(TEXT_MODEL_PROVIDERS as readonly string[]).includes(provider)) {
                 throw new Error(`--second-reviewer must be provider/model with provider one of ${TEXT_MODEL_PROVIDERS.join(', ')}; got "${secondReviewer}".`);
             }
             this.secondInspector = new Inspector(createTextModel(provider, model, { cwd: baseDir }));
@@ -481,6 +481,7 @@ export class Factory extends EventEmitter {
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
+            requirement,
             source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
             integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
             base_branch: this.prMode ? this.defaultBranch : undefined,
@@ -540,6 +541,7 @@ export class Factory extends EventEmitter {
             tasks: await this.prepareTasks(blueprint.tasks),
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
+            requirement,
             source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
             integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
             base_branch: this.prMode ? this.defaultBranch : undefined,
@@ -736,6 +738,7 @@ export class Factory extends EventEmitter {
                 .filter(task => worktreeMap.has(task.id))
                 .map(task => this.executeAndInspect(task, worktreeMap.get(task.id))));
             const environmentFault = results.find(r => r.status === 'rejected' && isEnvironmentFailure(r.reason));
+            let mergeFault: string | undefined;
             // Merge passed tasks sequentially (git isn't concurrent-safe)
             for (const result of results) {
                 if (result.status === 'fulfilled' && result.value) {
@@ -747,11 +750,22 @@ export class Factory extends EventEmitter {
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
                     }
-                    catch (e) {
+                    catch (e: any) {
+                        const blocked = WorktreeManager.mergeBlockedByWorkingTree(`${e?.stderr || ''}\n${e?.stdout || ''}`);
+                        if (blocked) {
+                            // The user's checkout refused the merge, not the task: a reviewed,
+                            // passing branch was charged three attempts for this in the first
+                            // dogfood run. Keep the branch, charge nothing, halt like a fault.
+                            task.status = 'pending';
+                            mergeFault = `merge of ${task.id} blocked by the working tree (${blocked}). Commit or stash those changes, then --resume; the reviewed branch line/${task.id} is kept.`;
+                            this.log(`MERGE BLOCKED: ${task.id}: ${blocked}`);
+                            continue;
+                        }
                         task.status = 'failed';
                         task.attempts++;
-                        this.log(`MERGE FAILED: ${task.id}: ${e.message}`);
-                        this.emitEvent({ type: 'task:fail', task, feedback: `Merge failed: ${e.message}` });
+                        const detail = `${e.message}${e?.stderr ? `: ${String(e.stderr).trim().split('\n').slice(-3).join(' ')}` : ''}`;
+                        this.log(`MERGE FAILED: ${task.id}: ${detail}`);
+                        this.emitEvent({ type: 'task:fail', task, feedback: `Merge failed: ${detail}` });
                     }
                 }
             }
@@ -764,6 +778,11 @@ export class Factory extends EventEmitter {
                 await this.worktreeManager.cleanup(task.id, branchName, willRetry);
             }
             await this.saveState();
+            if (mergeFault) {
+                this.environmentFault = mergeFault;
+                this.log(`HALTED: ${mergeFault}`);
+                break;
+            }
             if (environmentFault) {
                 this.environmentFault = (environmentFault as PromiseRejectedResult).reason?.message || 'worker backend unavailable';
                 this.log(`HALTED: ${this.environmentFault}`);
@@ -922,6 +941,7 @@ export class Factory extends EventEmitter {
                 const execution = worker.execute(task, worktreePath, {
                     streamToTerminal: this.streamToTerminal,
                     projectContext,
+                    requirement: this.state?.requirement,
                     memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
                     model,
                     diagnosticsDir: path.join(this.baseDir, '.softfactory'),
@@ -1147,7 +1167,7 @@ export class Factory extends EventEmitter {
                             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `💡 Epiphany Saved: ${epiphany.lesson}` });
                         }
                     } catch (e: any) {
-                        this.log(`Epiphany synthesis failed: ${e.message}`);
+                        this.log(`Epiphany synthesis failed: ${String(e?.message ?? e).replace(/\s+/g, ' ').slice(0, 200)}`);
                     }
                 }
 
@@ -1833,6 +1853,8 @@ export class Factory extends EventEmitter {
         }
         try {
             const health = await this.workerRegistry.preflight();
+            const dirty = await this.worktreeManager.uncommittedTrackedFiles().catch(() => [] as string[]);
+            if (dirty.length) this.log(`WARNING: ${dirty.length} tracked file(s) have uncommitted changes (${dirty.slice(0, 5).join(', ')}${dirty.length > 5 ? ', …' : ''}); a merge that touches them will be blocked. Commit or stash first.`);
             this.log(`Backend preflight: local ${health.local ? 'ready' : 'unavailable'} (${health.localModel}), cloud ${health.cloud ? 'ready' : 'unavailable'} (${this.workerRegistry.getCloudProvider()}/${health.cloudModel || 'configured default'})`);
             if (this.strategy === 'local' && !health.local) {
                 this.environmentFault = `Configured local model "${health.localModel}" is unavailable.`;

@@ -53,6 +53,11 @@ export class WorktreeManager {
     // Ensure no existing worktree conflict
     await execa('git', ['worktree', 'remove', '-f', worktreePath], { cwd: this.baseDir, reject: false });
     await execa('git', ['worktree', 'prune'], { cwd: this.baseDir, reject: false });
+    // An interrupted attempt can leave the directory behind once its
+    // registration is pruned; `worktree add` then refuses the non-empty path
+    // and the retry died with the fallback's misleading "invalid reference".
+    // The directory is softfactory's own; committed work lives on the branch.
+    await fs.rm(worktreePath, { recursive: true, force: true });
     if (!reuse) {
       await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir, reject: false });
     }
@@ -62,8 +67,12 @@ export class WorktreeManager {
     } else {
       try {
         await execa('git', ['worktree', 'add', '-b', branchName, worktreePath], { cwd: this.baseDir });
-      } catch {
-        await execa('git', ['worktree', 'add', worktreePath, branchName], { cwd: this.baseDir });
+      } catch (first: any) {
+        try {
+          await execa('git', ['worktree', 'add', worktreePath, branchName], { cwd: this.baseDir });
+        } catch (second: any) {
+          throw new Error(`git worktree add failed for ${taskId}: ${(first?.stderr || first?.message || first).toString().trim()}; then ${(second?.stderr || second?.message || second).toString().trim()}`);
+        }
       }
     }
 
@@ -213,6 +222,26 @@ export class WorktreeManager {
       await execa('git', ['merge', '--abort'], { cwd: this.baseDir, reject: false });
       throw error;
     }
+  }
+
+  /**
+   * Why git refused a merge because of the user's checkout rather than the
+   * branches: uncommitted edits (or untracked files) in paths the merge would
+   * write. Null for a genuine conflict or any other failure.
+   */
+  static mergeBlockedByWorkingTree(gitOutput: string): string | null {
+    const text = String(gitOutput || '');
+    const local = text.match(/local changes to the following files would be overwritten by merge:\s*\n([\s\S]*?)(?:\n\s*(?:Please|Aborting)|$)/i);
+    if (local) return `uncommitted changes in ${local[1].split('\n').map(l => l.trim()).filter(Boolean).join(', ')}`;
+    const untracked = text.match(/untracked working tree files would be overwritten by merge:\s*\n([\s\S]*?)(?:\n\s*(?:Please|Aborting)|$)/i);
+    if (untracked) return `untracked files in the way: ${untracked[1].split('\n').map(l => l.trim()).filter(Boolean).join(', ')}`;
+    return null;
+  }
+
+  /** Tracked files with uncommitted changes in the primary checkout. */
+  async uncommittedTrackedFiles(): Promise<string[]> {
+    const { stdout } = await execa('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: this.baseDir, reject: false });
+    return stdout.split('\n').filter(Boolean).map(line => line.slice(3).trim());
   }
 
   /** `keepBranch` preserves a failed attempt's commits for the next retry. */

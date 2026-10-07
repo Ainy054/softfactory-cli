@@ -30,10 +30,10 @@ describe('path arguments must stay inside the worktree', () => {
   });
 
   it('closes the interpreter, git and install escapes the allowlist left open', () => {
-    for (const c of ['node -r ./evil.js x.js', 'node --import ./evil.mjs x.js', 'git push origin main', 'git fetch', 'git pull', 'git clone x', 'git remote add x y', 'git submodule update', 'npm install lodash', 'npm ci']) {
+    for (const c of ['node -r ./evil.js x.js', 'node --import ./evil.mjs x.js', 'node --import=/w/evil.mjs x.js', 'node -r ../x.js y.js', 'git push origin main', 'git fetch', 'git pull', 'git clone x', 'git remote add x y', 'git submodule update', 'npm install lodash', 'npm ci']) {
       assert.throws(() => assertAllowedCommand(c, scope), c);
     }
-    for (const c of ['node ./scripts/check.js', 'git status', 'git diff', 'git log --oneline', 'npm install --ignore-scripts', 'npm ci --ignore-scripts', 'make test']) {
+    for (const c of ['node ./scripts/check.js', 'node --import tsx --test src/x.test.ts', 'node -r ts-node/register x.js', 'node --import=@swc-node/register/esm-register x.ts', 'git status', 'git diff', 'git log --oneline', 'npm install --ignore-scripts', 'npm ci --ignore-scripts', 'make test']) {
       assert.doesNotThrow(() => assertAllowedCommand(c, scope), c);
     }
   });
@@ -51,7 +51,7 @@ describe('the docker runner', () => {
     assert.match(joined, /-v \/repo:\/repo:ro/);
     assert.match(joined, /-v \/repo\/\.git\/softfactory-worktrees\/T1:\/repo\/\.git\/softfactory-worktrees\/T1(?: |$)/);
     assert.match(joined, /-e FOO=bar/);
-    assert.ok(joined.endsWith('node:20-bookworm-slim npm test'));
+    assert.ok(joined.endsWith('--entrypoint npm node:20-bookworm-slim test'), joined);
     assert.ok(!args.includes('-i'), 'stdin is attached only when there is input to pipe');
   });
 
@@ -146,5 +146,81 @@ describe('the verifier and the acceptance runner execute through the sandbox', (
     const result = await new TaskVerifier(sandbox).runAcceptance(dir, { id: 'T1', verification_command: 'cat /etc/passwd', attempts: 0 });
     assert.equal(result.unrunnable, true);
     assert.equal(calls.length, 0);
+  });
+});
+
+describe('the sandbox image carries the tools the allowlist promises', () => {
+  it('derives a local image from each stock base, and leaves an override image alone', async () => {
+    const { derivedImageName, sandboxDockerfile } = await import('./Sandbox.js');
+    assert.equal(derivedImageName('node:20-bookworm-slim'), 'softfactory-sandbox-node:latest');
+    assert.equal(derivedImageName('debian:bookworm-slim'), 'softfactory-sandbox-generic:latest');
+    assert.equal(derivedImageName('my/toolchain:1'), undefined);
+    const dockerfile = sandboxDockerfile('node:20-bookworm-slim');
+    assert.match(dockerfile, /^FROM node:20-bookworm-slim\n/);
+    for (const tool of ['git', 'ripgrep', 'make']) assert.match(dockerfile, new RegExp(`\\b${tool}\\b`), tool);
+    assert.match(dockerfile, /rm -rf \/var\/lib\/apt\/lists/);
+  });
+});
+
+describe('Node dependencies are installed for the sandbox platform, not copied from the host', () => {
+  it('plans one volume per lockfile and package manager, and none without a lockfile', async () => {
+    const { nodeDependencyPlan } = await import('./Sandbox.js');
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deps-'));
+    assert.equal(await nodeDependencyPlan(dir), undefined, 'no package.json');
+    await fs.writeFile(path.join(dir, 'package.json'), '{}');
+    assert.equal(await nodeDependencyPlan(dir), undefined, 'no lockfile: nothing reproducible to install');
+    await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":3}');
+    const npm = (await nodeDependencyPlan(dir))!;
+    assert.equal(npm.manager, 'npm');
+    assert.equal(npm.pkgDir, dir);
+    assert.match(npm.volume, /^softfactory-deps-[0-9a-f]{12}$/);
+    assert.match(npm.install, /^npm ci --ignore-scripts/);
+    await fs.writeFile(path.join(dir, 'package-lock.json'), '{"lockfileVersion":3,"packages":{}}');
+    assert.notEqual((await nodeDependencyPlan(dir))!.volume, npm.volume, 'a changed lockfile is a new volume');
+    const front = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deps-front-'));
+    await fs.mkdir(path.join(front, 'frontend'));
+    await fs.writeFile(path.join(front, 'frontend', 'package.json'), '{}');
+    await fs.writeFile(path.join(front, 'frontend', 'pnpm-lock.yaml'), 'lockfileVersion: 9');
+    const pnpm = (await nodeDependencyPlan(front))!;
+    assert.equal(pnpm.pkgDir, path.join(front, 'frontend'));
+    assert.equal(pnpm.manager, 'pnpm');
+    assert.match(pnpm.install, /pnpm install --frozen-lockfile --ignore-scripts/);
+  });
+
+  it('mounts the volume over the package directory\'s node_modules, and nothing when the install failed', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-deps-mount-'));
+    await fs.writeFile(path.join(dir, 'package.json'), '{}');
+    await fs.writeFile(path.join(dir, 'yarn.lock'), '# yarn');
+    const sandbox: any = new SandboxManager('docker');
+    const installs: string[] = [];
+    sandbox.installDependencyVolume = async (plan: any) => { installs.push(plan.volume); return true; };
+    const mounts = await sandbox.nodeDependencyMounts(dir);
+    assert.equal(mounts.length, 1);
+    assert.equal(mounts[0].container, path.join(dir, 'node_modules'));
+    assert.match(mounts[0].host, /^softfactory-deps-/);
+    assert.equal(mounts[0].readOnly, undefined, 'tools write their caches under node_modules');
+    await sandbox.nodeDependencyMounts(dir);
+    assert.equal(installs.length, 1, 'ensured once per run');
+    const failing: any = new SandboxManager('docker');
+    failing.installDependencyVolume = async () => false;
+    assert.deepEqual(await failing.nodeDependencyMounts(dir), []);
+  });
+
+  it('opens the network only for the install container, never for a command', () => {
+    const base = { image: 'x', mounts: [] as any[] };
+    assert.match(DockerRunner.buildArgs(base, 'npm', ['test'], { cwd: '/w' }).join(' '), /--network none/);
+    assert.match(DockerRunner.buildArgs({ ...base, network: 'bridge' }, 'npm', ['ci'], { cwd: '/w' }).join(' '), /--network bridge/);
+  });
+
+  it('prepare() leaves the host alone when the sandbox is on, and reports a missing lockfile', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-prep-'));
+    await fs.writeFile(path.join(dir, 'package.json'), '{}');
+    const sandbox: any = { active: true, nodeDependencyMounts: async () => [] };
+    const refused = await new TaskVerifier(sandbox as SandboxManager).prepare(dir, { files_hint: ['src/a.ts'] } as any);
+    assert.equal(refused.ok, false);
+    assert.match(refused.message!, /no lockfile|install failed/);
+    sandbox.nodeDependencyMounts = async () => [{ host: 'softfactory-deps-abc', container: path.join(dir, 'node_modules') }];
+    assert.deepEqual(await new TaskVerifier(sandbox as SandboxManager).prepare(dir, { files_hint: ['src/a.ts'] } as any), { ok: true });
+    await assert.rejects(fs.access(path.join(dir, 'node_modules')), 'no host npm ci ran');
   });
 });

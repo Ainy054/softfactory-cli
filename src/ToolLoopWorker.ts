@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
@@ -23,7 +23,8 @@ export class ToolLoopWorker implements IWorker {
   static readonly REPEAT_TOTAL_ABORT = 8;    // identical calls anywhere in the attempt
   static readonly CYCLE_WINDOW = 6;          // rolling window for A/B/A/B oscillation
   static readonly CYCLE_DISTINCT = 2;
-  static readonly NO_PROGRESS_ABORT = 10;    // allow initial inspection; cycle guards stop repetitive exploration sooner
+  static readonly NO_PROGRESS_WARN = 6;      // a nudge: enough reading, change a file
+  static readonly NO_PROGRESS_ABORT = 12;    // allow initial inspection; cycle guards stop repetitive exploration sooner
   static readonly MAX_ITERATIONS = 30;
   private readonly verifier = new TaskVerifier();
 
@@ -62,6 +63,7 @@ CRITICAL INSTRUCTIONS:
 6. Stay strictly within the task's declared files. Do not edit unrelated files to fix baseline failures.
 7. For test-writing tasks, add real executable assertions and interactions; never leave placeholder comments or empty tests.
 8. Only read-only pipelines using | are available (for example rg ... | head -20). Other shell operators (&&, ;, redirects, substitutions) are NOT available. Use working_dir for subprojects.
+9. Run focused tests only: the one test file for your change, or the acceptance command. Do not run the whole suite. The orchestrator runs the scoped suite and the acceptance command after you finish; a whole suite inside the sandbox is slow and is killed by the command timeout, and chasing its unrelated failures ends the attempt.
 ${projectRoots.length ? `\nPACKAGE ROOTS (run commands with the matching working_dir):\n${projectRoots.map(r => `- ${r}`).join('\n')}` : ''}
 
 PROJECT CONTEXT:
@@ -69,8 +71,10 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task): string {
+  private buildUserPrompt(task: Task, requirement?: string): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
+    if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
+    if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
     if (task.last_feedback) {
       userPrompt += `\nPREVIOUS ATTEMPT FAILED (Iteration ${task.attempts}):\n${task.last_feedback}\nEnsure you fix this.\n`;
       if (/parse|syntax|invalid|test file|test failure/i.test(task.last_feedback)) {
@@ -90,6 +94,7 @@ ${projectContext}
     if (task.review_questions?.length) {
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
     }
+    userPrompt += requirementSection(requirement);
     return userPrompt;
   }
 
@@ -168,6 +173,7 @@ ${projectContext}
           properties: {
             command: { type: 'string' },
             working_dir: { type: 'string', description: 'Directory to run in, relative to the repository root (e.g. "frontend"). Defaults to the root.' },
+            timeout_seconds: { type: 'number', description: 'Seconds before the command is killed: default 120, at most 600. Prefer focused tests over a longer timeout.' },
           },
           required: ['command'],
         },
@@ -201,7 +207,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
-      { role: 'user', content: this.buildUserPrompt(task) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement) },
     ];
     const tools = ToolLoopWorker.TOOLS;
     const safeCtx = this.getSafeContextWindow(model);
@@ -384,7 +390,7 @@ ${projectContext}
               const cwd = this.resolveWorkingDir(worktreePath, args.working_dir);
               this.assertAllowedCommand(args.command, { root: worktreePath, cwd });
               try {
-                const result = await this.runSafeCommand(args.command, cwd, worktreePath, options?.sandbox);
+                const result = await this.runSafeCommand(args.command, cwd, worktreePath, options?.sandbox, ToolLoopWorker.commandTimeoutMs(args.timeout_seconds));
                 toolResult = this.truncateToolResult(`STDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
               } catch (cmdErr: any) {
                 toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
@@ -441,6 +447,9 @@ ${projectContext}
           } else if (++callsSinceProgress >= ToolLoopWorker.NO_PROGRESS_ABORT) {
             stalledWithoutProgress = true;
             onOutput(`[${this.label}] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
+          } else if (callsSinceProgress === ToolLoopWorker.NO_PROGRESS_WARN) {
+            toolResult += `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. You have enough context: create or edit the file now with write_file or replace_content, then run the acceptance command. The attempt ends after ${ToolLoopWorker.NO_PROGRESS_ABORT} calls without an edit.`;
+            onOutput(`[${this.label}] ${callsSinceProgress} calls without an edit; nudged.`);
           }
 
           messages.push({ role: 'tool', tool_call_id: call.id, content: toolResult });
@@ -475,6 +484,8 @@ ${projectContext}
         ? `${who} hit a protocol error: ${protocolError}. Validate tool-call IDs and tool responses before retrying.`
         : finishAborted
         ? `${who} called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`
+        : stalledWithoutProgress && changedFiles.size > 0
+        ? `${who} stopped after ${ToolLoopWorker.NO_PROGRESS_ABORT} tool calls with no further edit; the ${changedFiles.size} edited file(s) stand and go to verification. Call finish_task once the focused tests pass instead of re-running the suite.`
         : stalledWithoutProgress
         ? `${who} made ${ToolLoopWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
         : repeatedCall?.startsWith('scope:')
@@ -712,9 +723,15 @@ ${projectContext}
   private assertAllowedCommand(command: unknown, scope?: CommandScope): asserts command is string { assertAllowedCommand(command, scope); }
   private splitPipeline(command: string): string[] { return splitPipeline(command); }
   private parseCommand(command: string): string[] { return parseCommand(command); }
-  private async runSafeCommand(command: string, cwd: string, root: string = cwd, sandbox?: SandboxManager) {
+  /** The model may ask for up to ten minutes; 30 seconds killed every `npm test` in the sandbox. */
+  static commandTimeoutMs(requested: unknown): number {
+    const seconds = Number(requested);
+    return Number.isFinite(seconds) && seconds > 0 ? Math.min(600, Math.max(5, Math.floor(seconds))) * 1000 : 120_000;
+  }
+
+  private async runSafeCommand(command: string, cwd: string, root: string = cwd, sandbox?: SandboxManager, timeoutMs = 120_000) {
     const runner = sandbox ? await sandbox.runnerFor(root, command.trim().split(/\s+/, 1)[0]) : undefined;
-    return runSafeCommand(command, cwd, 30000, { root, runner });
+    return runSafeCommand(command, cwd, timeoutMs, { root, runner });
   }
 
   private truncateToolResult(result: string): string {

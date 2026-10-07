@@ -62,6 +62,8 @@ export interface RefinementInput {
 
 export interface IPlanner {
   provider: PlannerProvider;
+  /** Where the planner reports rejected drafts and repair rounds; the factory wires its own log. */
+  log?: (line: string) => void;
   generateBlueprint(input: PlanningInput): Promise<Blueprint>;
   /** A mid-flight change to an in-progress plan; done tasks must come back unchanged. */
   refineBlueprint(input: RefinementInput): Promise<Blueprint>;
@@ -121,6 +123,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - Sequencing is cheap; a large task is not. Prefer more, smaller, dependency-ordered tasks.
 ` : ''}
 - Put tests before dependent implementation where useful. Put the final cross-cutting quality gate in the last phase.
+- Every agent task changes files. Never emit a task whose only work is running a command ("run the full test suite", "run the build"): that is the verification_command of the task it checks.
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria must be observable outcomes. verification must contain concrete commands or inspection checks.
 - For every test_writer task, declare test_targets and production_targets. If the criterion requires behavior that is not already present, add a dependency on the implementation task first.
@@ -128,7 +131,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
 - executor routes WHO performs a task, and it is a safety boundary. "agent" (the default) is repository-contained work a worker can verify inside its worktree. "orchestrator" is anything that touches the host or a live system: secret values and .env contents, crontab, host config, deploys, container restarts, git push, migrations against a live database. "user" is a decision only the product owner can make. Workers never receive orchestrator or user tasks, so never fold such work into an agent task; split it out.
-- verification_command is ONE command the orchestrator executes verbatim in the task's worktree as the merge gate. No shell operators (no &&, ;, redirects, cd). The executable must be one of npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another read-only tool. npx is not allowed: write "npm test -- --run src/x.test.ts", not "npx vitest run src/x.test.ts". Choose the narrowest command that proves the acceptance criteria.
+- verification_command is ONE command the orchestrator executes verbatim in the task's worktree as the merge gate. No shell operators (no &&, ;, redirects, cd). The executable must be one of npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another read-only tool. npx is not allowed: write "npm test -- --run src/x.test.ts", not "npx vitest run src/x.test.ts". A preload flag may name an installed package ("node --import tsx --test src/x.test.ts" is fine) but never a file. Choose the narrowest command that proves the acceptance criteria.
 - review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
 
 function escalationBlock(recurring?: string[]): string {
@@ -249,6 +252,7 @@ ${JSON.stringify(draft, null, 2)}`;
  */
 abstract class BasePlanner implements IPlanner {
   abstract provider: PlannerProvider;
+  log?: (line: string) => void;
   protected abstract run(prompt: string): Promise<unknown>;
 
   async generateBlueprint(input: PlanningInput): Promise<Blueprint> {
@@ -272,6 +276,8 @@ abstract class BasePlanner implements IPlanner {
       try {
         return validateBlueprint(draft, validationInput);
       } catch (error: any) {
+        const reasons = String(error?.message ?? error).split('\n').filter(l => l.startsWith('- '));
+        this.log?.(`Planner draft rejected${round < REPAIR_ROUNDS ? ` (repair round ${round + 1} of ${REPAIR_ROUNDS})` : ' (no repair rounds left)'}:${reasons.length ? '\n  ' + reasons.join('\n  ') : ' ' + String(error?.message ?? error).replace(/\s+/g, ' ').slice(0, 300)}`);
         if (round === REPAIR_ROUNDS) throw error;
         draft = await this.run(repairPrompt(error, requirement, draft));
       }
@@ -389,6 +395,9 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     ids.add(task.id);
     if (task.acceptance_criteria.length === 0) errors.push(`${task.id} has no acceptance criteria`);
     if (task.verification.length === 0) errors.push(`${task.id} has no verification`);
+    if (task.executor === 'agent' && task.files_hint.length === 0 && task.creates_files.length === 0) {
+      errors.push(`${task.id} changes no files; a command-only task ("run the tests", "run the build") is not worker work, so fold its command into the verification_command of the task it checks`);
+    }
     if (task.agent_role === 'test_writer' && task.production_targets.length === 0 && /(?:service|router|navigation|loading|keyboard|async|implement|create|add )/i.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
       errors.push(`${task.id} requires production_targets or an explicit implementation dependency before tests`);
     }

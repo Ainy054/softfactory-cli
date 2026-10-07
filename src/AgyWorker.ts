@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
-import { IWorker, WorkerOptions } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection } from './IWorker.js';
 
 export class AgyWorker implements IWorker {
   id = 'agy-cloud';
@@ -23,7 +23,7 @@ export class AgyWorker implements IWorker {
   }
 
   async execute(task: Task, worktreePath: string, options: WorkerOptions = {}): Promise<Handoff> {
-    const { onOutput, streamToTerminal = false, projectContext, memoryPatterns, model } = options;
+    const { onOutput, streamToTerminal = false, projectContext, memoryPatterns, model, requirement } = options;
     const selectedModel = model || task.model || this.defaultModel;
     const handoffPath = path.join(worktreePath, '.softfactory', 'handoff.json');
     await fs.mkdir(path.dirname(handoffPath), { recursive: true });
@@ -69,6 +69,8 @@ LESSONS LEARNED FROM PREVIOUS TASKS:
 ${memoryPatterns.map(p => `- ${p}`).join('\n')}
 `;
     }
+
+    prompt += requirementSection(requirement);
 
     prompt += `
 ADVICE & INSTRUCTIONS:

@@ -248,6 +248,7 @@ async function main() {
   }
 
   if (noTui) {
+    factory.on('worker:output', (event: { taskId: string; line: string }) => console.log(`[${event.taskId}] ${String(event.line).slice(0, 240)}`));
     await startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode });
   } else {
     const { render } = await import('ink');

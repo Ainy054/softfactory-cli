@@ -61,7 +61,17 @@ export class TaskVerifier {
         ? worktreePath
         : (await this.exists(path.join(worktreePath, 'frontend', 'package.json')))
           ? path.join(worktreePath, 'frontend') : null;
-    if (!nodeDir || await this.exists(path.join(nodeDir, 'node_modules')) || await this.exists(path.join(worktreePath, 'node_modules'))) {
+    if (!nodeDir) return { ok: true };
+    // With the sandbox on, dependencies are installed inside the Linux image
+    // (once per lockfile) and mounted over node_modules; a host install here
+    // would only put the wrong platform's binaries in the container's way.
+    if (this.sandbox.active) {
+      const mounts = await this.sandbox.nodeDependencyMounts(worktreePath);
+      return mounts.length
+        ? { ok: true }
+        : { ok: false, message: 'Node dependencies could not be installed in the sandbox: no lockfile (package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml or yarn.lock), or the install failed (see the log)' };
+    }
+    if (await this.exists(path.join(nodeDir, 'node_modules')) || await this.exists(path.join(worktreePath, 'node_modules'))) {
       return { ok: true };
     }
     if (!await this.exists(path.join(nodeDir, 'package-lock.json')) && !await this.exists(path.join(nodeDir, 'npm-shrinkwrap.json'))) {
@@ -325,8 +335,11 @@ export class TaskVerifier {
           .filter(f => f.endsWith('.test.ts') || f.endsWith('.test.tsx') || f.endsWith('.spec.ts') || f.endsWith('.spec.tsx'));
 
         // If no test files were explicitly hinted, check if corresponding test files exist on disk for the hinted implementation files
-        if (!fullSuite && testFiles.length === 0 && task?.files_hint) {
-          for (const hint of task.files_hint) {
+        // The file a task creates has a test neighbour as often as the files it
+        // edits: T2 created AgyStream.ts next to T1's AgyStream.test.ts and was
+        // gated on the whole suite instead, which timed out in the sandbox.
+        if (!fullSuite && testFiles.length === 0 && task) {
+          for (const hint of [...(task.files_hint || []), ...(task.creates_files || [])]) {
             const rel = hint.startsWith('frontend/') ? hint.slice('frontend/'.length) : hint;
             const ext = path.extname(rel);
             if (!ext) continue;
@@ -352,8 +365,10 @@ export class TaskVerifier {
         // Falling back to the whole of src gates a task on failures it does not
         // own: godo's T1 touches six config files, yet was held to a green
         // CalendarView.test.tsx that T5-T8 are meant to fix.
+        let broad = fullSuite;
         if (!fullSuite && testFiles.length === 0) {
           testFiles = await this.testDirectoriesForTask(nodeDir, task);
+          broad = true; // a directory of tests is the suite, for a flat project
         }
         // A config-only task has no test neighbourhood at all. Run everything so
         // it cannot break collection or compilation unnoticed, but do not blame
@@ -365,7 +380,9 @@ export class TaskVerifier {
         const runEnv = { ...testEnv, CI: 'true', VITEST_WATCH: 'false' };
         let stdout: string, stderr: string;
         try {
-          ({ stdout, stderr } = await this.run(worktreePath, binary, args, { cwd: nodeDir, env: runEnv, timeout: 180000 }));
+          // A whole suite inside a container on a bind mount runs several times
+          // slower than on the host (this repository: 22s host, 5 min Docker).
+          ({ stdout, stderr } = await this.run(worktreePath, binary, args, { cwd: nodeDir, env: runEnv, timeout: broad || unscoped ? 600000 : 180000 }));
         } catch (runError: any) {
           const out = (runError.stdout || runError.stderr || runError.message || '') as string;
           if (unscoped && this.isPreExistingAssertionFailure(out)) {
@@ -582,6 +599,29 @@ export class TaskVerifier {
    */
   testRunnerArgs(testScript: string, hasVitestBinary: boolean, scope: string[]): { binary: string; args: string[] } {
     if (hasVitestBinary) return { binary: './node_modules/.bin/vitest', args: ['run', ...scope] };
+    // node:test keeps the script's own globs: `npm test -- src/x.test.ts` ran
+    // `node --test src/*.test.ts src/x.test.ts`, the whole suite plus one file,
+    // and a correctly scoped task timed out in the sandbox four times over.
+    // Rebuild the command with the script's flags and only the scope.
+    const nodeTest = testScript.trim().match(/^node\s+(.*)$/);
+    const testFilesOnly = scope.length > 0 && scope.every(entry => /\.(test|spec)\.[cm]?[jt]sx?$/.test(entry));
+    if (nodeTest && /(^|\s)--test(\s|$)/.test(testScript) && !testFilesOnly) {
+      // A directory or the whole suite: the script's own globs are the suite,
+      // and `node --test <dir>` finds nothing on Node 20.
+      return { binary: 'npm', args: ['test'] };
+    }
+    if (nodeTest && /(^|\s)--test(\s|$)/.test(testScript)) {
+      const tokens = nodeTest[1].split(/\s+/).filter(Boolean);
+      const valued = new Set(['--import', '--require', '-r', '--loader', '--experimental-loader', '--test-reporter', '--test-reporter-destination', '--test-concurrency', '--test-name-pattern', '--test-skip-pattern']);
+      const kept: string[] = [];
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (!token.startsWith('-')) continue; // a positional file or glob: replaced by the scope
+        kept.push(token);
+        if (valued.has(token) && i + 1 < tokens.length) kept.push(tokens[++i]);
+      }
+      return { binary: 'node', args: [...kept, ...scope] };
+    }
     const usesVitest = /\bvitest\b/.test(testScript);
     return { binary: 'npm', args: ['test', '--', ...(usesVitest ? ['--run'] : []), ...scope] };
   }
@@ -666,6 +706,11 @@ export class TaskVerifier {
     if (options.evidenceDir) {
       evidencePath = path.join(options.evidenceDir, `${task.id}-attempt${(task.attempts ?? 0) + 1}.log`);
       await fs.mkdir(options.evidenceDir, { recursive: true });
+      // Never overwrite: a resumed run re-numbers attempts after a ghost reset,
+      // and the journal holds the hash of the file written the first time.
+      for (let n = 2; await this.exists(evidencePath); n++) {
+        evidencePath = path.join(options.evidenceDir, `${task.id}-attempt${(task.attempts ?? 0) + 1}-${n}.log`);
+      }
       await fs.writeFile(evidencePath, [
         '# softfactory acceptance evidence',
         `task: ${task.id}`,
@@ -727,6 +772,16 @@ export class TaskVerifier {
         filesFailed: files?.failed || 0, filesPassed: files?.passed || 0,
         testsFailed: tests?.failed || 0, testsPassed: tests?.passed || 0,
       };
+    }
+    // node:test's TAP tally: "# tests 400", "# pass 398", "# fail 2"; each file
+    // is a top-level test line. Before this the Go regex below counted the
+    // first five "ok N - ..." lines and called the baseline "5 passing".
+    const tapTests = output.match(/^# tests (\d+)\s*$/m);
+    if (tapTests) {
+      const tally = (label: string) => Number((output.match(new RegExp(`^# ${label} (\\d+)\\s*$`, 'm')) || [])[1] || 0);
+      const fileLines = output.match(/^(?:not )?ok \d+ - \S+\.(?:test|spec)\.[cm]?[jt]sx?\b/gm) || [];
+      const filesFailed = fileLines.filter(line => line.startsWith('not ok')).length;
+      return { filesFailed, filesPassed: fileLines.length - filesFailed, testsFailed: tally('fail') + tally('cancelled'), testsPassed: tally('pass') };
     }
     const goFail = (output.match(/^--- FAIL:/gm) || []).length;
     const goPass = (output.match(/^--- PASS:/gm) || []).length + (output.match(/^ok\s+\S+/gm) || []).length;
