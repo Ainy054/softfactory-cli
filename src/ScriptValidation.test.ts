@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { execa } from 'execa';
 import { LocalAgentWorker } from './ToolLoopWorker.js';
 import { Factory } from './Factory.js';
 
@@ -25,12 +27,17 @@ const GOOD_TS = BROKEN_TS.replace(/^\s+\],\n\s+\],\n/m, '');
 
 /** A worktree with the project's own esbuild, as a real target repo has. */
 async function worktreeWithEsbuild() {
+  let real: string;
+  try {
+    const require = createRequire(import.meta.url);
+    real = path.join(path.dirname(require.resolve('esbuild/package.json')), 'bin', 'esbuild');
+    await fs.access(real);
+    await execa(real, ['--version'], { timeout: 2_000 });
+  } catch { return null; }
+
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-ts-'));
   await fs.mkdir(path.join(dir, 'frontend', 'node_modules', '.bin'), { recursive: true });
-  const real = '/Users/buv/godo/frontend/node_modules/.bin/esbuild';
-  try {
-    await fs.symlink(real, path.join(dir, 'frontend', 'node_modules', '.bin', 'esbuild'));
-  } catch { return null; }
+  await fs.symlink(real, path.join(dir, 'frontend', 'node_modules', '.bin', 'esbuild'));
   return dir;
 }
 
