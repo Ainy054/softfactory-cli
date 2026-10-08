@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { execa } from 'execa';
 import { HostRunner, type CommandRunner } from './Sandbox.js';
 
@@ -149,6 +150,18 @@ export function safeCommandEnv(): NodeJS.ProcessEnv {
 
 export interface SafeCommandResult { stdout: string; stderr: string; exitCode: number }
 
+/** Selects a host shell only for explicitly unblocked experiments. */
+export function selectHostShell(
+  env: { SHELL?: string } = process.env,
+  exists: (file: string) => boolean = existsSync,
+): { shell: string; flag: '-lc' | '-c' } {
+  const candidates = [env.SHELL, '/bin/zsh', '/bin/bash', '/bin/sh'];
+  const shell = candidates.find((candidate): candidate is string => !!candidate && exists(candidate));
+  if (!shell) throw new Error('No host shell found: SHELL and /bin/zsh, /bin/bash, /bin/sh do not exist.');
+  const name = path.basename(shell);
+  return { shell, flag: name === 'zsh' || name === 'bash' ? '-lc' : '-c' };
+}
+
 export interface RunSafeOptions {
   /** The worktree; path arguments must stay inside it. Defaults to cwd. */
   root?: string;
@@ -165,8 +178,8 @@ export async function runSafeCommand(command: string, cwd: string, timeoutMs = 3
   const runner = options.runner || new HostRunner();
   const scope: CommandScope = { root: options.root || cwd, cwd };
   if (process.env.SOFTFACTORY_DISABLE_TOOL_BLOCKING === '1') {
-    const shell = runner.kind === 'docker' ? 'sh' : '/bin/zsh';
-    return runner.exec(shell, [runner.kind === 'docker' ? '-c' : '-lc', command], { cwd, timeout: timeoutMs, env: safeCommandEnv() });
+    const { shell, flag } = runner.kind === 'docker' ? { shell: 'sh', flag: '-c' } : selectHostShell();
+    return runner.exec(shell, [flag, command], { cwd, timeout: timeoutMs, env: safeCommandEnv() });
   }
   const segments = splitPipeline(command);
   let input: string | undefined;
