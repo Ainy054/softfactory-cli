@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, requirementSection } from './IWorker.js';
+import { AgyStreamRelay } from './AgyStream.js';
 
 export class AgyWorker implements IWorker {
   id = 'agy-cloud';
@@ -106,6 +107,7 @@ The JSON must follow this exact schema:
     const args = [
       '--model', selectedModel,
       '--dangerously-skip-permissions',
+      '--output-format', 'stream-json',
       '--print', prompt
     ];
 
@@ -113,19 +115,36 @@ The JSON must follow this exact schema:
 
     const proc = execa('agy', args, {
       cwd: worktreePath,
-      stdio: useStreaming ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+      stdio: ['ignore', 'pipe', useStreaming ? 'pipe' : 'inherit'],
       timeout: 600000,
       ...(options?.signal ? { cancelSignal: options.signal } : {}),
     });
 
-    if (useStreaming && proc.stdout) {
+    const relay = new AgyStreamRelay(
+      (line) => {
+        if (onOutput) {
+          onOutput(line);
+        } else {
+          console.log(line);
+        }
+      },
+      options.onUsage
+    );
+
+    if (proc.stdout) {
       let buffer = '';
       proc.stdout.on('data', (chunk: Buffer) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         for (const line of lines) {
-          if (line.trim()) onOutput(line);
+          if (line.trim()) relay.push(line);
+        }
+      });
+      proc.stdout.on('end', () => {
+        if (buffer.trim()) {
+          relay.push(buffer);
+          buffer = '';
         }
       });
     }
