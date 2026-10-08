@@ -62,6 +62,12 @@ export class TaskVerifier {
         : (await this.exists(path.join(worktreePath, 'frontend', 'package.json')))
           ? path.join(worktreePath, 'frontend') : null;
     if (!nodeDir) return { ok: true };
+    // A package with nothing to install needs no lockfile and no install.
+    try {
+      const pkg = JSON.parse(await fs.readFile(path.join(nodeDir, 'package.json'), 'utf8'));
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}), ...(pkg.optionalDependencies || {}) };
+      if (Object.keys(deps).length === 0) return { ok: true };
+    } catch { /* unreadable package.json: let the install path report it */ }
     // With the sandbox on, dependencies are installed inside the Linux image
     // (once per lockfile) and mounted over node_modules; a host install here
     // would only put the wrong platform's binaries in the container's way.

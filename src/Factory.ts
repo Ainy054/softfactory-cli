@@ -16,6 +16,9 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
+import { loadUat, runUat, UAT_FILE, type UatResult } from './Uat.js';
+import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
+import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
 import { RunJournal } from './RunJournal.js';
 import { GitHub, buildPullRequestBody } from './PullRequest.js';
 import { SOFTFACTORY_VERSION } from './version.js';
@@ -55,6 +58,8 @@ export interface FactoryOptions {
     prMode?: boolean;
     /** The issue the requirement was read from, so the pull request can close it. */
     issue?: { number: number; url: string; title: string };
+    /** Skip .softfactory/uat.json at the end of the run. */
+    skipUat?: boolean;
 }
 
 export class Factory extends EventEmitter {
@@ -81,6 +86,7 @@ export class Factory extends EventEmitter {
     /** Short facts learned during this run, handed to the tasks that run after. */
     runNotes: Array<{ taskId: string; note: string }> = [];
     prMode: boolean;
+    skipUat = false;
     issue: { number: number; url: string; title: string } | undefined;
     /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
     github: GitHub;
@@ -116,7 +122,8 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false } = options;
+        this.skipUat = skipUat;
         this.prMode = prMode;
         this.issue = issue;
         this.github = new GitHub(baseDir);
@@ -475,9 +482,7 @@ export class Factory extends EventEmitter {
         const repositoryFiles = new Set(await this.getRepositoryFiles());
         const memoryPatterns = await this.getMemoryPatterns();
         const history = await this.getHistory();
-        const featureHistory = history.length > 0
-            ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
-            : '';
+        const featureHistory = await this.planningHistory(history, requirement);
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
         const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
@@ -536,9 +541,7 @@ export class Factory extends EventEmitter {
         const repositoryFiles = new Set(await this.getRepositoryFiles());
         const memoryPatterns = await this.getMemoryPatterns();
         const history = await this.getHistory();
-        const featureHistory = history.length > 0
-            ? history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n')
-            : '';
+        const featureHistory = await this.planningHistory(history, requirement);
         const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
@@ -736,7 +739,7 @@ export class Factory extends EventEmitter {
             for (const task of readyTasks) {
                 const branchName = `line/${task.id}`;
                 try {
-                    const worktreePath = await this.worktreeManager.create(task.id, branchName, task.attempts > 0);
+                    const worktreePath = await this.worktreeManager.create(task.id, branchName, task.attempts > 0 || task.micro_fix_used);
                     worktreeMap.set(task.id, worktreePath);
                 }
                 catch (e) {
@@ -755,9 +758,24 @@ export class Factory extends EventEmitter {
             for (const result of results) {
                 if (result.status === 'fulfilled' && result.value) {
                     const { task, branchName } = result.value;
+                    const stale = await this.forkFreshness(task, branchName, worktreeMap.get(task.id));
+                    if (stale) {
+                        task.status = 'failed';
+                        task.attempts++;
+                        task.last_feedback = stale;
+                        task.error_history = [...(task.error_history || []), stale.slice(0, 500)];
+                        this.log(`STALE FORK: ${task.id} — ${stale.split('\n')[0]}`);
+                        await this.recordAttempt(task, 'stale_fork', stale);
+                        this.emitEvent({ type: 'task:fail', task, feedback: stale });
+                        continue;
+                    }
                     try {
                         await this.worktreeManager.merge(task.id, branchName, this.mergeTarget());
                         task.status = 'done';
+                        await appendHandoff(this.baseDir, {
+                            date: new Date().toISOString().slice(0, 10), feature_id: this.state.feature_id, task_id: task.id, title: task.title,
+                            files: [...new Set([...task.files_hint, ...task.creates_files])], acceptance: task.verification_command || '', summary: task.handoff_summary || '',
+                        }).catch(() => undefined);
                         await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
@@ -890,7 +908,7 @@ export class Factory extends EventEmitter {
             this.emitEvent({ type: 'task:fail', task, feedback: task.last_feedback });
         };
         const branchName = `line/${task.id}`;
-        const worktreePath = preCreatedWorktree || await this.worktreeManager.create(task.id, branchName, task.attempts > 0);
+        const worktreePath = preCreatedWorktree || await this.worktreeManager.create(task.id, branchName, task.attempts > 0 || task.micro_fix_used);
         try {
             const { worker, model, provider, escalated } = await this.workerRegistry.resolveWorker(task);
             task.model = model;
@@ -1153,7 +1171,7 @@ export class Factory extends EventEmitter {
                     this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Synthesizing Epiphany from ${task.error_history.length} failures...` });
                     try {
                         const epiphany = await this.inspector.synthesizeEpiphany(task, diff);
-                        if (epiphany?.should_save && await this.lessons.add({ lesson: String(epiphany.lesson).slice(0, 500), tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
+                        if (epiphany?.should_save && await this.lessons.add({ lesson: String(epiphany.lesson).slice(0, 500), check: epiphany.check ? String(epiphany.check) : undefined, tags: epiphany.tags || [], scope: epiphany.scope || 'project', confidence: epiphany.confidence || 0, evidence: { taskId: task.id, failure: task.error_history.join('\n').slice(0, 500), resolution: handoff.summary } })) {
                             this.state.memory_patterns = this.state.memory_patterns || [];
                             this.state.memory_patterns.push(epiphany.lesson);
                             this.addRunNote(task.id, epiphany.lesson);
@@ -1164,6 +1182,8 @@ export class Factory extends EventEmitter {
                     }
                 }
 
+                task.handoff_summary = String(handoff.summary || '').slice(0, 600);
+                await this.noteUnwired(task, worktreePath);
                 if (this.trainingCaptureEnabled) {
                     const captured = await this.trainingData.addVerified({ task, diff, verification: verifierResult.testSummary, resolution: handoff.summary });
                     if (captured) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Training candidate saved (sanitized, verified)` });
@@ -1174,6 +1194,18 @@ export class Factory extends EventEmitter {
             else {
                 this.log(`FAILED: ${task.id}. Feedback: ${review.feedback}`);
                 this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector: FAILED - ${review.feedback.slice(0, 120)}` });
+                if (this.microFixAllowed(task, review)) {
+                    // Softhouse's MICRO-FIX: a defect with one correct form costs a
+                    // narrow repair, not an attempt. Everything re-runs afterwards:
+                    // gates, acceptance and a full review of the new diff.
+                    task.micro_fix_used = true;
+                    task.status = 'failed';
+                    task.last_feedback = `MICRO-FIX (mechanical; one per task; no attempt charged). Fix exactly these defects and nothing else, then finish:\n${review.feedback}`.slice(0, 4000);
+                    this.log(`MICRO-FIX: ${task.id} — the reviewer called the defect mechanical; one narrow repair, no attempt charged.`);
+                    await this.recordAttempt(task, 'micro_fix', review.feedback);
+                    this.emitEvent({ type: 'task:fail', task, feedback: task.last_feedback });
+                    return null;
+                }
                 processFailure(review.feedback);
                 return null;
             }
@@ -1249,6 +1281,8 @@ export class Factory extends EventEmitter {
             } else if (executed.some(check => !check.passed)) {
                 this.log('Final gate: pre-existing failures only, not attributed to this build.');
             }
+            if (this.state.status === 'completed') await this.wiringGate();
+            if (this.state.status === 'completed') await this.uatGate();
     }
 
     /** Tallies say this run is no worse than the base branch was: pre-existing red, not this build's. */
@@ -1307,6 +1341,12 @@ export class Factory extends EventEmitter {
     }
 
     async captureBaseline() {
+        if (this.state && !this.state.wiring_baseline) {
+            try {
+                this.state.wiring_baseline = (await wiringCensus(this.baseDir)).map(censusKey);
+                this.log(`Wiring census on ${this.defaultBranch}: ${this.state.wiring_baseline.length} export(s) with no call site; this run may not add one.`);
+            } catch { /* not a git checkout we can read: the ratchet stays off */ }
+        }
         try {
             const results = await this.taskVerifier.verifyAll(this.baseDir);
             const counted = results.filter(r => r.counts);
@@ -1344,7 +1384,7 @@ export class Factory extends EventEmitter {
         const model = verdicts.map(v => v.model).join('+');
         const failed = verdicts.filter(v => v.verdict === 'FAIL');
         if (failed.length === 0) return { review: { verdict: 'PASS', feedback: verdicts.map(v => `${label(v)}: ${v.feedback}`).join('\n\n'), provider, model }, inspection };
-        if (failed.length === verdicts.length) return { review: { verdict: 'FAIL', feedback: verdicts.map(v => `${label(v)}: ${v.feedback}`).join('\n\n'), provider, model }, inspection };
+        if (failed.length === verdicts.length) return { review: { verdict: 'FAIL', feedback: verdicts.map(v => `${label(v)}: ${v.feedback}`).join('\n\n'), provider, model, ...(failed.every(v => v.fixKind === 'mechanical') ? { fixKind: 'mechanical' as const } : { fixKind: 'logic' as const }) }, inspection };
         if (blind) {
             // Protected code needs every reviewer's agreement.
             return { review: { verdict: 'FAIL', feedback: `Reviewers disagreed on a protected diff, so it does not merge. ${failed.map(v => `${label(v)} failed it: ${v.feedback}`).join(' ')}`, provider, model }, inspection };
@@ -1703,8 +1743,10 @@ export class Factory extends EventEmitter {
                 catch { }
                 const separator = existing ? '\n\n---\n\n' : '';
                 const header = `## ${this.state.feature} (${this.state.feature_id})\n`;
-                await fs.appendFile(this.memoryPath, `${separator}${header}${memory}\n`);
-                this.log('Memory saved to FACTORY_MEMORY.md');
+                const { kept, archived } = Factory.boundMemory(`${existing}${separator}${header}${memory}\n`);
+                if (archived) await fs.appendFile(this.memoryPath.replace(/\.md$/, '.archive.md'), `${archived}\n`);
+                await fs.writeFile(this.memoryPath, kept);
+                this.log(`Memory saved to FACTORY_MEMORY.md${archived ? ` (older sections moved to FACTORY_MEMORY.archive.md to stay within ${Factory.MEMORY_MAX_LINES} lines)` : ''}`);
             }
         }
         catch (e) {
@@ -1762,6 +1804,7 @@ export class Factory extends EventEmitter {
      */
     async getProjectContext(worktreePath: string, task?: { files_hint?: string[]; creates_files?: string[] }) {
         const parts: string[] = [];
+        const digest = await this.workerContextDigest();
         let tracked: string[] = [];
         try {
             const { stdout } = await execa('git', ['ls-files'], { cwd: worktreePath });
@@ -1784,9 +1827,11 @@ export class Factory extends EventEmitter {
         }
         catch { }
         const context = parts.join('\n\n');
-        return context.length > Factory.MAX_PROJECT_CONTEXT_CHARS
+        const listing = context.length > Factory.MAX_PROJECT_CONTEXT_CHARS
             ? `${context.slice(0, Factory.MAX_PROJECT_CONTEXT_CHARS)}\n...[project context truncated]`
             : context;
+        // The digest has its own 200-line bound and leads, outside the listing's cap.
+        return digest ? `${digest}\n\n${listing}` : listing;
     }
     async getRepositoryFiles(): Promise<string[]> {
         const { stdout } = await execa('git', ['ls-files'], { cwd: this.baseDir });
@@ -1834,6 +1879,161 @@ export class Factory extends EventEmitter {
             ? `${lessons}\n\nArchitectural memory from previous builds:\n${memory.trim()}`
             : lessons;
     }
+    static readonly MEMORY_MAX_LINES = 150;
+    static readonly WORKER_CONTEXT_MAX_LINES = 200;
+
+    /**
+     * FACTORY_MEMORY.md is read by every plan; Softhouse caps its equivalent
+     * at 150 lines because a file that only grows stops being read. Whole
+     * sections, oldest first, move to the archive until the rest fits.
+     */
+    static boundMemory(text: string, maxLines = Factory.MEMORY_MAX_LINES): { kept: string; archived: string } {
+        const sections = text.split(/\n\n---\n\n/);
+        const archived: string[] = [];
+        while (sections.length > 1 && sections.join('\n\n---\n\n').split('\n').length > maxLines) archived.push(sections.shift()!);
+        let kept = sections.join('\n\n---\n\n');
+        const lines = kept.split('\n');
+        if (lines.length > maxLines) {
+            archived.push(lines.slice(0, lines.length - maxLines).join('\n'));
+            kept = lines.slice(-maxLines).join('\n');
+        }
+        return { kept: kept.endsWith('\n') ? kept : `${kept}\n`, archived: archived.join('\n\n---\n\n') };
+    }
+
+    /**
+     * .softfactory/worker-context.md: the short, curated digest every worker
+     * reads first (Softhouse's worker-context.md). It is the project's own
+     * words about conventions and traps, read from the main checkout, and it
+     * forms a prefix every worker prompt shares.
+     */
+    async workerContextDigest(): Promise<string> {
+        let text: string;
+        try { text = await fs.readFile(path.join(this.baseDir, '.softfactory', 'worker-context.md'), 'utf8'); }
+        catch { return ''; }
+        const lines = text.trimEnd().split('\n');
+        if (lines.length > Factory.WORKER_CONTEXT_MAX_LINES && !this.warnedLongDigest) {
+            this.warnedLongDigest = true;
+            this.log(`WARNING: .softfactory/worker-context.md has ${lines.length} lines; workers see the first ${Factory.WORKER_CONTEXT_MAX_LINES}. Shorten it.`);
+        }
+        return `Project digest (.softfactory/worker-context.md):\n${lines.slice(0, Factory.WORKER_CONTEXT_MAX_LINES).join('\n')}`;
+    }
+    private warnedLongDigest = false;
+
+    /** Prior features plus, from the handoff index, the merged tasks most like this requirement. */
+    async planningHistory(history: Array<{ feature: string; status: string; tasks_done: number; task_count: number }>, requirement: string): Promise<string> {
+        const features = history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n');
+        const similar = await similarHandoffs(this.baseDir, requirement).catch(() => [] as string[]);
+        if (similar.length) this.log(`Handoff index: ${similar.length} similar past task(s) given to the planner.`);
+        return [features, similar.length ? `Similar tasks already merged in this repository (reuse their split and their checks where they fit):\n${similar.join('\n')}` : ''].filter(Boolean).join('\n\n');
+    }
+
+    /**
+     * One micro-fix per task, never on protected code, and only when every
+     * reviewer that failed the diff called the defect mechanical.
+     */
+    microFixAllowed(task: Task, review: { fixKind?: 'mechanical' | 'logic' }): boolean {
+        return review.fixKind === 'mechanical' && !task.protected && !task.micro_fix_used && task.agent_role !== 'test_writer';
+    }
+
+    /**
+     * Fork freshness, borrowed from Softhouse's merge-base check. Tasks of one
+     * phase fork from the same commit and merge one after another, so every
+     * branch after the first was judged against a target that has since moved.
+     * A three-way merge keeps disjoint files and silently combines co-edited
+     * ones. When the target has moved, merge it into the line branch first and
+     * re-run the task's acceptance on the result. Null when the branch may merge.
+     */
+    async forkFreshness(task: Task, branchName: string, worktreePath?: string): Promise<string | null> {
+        if (!worktreePath) return null;
+        const target = this.mergeTarget();
+        const git = (args: string[], cwd = this.baseDir) => execa('git', args, { cwd, reject: false });
+        const [base, head] = await Promise.all([git(['merge-base', target, branchName]), git(['rev-parse', target])]);
+        if (base.exitCode !== 0 || head.exitCode !== 0 || base.stdout.trim() === head.stdout.trim()) return null;
+        const moved = (await git(['diff', '--name-only', base.stdout.trim(), head.stdout.trim()])).stdout.split('\n').filter(Boolean);
+        const mine = (await git(['diff', '--name-only', `${base.stdout.trim()}..${branchName}`])).stdout.split('\n').filter(Boolean);
+        const shared = mine.filter(f => moved.includes(f));
+        this.log(`FORK: ${task.id} forked before ${target} moved (${moved.length} file(s) changed since${shared.length ? `, ${shared.length} also edited here: ${shared.slice(0, 5).join(', ')}` : ''}); merging ${target} into the branch and re-checking.`);
+        const merged = await git(['merge', '--no-edit', '-m', `softfactory: bring ${task.id} up to ${target}`, target], worktreePath);
+        if (merged.exitCode !== 0) {
+            const conflicts = (await git(['diff', '--name-only', '--diff-filter=U'], worktreePath)).stdout.split('\n').filter(Boolean);
+            await git(['merge', '--abort'], worktreePath);
+            return `This branch conflicts with work merged after it started (${conflicts.join(', ') || 'see git output'}). Redo the change on top of the current code: re-read those files first.`;
+        }
+        if (!task.verification_command || task.agent_role === 'test_writer') return null;
+        const acceptance = await this.taskVerifier.runAcceptance(worktreePath, task, {
+            evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
+            note: `re-run after merging ${target} into ${branchName}`,
+        });
+        await this.journal()?.append('task:fork-recheck', { task_id: task.id, target, shared_files: shared, passed: acceptance.passed, exit_code: acceptance.exitCode }, acceptance.evidencePath ? [acceptance.evidencePath] : []).catch(() => undefined);
+        if (acceptance.passed) return null;
+        await git(['reset', '--hard', 'HEAD~1'], worktreePath);
+        return `Combined with work merged after this task started, its acceptance command fails: ${task.verification_command} exited ${acceptance.exitCode ?? 'without running'}.${shared.length ? ` Both changed: ${shared.join(', ')}.` : ''} Re-read the current code and make the change work with it.\n${acceptance.output.slice(-1200)}`;
+    }
+
+    /** A per-task note, never a failure: the export may be wired by a later task of this run. */
+    async noteUnwired(task: Task, worktreePath: string): Promise<void> {
+        if (!this.state?.wiring_baseline) return;
+        try {
+            const added = newlyUnwired(this.state.wiring_baseline, await wiringCensus(worktreePath));
+            if (added.length) {
+                const names = added.map(u => `${u.name} (${u.file})`).join(', ');
+                this.log(`WIRING: ${task.id} adds export(s) nothing calls yet: ${names}. A later task must wire them, or the final gate fails.`);
+                this.addRunNote(task.id, `exports not yet wired: ${names}`);
+            }
+        } catch { /* census is advisory per task */ }
+    }
+
+    /** The run may not end with more library code that nothing calls than it started with. */
+    async wiringGate(): Promise<void> {
+        if (!this.state.wiring_baseline) return;
+        const added = newlyUnwired(this.state.wiring_baseline, await wiringCensus(this.baseDir).catch(() => []));
+        await this.journal()?.append('run:wiring', { baseline: this.state.wiring_baseline.length, added: added.map(censusKey) }).catch(() => undefined);
+        if (!added.length) {
+            this.log(`Wiring census: no new export without a call site (${this.state.wiring_baseline.length} before the run).`);
+            return;
+        }
+        this.log(`FINAL GATE FAILED: this run added library code that nothing calls: ${added.map(u => `${u.name} (${u.file})`).join(', ')}. Wire it, or stop exporting it.`);
+        this.state.status = 'failed';
+        await this.saveState();
+        await this.updateHistory('failed');
+    }
+
+    /**
+     * Live verification against .softfactory/uat.json in the main checkout:
+     * build, binary proof, setup, reachability probes. Absent file: logged,
+     * never a pass dressed up as one.
+     */
+    async uatGate(): Promise<UatResult | undefined> {
+        if (this.skipUat) { this.log('UAT: skipped (--no-uat).'); return undefined; }
+        let config;
+        try { config = await loadUat(this.baseDir); }
+        catch (error: any) {
+            this.log(`UAT FAILED: ${error.message}`);
+            this.state.status = 'failed';
+            await this.saveState();
+            await this.updateHistory('failed');
+            return undefined;
+        }
+        if (!config) {
+            this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
+            return undefined;
+        }
+        this.log(`UAT: running ${UAT_FILE} on ${this.mergeTarget()} (host, network on: this is the orchestrator's check of the live stack).`);
+        const result = await runUat(this.baseDir, config, {
+            runId: `${this.state.feature_id}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
+            evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
+        });
+        for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
+        await this.journal()?.append('uat:result', { passed: result.passed, steps: result.steps.map(s => ({ name: s.name, passed: s.passed })) }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
+        if (!result.passed) {
+            this.log(`UAT FAILED: the merged code does not pass live verification (evidence: ${result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none'}).`);
+            this.state.status = 'failed';
+            await this.saveState();
+            await this.updateHistory('failed');
+        }
+        return result;
+    }
+
     async getDiff(branch: string) {
         const { stdout } = await execa('git', ['diff', `${this.mergeTarget()}...${branch}`], { cwd: this.baseDir });
         return stdout;

@@ -6,6 +6,8 @@ import type { ITextModel } from './TextModel.js';
 export interface InspectionResult {
   verdict: 'PASS' | 'FAIL';
   feedback: string;
+  /** For a FAIL: mechanical (one correct form, no test could disagree) or logic. Absent on PASS or when the reviewer did not say. */
+  fixKind?: 'mechanical' | 'logic';
   provider: string;
   model: string;
 }
@@ -13,6 +15,8 @@ export interface InspectionResult {
 export interface Epiphany {
   should_save: boolean;
   lesson: string;
+  /** The command or gate that would have caught the failure; a lesson without one is not saved. */
+  check?: string;
   tags?: string[];
   scope?: 'project' | 'language' | 'path';
   confidence?: number;
@@ -52,9 +56,15 @@ Verdict Rules:
 3. If the task role is "test_writer" (TDD): It is EXPECTED and NORMAL for newly written test assertions to fail against not-yet-implemented business logic. You must NOT fail a "test_writer" task simply because the tests fail against unimplemented code, as long as the test code compiles and validly tests the required behavior.
 4. For implementation roles ("coder", etc.): Ensure automated tests compile and pass.
 
+
+If the verdict is FAIL, classify the fix:
+- "mechanical": every defect has exactly one correct form and no test could disagree with it (a typo in a message, a missing import, an off-by-one in a script, a wrong file name in a string).
+- "logic": anything else. Error or status-code mapping, TTL or expiry rules, auth or role lists, configuration inside folded YAML, and any change to what a function returns are logic at any line count.
+
 CRITICAL: Return ONLY a valid JSON object:
 {
   "verdict": "PASS" | "FAIL",
+  "fix_kind": "none" | "mechanical" | "logic",
   "feedback": "Concise explanation of your decision"
 }
 `;
@@ -70,6 +80,7 @@ CRITICAL: Return ONLY a valid JSON object:
       const parsed = extractJson(raw);
       return {
         verdict: parsed.verdict?.toUpperCase() === 'PASS' ? 'PASS' : 'FAIL',
+        ...(parsed.verdict?.toUpperCase() !== 'PASS' && ['mechanical', 'logic'].includes(parsed.fix_kind) ? { fixKind: parsed.fix_kind } : {}),
         feedback: parsed.feedback || 'No feedback provided.',
         provider: this.provider,
         model: this.model,
@@ -123,9 +134,15 @@ ${verifierOutput || '(none)'}
 Diff:
 ${diff}
 
+
+If the verdict is FAIL, classify the fix:
+- "mechanical": every defect has exactly one correct form and no test could disagree with it (a typo in a message, a missing import, an off-by-one in a script, a wrong file name in a string).
+- "logic": anything else. Error or status-code mapping, TTL or expiry rules, auth or role lists, configuration inside folded YAML, and any change to what a function returns are logic at any line count.
+
 CRITICAL: Return ONLY a valid JSON object:
 {
   "verdict": "PASS" | "FAIL",
+  "fix_kind": "none" | "mechanical" | "logic",
   "feedback": "findings first (severity, location, what is wrong, the fix), then Checked: ..."
 }
 `;
@@ -139,6 +156,7 @@ CRITICAL: Return ONLY a valid JSON object:
       const parsed = extractJson(raw);
       return {
         verdict: parsed.verdict?.toUpperCase() === 'PASS' ? 'PASS' : 'FAIL',
+        ...(parsed.verdict?.toUpperCase() !== 'PASS' && ['mechanical', 'logic'].includes(parsed.fix_kind) ? { fixKind: parsed.fix_kind } : {}),
         feedback: parsed.feedback || 'No feedback provided.',
         provider: this.provider,
         model: this.model,
@@ -149,7 +167,7 @@ CRITICAL: Return ONLY a valid JSON object:
   }
 
   async synthesizeEpiphany(task: Task, diff: string): Promise<Epiphany | null> {
-    const prompt = `Extract one specific, reusable project lesson from this successfully repaired task. Return only JSON: {"should_save":boolean,"lesson":string,"tags":string[],"scope":"project"|"language"|"path","confidence":number}. Reject generic advice.\nTask: ${task.description}\nFailures: ${(task.error_history || []).join('\n')}\nFinal diff: ${diff.slice(0, 6000)}`;
+    const prompt = `Extract one specific, reusable project lesson from this successfully repaired task. Return only JSON: {"should_save":boolean,"lesson":string,"check":string,"tags":string[],"scope":"project"|"language"|"path","confidence":number}. "check" is the concrete command, test or gate that would have caught this failure before review (for example "npm test -- src/x.test.ts" or "grep -n 'export' src/x.ts"); if no check could have caught it, set should_save to false. Reject generic advice.\nTask: ${task.description}\nFailures: ${(task.error_history || []).join('\n')}\nFinal diff: ${diff.slice(0, 6000)}`;
     try {
       return extractJson<Epiphany>(await this.textModel.complete(prompt, { timeoutMs: 60000, json: true }));
     } catch {

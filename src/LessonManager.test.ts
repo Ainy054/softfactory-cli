@@ -11,7 +11,7 @@ describe('LessonManager', () => {
     try {
       await fs.mkdir(path.join(dir, '.softfactory'));
       const lessons = new LessonManager(dir);
-      const candidate = { lesson: 'Run PostgreSQL migrations before backend integration tests.', tags: ['postgresql', 'migrations', 'backend'], scope: 'project' as const, confidence: 0.9, evidence: { taskId: 'T001', failure: 'migration missing', resolution: 'ran migrations' } };
+      const candidate = { lesson: 'Run PostgreSQL migrations before backend integration tests.', tags: ['postgresql', 'migrations', 'backend'], scope: 'project' as const, confidence: 0.9, check: 'make migrate-check', evidence: { taskId: 'T001', failure: 'migration missing', resolution: 'ran migrations' } };
       assert.equal(await lessons.add(candidate), true);
       assert.equal(await lessons.add(candidate), false);
       const relevant = await lessons.getRelevant({ title: 'Add PostgreSQL migration', description: 'backend migration', agent_role: 'coder', files_hint: ['backend/db.go'] });

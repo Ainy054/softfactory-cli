@@ -9,7 +9,7 @@ describe('TaskVerifier', () => {
   it('fails closed when Node dependencies are unavailable', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-verifier-'));
     try {
-      await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+      await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' }, devDependencies: { vitest: '^3.0.0' } }));
       const result = await new TaskVerifier().verify(dir);
       assert.equal(result.executed, false);
       assert.equal(result.passed, false);

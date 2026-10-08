@@ -149,15 +149,25 @@ export class WorktreeManager {
       '.env.local',
     ];
 
-    const gitignorePath = path.join(worktreePath, '.gitignore');
+    // git's own per-repository exclude file, shared by every worktree. Writing
+    // the tracked .gitignore instead left the user's checkout dirty on every
+    // run, and the next preflight warned about softfactory's own edit.
+    const { stdout: commonDir } = await execa('git', ['rev-parse', '--git-common-dir'], { cwd: worktreePath });
+    const gitignorePath = path.join(path.resolve(worktreePath, commonDir.trim()), 'info', 'exclude');
+    await fs.mkdir(path.dirname(gitignorePath), { recursive: true });
     let existing = '';
     try {
       existing = await fs.readFile(gitignorePath, 'utf-8');
     } catch {}
+    try {
+      existing += `\n${await fs.readFile(path.join(worktreePath, '.gitignore'), 'utf-8')}`;
+    } catch {}
 
-    const missing = REQUIRED_ENTRIES.filter(e => !existing.includes(e));
+    const missing = REQUIRED_ENTRIES.filter(e => !existing.split('\n').some(line => line.trim() === e || line.trim() === e.replace(/\/$/, '')));
     if (missing.length > 0) {
-      const suffix = (existing && !existing.endsWith('\n') ? '\n' : '') + missing.join('\n') + '\n';
+      let current = '';
+      try { current = await fs.readFile(gitignorePath, 'utf-8'); } catch {}
+      const suffix = (current && !current.endsWith('\n') ? '\n' : '') + `# added by softfactory\n${missing.join('\n')}\n`;
       await fs.appendFile(gitignorePath, suffix);
     }
   }

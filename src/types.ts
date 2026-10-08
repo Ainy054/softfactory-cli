@@ -45,6 +45,10 @@ export const TaskSchema = z.object({
   /** How the last merge decision was reached: a model reviewed the diff, or only mechanical gates ran. */
   inspection: z.enum(['model', 'mechanical-only', 'blind-review']).optional(),
   inspector_model: z.string().optional(),
+  /** One mechanical review fix per task is allowed without charging an attempt; this records that it was used. */
+  micro_fix_used: z.boolean().default(false),
+  /** The worker's own summary of the attempt that passed, for the handoff index. */
+  handoff_summary: z.string().optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -61,6 +65,8 @@ export const FactoryStateSchema = z.object({
   feature: z.string(),
   /** The user's requirement, verbatim, so every attempt (and every resume) can hand it to the worker. */
   requirement: z.string().default(''),
+  /** Exports with no call site when the run started (file#name); the final gate refuses any new one. */
+  wiring_baseline: z.array(z.string()).optional(),
   status: z.enum(['planning', 'planned', 'active', 'paused', 'completed', 'failed']),
   strategy: z.enum(['hybrid', 'local', 'cloud']).default('hybrid'),
   cloud_provider: z.enum(['agy', 'openai', 'openai-api', 'anthropic', 'deepseek', 'qwen', 'openai-compat', 'claude-code', 'gemini-cli', 'muse']).default('agy'),
@@ -91,7 +97,10 @@ export type FactoryState = z.infer<typeof FactoryStateSchema>;
 
 export const LessonSchema = z.object({
   id: z.string(), lesson: z.string().min(12).max(500), tags: z.array(z.string()).max(8), scope: z.enum(['project', 'language', 'path']).default('project'), confidence: z.number().min(0).max(1),
-  evidence: z.object({ taskId: z.string(), failure: z.string().max(500), resolution: z.string().max(500) }), createdAt: z.string(), lastUsedAt: z.string().optional(), useCount: z.number().default(0), status: z.enum(['active', 'superseded', 'rejected']).default('active'),
+  evidence: z.object({ taskId: z.string(), failure: z.string().max(500), resolution: z.string().max(500) }),
+  /** The gate or command that enforces the lesson. Softhouse: a rule nobody checks is recorded again and recurs. */
+  check: z.string().max(240).optional(),
+  createdAt: z.string(), lastUsedAt: z.string().optional(), useCount: z.number().default(0), status: z.enum(['active', 'superseded', 'rejected', 'retired']).default('active'),
 });
 export type Lesson = z.infer<typeof LessonSchema>;
 

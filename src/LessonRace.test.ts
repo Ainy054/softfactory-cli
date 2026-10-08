@@ -7,7 +7,7 @@ import { LessonManager } from './LessonManager.js';
 
 const lesson = (n: number) => ({
   lesson: `Always check the thing number ${n} before proceeding`,
-  tags: ['x'], scope: 'project' as const, confidence: 0.9,
+  tags: ['x'], scope: 'project' as const, confidence: 0.9, check: `npm test -- thing${n}.test.ts`,
   evidence: { taskId: `T${n}`, failure: 'it broke', resolution: 'it was fixed' },
 });
 

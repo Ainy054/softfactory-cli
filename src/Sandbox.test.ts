@@ -214,7 +214,7 @@ describe('Node dependencies are installed for the sandbox platform, not copied f
 
   it('prepare() leaves the host alone when the sandbox is on, and reports a missing lockfile', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-prep-'));
-    await fs.writeFile(path.join(dir, 'package.json'), '{}');
+    await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ dependencies: { leftpad: '1.0.0' } }));
     const sandbox: any = { active: true, nodeDependencyMounts: async () => [] };
     const refused = await new TaskVerifier(sandbox as SandboxManager).prepare(dir, { files_hint: ['src/a.ts'] } as any);
     assert.equal(refused.ok, false);

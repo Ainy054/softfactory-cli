@@ -90,11 +90,16 @@ export async function readRecentMetrics(baseDir: string, limit = 5): Promise<Run
  * Failure categories seen in at least two of the last three runs. The plan
  * must change its approach for these; a stronger model alone is not a change.
  */
+const NOT_ESCALATED = new Set(['micro_fix']);
+
 export function recurringFailures(recent: RunMetrics[], window = 3, threshold = 2): string[] {
   const last = recent.slice(-window);
   const seenIn = new Map<string, number>();
   for (const run of last) {
     for (const category of Object.keys(run.rejected_by_category || {})) {
+      // A micro-fix is review working as intended, not a failure to plan around
+      // (Softhouse excludes review-caught-defect from its escalation rule).
+      if (NOT_ESCALATED.has(category)) continue;
       seenIn.set(category, (seenIn.get(category) || 0) + 1);
     }
   }

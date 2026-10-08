@@ -46,7 +46,7 @@ describe('lesson evidence is redacted before it is stored', () => {
     await fs.mkdir(path.join(baseDir, '.softfactory'));
     const lessons = new LessonManager(baseDir);
     const added = await lessons.add({
-      lesson: 'Always load the database URL from the environment, not a literal.', tags: ['config'], scope: 'project', confidence: 0.9,
+      lesson: 'Always load the database URL from the environment, not a literal.', tags: ['config'], scope: 'project', confidence: 0.9, check: 'grep -rn "postgres://" src',
       evidence: { taskId: 'T1', failure: 'connection refused for postgres://app:s3cretpw@db/app', resolution: 'set DATABASE_URL=postgres://app:s3cretpw@db/app in config' },
     });
     assert.equal(added, true);
