@@ -50,6 +50,7 @@ describe('#8 honesty tags: cited sources must exist', () => {
     const bad = await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', claims: [{ text: 'the guard is at line 40', source: 'app.ts:40' }, { text: 'helper exists', source: 'src/helper.ts:3' }] }, dir);
     assert.match(bad, /cites app\.ts:40, but app\.ts has 3 lines/);
     assert.match(bad, /cites src\/helper\.ts:3, but src\/helper\.ts does not exist/);
+    assert.equal(await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', claims: [{ text: 'the whole file', source: 'app.ts:1-70' }] }, dir), null, 'an overshot range is imprecise, not fabricated');
   });
 
   it('checks file:line references inside review answers too', async () => {

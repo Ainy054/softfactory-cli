@@ -2175,8 +2175,10 @@ export class Factory extends EventEmitter {
         };
         const check = async (where: string, ref: string, file: string, start: number, end: number) => {
             const count = await lines(file);
+            // A range that runs past the end ("1-70" of a 65-line file, meaning
+            // the whole file) is imprecise, not invented; a start past the end is.
             if (count === null) problems.push(`${where} cites ${ref}, but ${file} does not exist`);
-            else if (start < 1 || end > count || end < start) problems.push(`${where} cites ${ref}, but ${file} has ${count} lines`);
+            else if (start < 1 || start > count || end < start) problems.push(`${where} cites ${ref}, but ${file} has ${count} lines`);
         };
         const unverified: string[] = [];
         for (const claim of handoff.claims || []) {
