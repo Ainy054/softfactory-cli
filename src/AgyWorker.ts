@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
 export class AgyWorker implements IWorker {
@@ -38,7 +38,7 @@ Description: ${task.description}
 Files Hint: ${task.files_hint.join(', ')}
 Acceptance Criteria: ${task.acceptance_criteria.join('; ')}
 Verification: ${task.verification.join('; ')}
-${task.verification_command ? `Acceptance Command (run verbatim by the orchestrator after you finish; make it pass): ${task.verification_command}\n` : ''}${task.review_questions?.length ? `Review Questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n` : ''}`;
+${task.verification_command ? `${acceptanceLine(task.verification_command)}\n` : ''}${task.review_questions?.length ? `Review Questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n` : ''}`;
 
     // Proactive context injection: read files_hint contents
     const fileContents: string[] = [];

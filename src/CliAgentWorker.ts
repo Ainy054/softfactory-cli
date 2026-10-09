@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -221,7 +221,7 @@ Description: ${task.description}
 Files hint: ${task.files_hint.join(', ')}
 Acceptance criteria: ${task.acceptance_criteria.join('; ')}
 Verification: ${task.verification.join('; ')}
-${task.verification_command ? `Acceptance command (run verbatim by the orchestrator after you finish; make it pass): ${task.verification_command}` : ''}
+${acceptanceLine(task.verification_command)}
 ${task.review_questions?.length ? `Review questions (an independent reviewer verifies each answer against your diff; answer each in the handoff's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}` : ''}
 ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}

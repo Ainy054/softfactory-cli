@@ -107,10 +107,25 @@ export class WorkerRegistry {
     return this.isLightTask(task) ? this.lightLocalModel : this.heavyLocalModel;
   }
 
+  /**
+   * Protected code, and work on security, tenancy, cryptography, money or
+   * cross-package refactors: the failures no test reports.
+   */
+  static silentFailureRisk(task: Pick<Task, 'protected' | 'behavior_tags' | 'title' | 'description'>): boolean {
+    if (task.protected) return true;
+    const tags = (task.behavior_tags || []).join(' ');
+    const text = `${tags} ${task.title} ${task.description}`.toLowerCase();
+    return /\b(?:security|auth(?:entication|orization|z|n)?|tenan(?:t|cy)|rls|permission|crypto(?:graphy)?|encrypt\w*|signature|hsm|payment|ledger|settlement|billing|money|refund)\b/.test(text)
+      || /cross[- ]package refactor/.test(text);
+  }
+
   async resolveWorker(task: Task): Promise<{ worker: IWorker; model: string; provider: string; escalated?: boolean }> {
     // Prefer the explicit escalation tier, while honoring older persisted
     // states that only recorded attempts as their escalation signal.
-    const escalation = Math.max(task.escalation_level || 0, task.attempts || 0);
+    // Work whose failure is silent (it compiles and passes tests while being
+    // wrong) starts on the strongest tier instead of reaching it after two
+    // failures; work that fails loudly keeps the cheap tier (Softhouse 2.3).
+    const escalation = Math.max(task.escalation_level || 0, task.attempts || 0, WorkerRegistry.silentFailureRisk(task) ? 2 : 0);
 
     // 1. Cloud-only Strategy:
     if (this.strategy === 'cloud') {

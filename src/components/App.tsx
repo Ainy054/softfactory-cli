@@ -1,5 +1,6 @@
-import React, { useReducer, useEffect, useCallback, useRef } from 'react';
-import { Box, Text, useApp } from 'ink';
+import React, { useReducer, useEffect, useCallback, useRef, useState } from 'react';
+import { Box, Text, useApp, useInput } from 'ink';
+import { formatPlan, type PlanDecision } from '../PlanApproval.js';
 import { Factory } from '../Factory.js';
 import { Task, FactoryState, FactoryEvent } from '../types.js';
 import { Header } from './Header.js';
@@ -17,6 +18,8 @@ interface AppProps {
   retryBlocked?: boolean;
   refineMode?: boolean;
   planMode?: boolean;
+  /** Show the plan and wait for y/n before any worker starts. */
+  askForApproval?: boolean;
 }
 
 interface AppState {
@@ -71,10 +74,22 @@ const initialState: AppState = {
   done: false,
 };
 
-export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode }: AppProps) {
+export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, askForApproval }: AppProps) {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, initialState);
   const hasStartedRef = useRef(false);
+  const [pendingPlan, setPendingPlan] = useState<{ lines: string[]; resolve: (decision: PlanDecision) => void } | null>(null);
+
+  if (askForApproval && !factory.approvePlan) {
+    factory.approvePlan = planState => new Promise(resolve => setPendingPlan({ lines: formatPlan(planState), resolve }));
+  }
+
+  useInput((input, key) => {
+    if (!pendingPlan) return;
+    const answer = input.toLowerCase();
+    if (answer === 'y') { pendingPlan.resolve('approve'); setPendingPlan(null); }
+    else if (answer === 'n' || answer === 'q' || key.escape) { pendingPlan.resolve('abort'); setPendingPlan(null); }
+  }, { isActive: Boolean(askForApproval) });
 
   const handleEvent = useCallback((event: FactoryEvent) => {
     switch (event.type) {
@@ -143,6 +158,13 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
           <PhaseProgress tasks={state.tasks} currentPhase={state.currentPhase} />
           <TaskList tasks={state.tasks} />
         </>
+      )}
+
+      {pendingPlan && (
+        <Box flexDirection="column" marginTop={1} borderStyle="round" paddingX={1}>
+          {pendingPlan.lines.map((line, i) => <Text key={i}>{line}</Text>)}
+          <Text bold color="yellow">Start this plan? y = start, n = keep it unstarted (change it with --refine)</Text>
+        </Box>
       )}
 
       <WorkerOutput logs={state.workerLogs} />

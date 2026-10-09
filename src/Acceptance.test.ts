@@ -154,7 +154,7 @@ describe('the plan is checked for runnable acceptance commands', () => {
   it('rejects a plan whose command cannot run in this environment, and records the red baseline otherwise', async () => {
     const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-prep-')), '', { strategy: 'local' });
     const blueprintTask = { id: 'T1', title: 'Repair', description: 'Repair the palette integration.', agent_role: 'coder', phase: 1,
-      files_hint: ['src/App.tsx'], acceptance_criteria: ['works'], verification: ['npm test'], verification_command: 'pytest tests/x.py' };
+      files_hint: ['src/App.tsx'], test_targets: ['tests/x.py'], acceptance_criteria: ['works'], verification: ['npm test'], verification_command: 'pytest tests/x.py' };
 
     factory.taskVerifier.runAcceptance = async () => ({ ran: true, passed: false, exitCode: null, output: 'spawn pytest ENOENT', command: 'pytest tests/x.py', unrunnable: true });
     await assert.rejects(() => factory.prepareTasks([blueprintTask]), /Plan rejected: these acceptance commands cannot run/);
