@@ -48,18 +48,19 @@ function isSkipped(file: string): boolean {
 function candidateTerms(requirement: string): string[] {
     const terms: string[] = [];
     const seen = new Set<string>();
-    const add = (raw: string) => {
+    const add = (raw: string, minLength = 3) => {
         const term = raw.trim();
-        if (term.length < 3) return;
+        if (term.length < minLength) return;
         const key = term.toLowerCase();
         if (seen.has(key)) return;
         seen.add(key);
         terms.push(term);
     };
 
-    // 1. Identifiers in backticks.
+    // 1. Identifiers in backticks. These are explicit code names, so even
+    // short identifiers (`go`, `id`) are strong signals and are kept verbatim.
     for (const match of requirement.matchAll(/`([^`]+)`/g)) {
-        for (const part of match[1].split(/[^A-Za-z0-9_$]+/)) add(part);
+        for (const part of match[1].split(/[^A-Za-z0-9_$]+/)) add(part, 1);
     }
     // 2. CamelCase or snake_case words of 5+ characters.
     for (const match of requirement.matchAll(/[A-Za-z][A-Za-z0-9_]*/g)) {
