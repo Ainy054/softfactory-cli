@@ -61,7 +61,8 @@ export async function initProject(baseDir: string): Promise<Array<{ file: string
   // across a major version silently: pin the version now, but never overwrite
   // an existing pin.
   if ((await readPin(baseDir)) === undefined) {
-    await writePin(baseDir, SOFTFACTORY_VERSION);
+    // An unreadable config.json is reported, not replaced; the starter files are still written.
+    await writePin(baseDir, SOFTFACTORY_VERSION).catch(error => console.error(`[SoftFactory] Version not pinned: ${error.message}`));
   }
   return results;
 }

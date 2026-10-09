@@ -74,7 +74,12 @@ async function main() {
   }
 
   if (args.includes('--adopt')) {
-    await writePin(process.cwd(), SOFTFACTORY_VERSION);
+    try {
+      await writePin(process.cwd(), SOFTFACTORY_VERSION);
+    } catch (error: any) {
+      console.error(`[SoftFactory] ${error.message}`);
+      process.exit(1);
+    }
     console.log(`[SoftFactory] Accepted softfactory ${SOFTFACTORY_VERSION}: pinned .softfactory/config.json to ${SOFTFACTORY_VERSION}.`);
     process.exit(0);
   }
@@ -314,25 +319,23 @@ async function main() {
       process.exit(1);
     }
 
-    const known = (await openBacklog(process.cwd())).some(e => e.id === backlogId);
-    if (!known) {
+    const entry = (await openBacklog(process.cwd())).find(e => e.id === backlogId);
+    if (!entry) {
       console.error(`Error: no open backlog entry with id "${backlogId}".`);
       process.exit(1);
     }
 
-    const text = await triage(process.cwd(), backlogId, decision);
     if (decision === 'promote') {
-      if (!text) {
-        console.error(`Error: backlog entry "${backlogId}" has no text to queue.`);
-        process.exit(1);
-      }
       // Same path --queue takes: plan the text and park it under .softfactory/queue/.
+      // Queue first: a planning failure must leave the entry open, not lost as "promoted".
       const promoFactory = new Factory(process.cwd(), apiKey, factoryOptions);
       globalFactory = promoFactory;
       await promoFactory.init();
-      await promoFactory.queue(text);
+      await promoFactory.queue(entry.text);
+      await triage(process.cwd(), backlogId, decision);
       console.log(`[SoftFactory] Promoted ${backlogId} and queued it; run --next to start it.`);
     } else {
+      await triage(process.cwd(), backlogId, decision);
       console.log(`[SoftFactory] Marked ${backlogId} as ${decision === 'keep' ? 'kept' : 'dropped'}.`);
     }
     process.exit(0);

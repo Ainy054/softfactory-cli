@@ -62,3 +62,14 @@ describe('readPin', () => {
     assert.equal(await readPin(baseDir), undefined);
   });
 });
+
+describe('writePin on a config it cannot read', () => {
+  it('refuses rather than replacing the project\'s settings', async () => {
+    const baseDir = await tempBase();
+    const file = path.join(baseDir, '.softfactory', 'config.json');
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, '{ "commitRecords": true, ', 'utf8');
+    await assert.rejects(writePin(baseDir, '5.7.0'), /not valid JSON/);
+    assert.equal(await fs.readFile(file, 'utf8'), '{ "commitRecords": true, ', 'the file is untouched');
+  });
+});

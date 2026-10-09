@@ -35,11 +35,14 @@ export async function readPin(baseDir: string): Promise<string | undefined> {
 export async function writePin(baseDir: string, version: string): Promise<void> {
   const file = configPath(baseDir);
   let config: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) config = parsed;
-  } catch {
-    config = {};
+  let raw: string | undefined;
+  try { raw = await fs.readFile(file, 'utf8'); } catch { /* no config yet: start one */ }
+  if (raw !== undefined) {
+    // Never replace a config the project wrote and we cannot read: that would drop its settings.
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { throw new Error(`${CONFIG_FILE} is not valid JSON; fix it, then pin again.`); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${CONFIG_FILE} is not a JSON object; fix it, then pin again.`);
+    config = parsed as Record<string, unknown>;
   }
   config[PIN_KEY] = version;
   await fs.mkdir(path.dirname(file), { recursive: true });

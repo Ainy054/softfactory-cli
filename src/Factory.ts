@@ -687,6 +687,7 @@ export class Factory extends EventEmitter {
             brief: blueprint.brief ?? '',
             source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
             integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
+            coverage_before: this.coverageBefore,
             base_branch: this.prMode ? this.defaultBranch : undefined,
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -2065,6 +2066,13 @@ export class Factory extends EventEmitter {
     async captureCoverageBaseline(): Promise<void> {
         this.coverageCommand = await this.loadCoverageCommand();
         if (!this.coverageCommand) return;
+        // A resumed or refined run is partly built: its "before" is the one
+        // measured when the build started, kept in the state.
+        const unfinished = this.state && ['active', 'planned', 'paused'].includes(this.state.status);
+        if (unfinished && typeof this.state.coverage_before === 'number') {
+            this.coverageBefore = this.state.coverage_before;
+            return;
+        }
         this.coverageBefore = await measureCoverage(this.baseDir, this.coverageCommand, this.coverageRunner);
         if (this.coverageBefore === undefined) this.log(`Coverage: "${this.coverageCommand}" produced no percentage on the base.`);
         else this.log(`Coverage before: ${this.coverageBefore}% (${this.coverageCommand}).`);
@@ -2195,7 +2203,9 @@ export class Factory extends EventEmitter {
             // "Escalations applied" describe this run instead of being invented.
             const facts = this.state.tasks
                 .map(task => {
-                    const lastError = task.error_history.length ? task.error_history[task.error_history.length - 1] : 'none';
+                    // One line each: an error can be a whole test transcript.
+                    const last = task.error_history.length ? task.error_history[task.error_history.length - 1] : 'none';
+                    const lastError = redactSecrets(String(last)).replace(/\s+/g, ' ').slice(0, 200);
                     return `- ${task.id}: status=${task.status}, attempts=${task.attempts}, last error: ${lastError}`;
                 })
                 .join('\n');

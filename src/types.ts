@@ -97,6 +97,8 @@ export const FactoryStateSchema = z.object({
   usage_by_model: z.record(z.string(), z.object({ input: z.number().default(0), output: z.number().default(0) })).optional(),
   /** The outcome of live UAT against the merged code, when the run reached that gate. */
   uat_result: z.enum(['passed', 'failed', 'skipped', 'none']).optional(),
+  /** Coverage measured on the base when the build started; a resume reuses it rather than re-measuring a half-built branch. */
+  coverage_before: z.number().optional(),
   /** Where the requirement came from, when it was not typed on the command line. */
   source: z.object({ kind: z.literal('issue'), number: z.number(), url: z.string(), title: z.string() }).optional(),
   /** PR mode: passing tasks merge here instead of the base branch, and the branch becomes a pull request. */
