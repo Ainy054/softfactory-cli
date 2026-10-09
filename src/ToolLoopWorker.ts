@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError, briefSection } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError, briefSection, isEnvironmentFailure } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
@@ -503,6 +503,7 @@ ${projectContext}
         if (handoffResult) break;
 
       } catch (e: any) {
+        if (isEnvironmentFailure(e)) throw e;
         if (/deserialize|400|422|tool_call_id|tool_calls/i.test(String(e.message))) {
           protocolError = String(e.message).slice(0, 1000);
           onOutput(`[${this.label}] ❌ Protocol error: ${protocolError}`);
@@ -727,7 +728,9 @@ ${projectContext}
         temperature: 0, contextWindow, signal: controller.signal,
       });
       return this.extractToolCalls(reply.content, reply.toolCalls).length > 0;
-    } catch {
+    } catch (error) {
+      // An account fault is not the model's: let it halt the run uncharged.
+      if (isEnvironmentFailure(error)) throw error;
       return false;
     } finally {
       clearTimeout(timer);

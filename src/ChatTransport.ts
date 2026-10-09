@@ -1,5 +1,23 @@
 import { requestJson, HttpStatusError } from './HttpRetry.js';
 import { compatEndpoint, modelListed, safeLocalContextWindow } from './TextModel.js';
+import { WorkerEnvironmentError } from './IWorker.js';
+
+/**
+ * A rejected key, an exhausted balance or a forbidden account fails every
+ * request the same way, so it is an environment fault: it must halt the run
+ * without charging the task. Observed: a DeepSeek balance ran out mid-run and
+ * the 402s were charged as four failed attempts in four seconds.
+ */
+const ACCOUNT_STATUS = new Set([401, 402, 403]);
+
+export function apiError(label: string, error: unknown): unknown {
+  if (!(error instanceof HttpStatusError)) return error;
+  if (ACCOUNT_STATUS.has(error.status)) {
+    const hint = error.status === 402 ? 'top up the account balance' : 'check the API key and account';
+    return new WorkerEnvironmentError(`${label} API rejected the request: ${error.status} ${error.statusText} - ${error.body.slice(0, 300)}. Fix it (${hint}) and run --resume; no task retry was consumed.`);
+  }
+  return new Error(`${label} API error: ${error.statusText} - ${error.body}`);
+}
 
 /**
  * One tool-calling chat backend. The tool loop (ToolLoopWorker) is written
@@ -222,9 +240,7 @@ export class OpenAiCompatibleChatTransport implements ChatTransport {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.apiKey}` },
       body: JSON.stringify({ model: request.model, messages, tools: request.tools, stream: false, ...temperature }),
-    }, { label: `${this.label} API`, signal: request.signal }).catch(error => {
-      throw error instanceof HttpStatusError ? new Error(`${this.label} API error: ${error.statusText} - ${error.body}`) : error;
-    });
+    }, { label: `${this.label} API`, signal: request.signal }).catch(error => { throw apiError(this.label, error); });
     const message = data.choices?.[0]?.message || {};
     return {
       content: typeof message.content === 'string' ? message.content : '',
@@ -302,9 +318,7 @@ export class AnthropicChatTransport implements ChatTransport {
     const data = await requestJson<any>(this.fetch, `${AnthropicChatTransport.URL}/messages`, {
       method: 'POST', headers: this.headers,
       body: JSON.stringify({ model: request.model, max_tokens: 16000, system, messages, tools, temperature: request.temperature }),
-    }, { label: 'Anthropic API', signal: request.signal }).catch(error => {
-      throw error instanceof HttpStatusError ? new Error(`Anthropic API error: ${error.statusText} - ${error.body}`) : error;
-    });
+    }, { label: 'Anthropic API', signal: request.signal }).catch(error => { throw apiError('Anthropic', error); });
     const blocks: any[] = Array.isArray(data.content) ? data.content : [];
     return {
       content: blocks.filter(block => block.type === 'text').map(block => block.text).join(''),
