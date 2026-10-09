@@ -171,7 +171,7 @@ describe('what the first pull-request run surfaced', () => {
     await fs.writeFile(path.join(dir, 'ev', 'T1-attempt1.log'), 'command: node --test x\n# fail 1\nRESULT: FAIL\n');
     await fs.writeFile(path.join(dir, 'ev', 'T2-attempt1.log'), 'command: node --test x\nRESULT: PASS\n');
     const state: any = {
-      feature: 'Relay', feature_id: 'f-2', status: 'completed', strategy: 'cloud', cloud_provider: 'deepseek', planner_provider: 'deepseek', integration_branch: 'softfactory/f-2',
+      feature: 'Relay', feature_id: 'f-2', brief: '', status: 'completed', strategy: 'cloud', cloud_provider: 'deepseek', planner_provider: 'deepseek', integration_branch: 'softfactory/f-2',
       tasks: [
         { id: 'T1', title: 'Tests first', status: 'done', attempts: 0, executor: 'agent', agent_role: 'test_writer', inspection: 'model', inspector_model: 'deepseek+qwen', verification_command: 'node --test x', evidence: 'ev/T1-attempt1.log' },
         { id: 'T2', title: 'Then the code', status: 'done', attempts: 0, executor: 'agent', agent_role: 'coder', inspection: 'model', inspector_model: 'deepseek+qwen', verification_command: 'node --test x', evidence: 'ev/T2-attempt1.log' },
