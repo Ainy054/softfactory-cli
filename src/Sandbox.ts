@@ -295,6 +295,14 @@ export class SandboxManager {
   async nodeDependencyMounts(rootPath: string): Promise<Mount[]> {
     const plan = await nodeDependencyPlan(rootPath);
     if (!plan) return [];
+    // Mounting over a symlinked node_modules makes Docker resolve the link on
+    // the host side; it once replaced the link's target, another checkout's
+    // node_modules, with a self-referencing link.
+    const existing = await fs.lstat(path.join(plan.pkgDir, 'node_modules')).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      this.log(`Sandbox: ${path.join(plan.pkgDir, 'node_modules')} is a symlink; Linux dependencies are not mounted over it. Replace it with a real install to test in the sandbox.`);
+      return [];
+    }
     if (!await this.ensureDependencyVolume(plan)) return [];
     return [{ host: plan.volume, container: path.join(plan.pkgDir, 'node_modules') }];
   }

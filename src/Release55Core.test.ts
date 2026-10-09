@@ -343,3 +343,19 @@ describe('the read budget before the first edit scales with the task\'s files', 
     assert.deepEqual(await ToolLoopWorker.progressLimits(dir, []), { warn: 6, abort: 12 });
   });
 });
+
+describe('the sandbox never mounts dependencies over a symlinked node_modules', () => {
+  it('skips the mount and says why', async () => {
+    const { SandboxManager } = await import('./Sandbox.js');
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-symdeps-'));
+    const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-elsewhere-'));
+    await fs.writeFile(path.join(dir, 'package.json'), '{}');
+    await fs.writeFile(path.join(dir, 'package-lock.json'), '{}');
+    await fs.symlink(elsewhere, path.join(dir, 'node_modules'));
+    const logs: string[] = [];
+    const sandbox: any = new SandboxManager('docker', (l: string) => logs.push(l));
+    sandbox.installDependencyVolume = async () => { throw new Error('must not install'); };
+    assert.deepEqual(await sandbox.nodeDependencyMounts(dir), []);
+    assert.ok(logs.some(l => /is a symlink; Linux dependencies are not mounted over it/.test(l)));
+  });
+});
