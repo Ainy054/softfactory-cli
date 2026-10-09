@@ -26,7 +26,8 @@ const BlueprintTaskSchema = z.object({
   test_targets: z.array(z.string()).default([]),
   behavior_tags: z.array(z.string()).default([]),
   verification_command: z.string().optional(),
-  complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
+  // Advisory only; an unknown value is dropped rather than costing a repair round (issue #7's plan said "medium").
+  complexity: z.preprocess(v => (['simple', 'moderate', 'complex'].includes(v as string) ? v : undefined), z.enum(['simple', 'moderate', 'complex']).optional()),
   allocation_reason: z.string().optional(),
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
   review_questions: z.array(z.string()).default([]),

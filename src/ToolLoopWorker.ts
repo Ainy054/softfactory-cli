@@ -219,6 +219,7 @@ ${projectContext}
               description: 'Material claims about your change, each with a checkable source: "path:line", "path:start-end", "command: <what you ran>", or "UNVERIFIED" when you could not check it. A cited line that does not exist rejects the task.',
               items: { type: 'object', properties: { text: { type: 'string' }, source: { type: 'string' } }, required: ['text', 'source'] },
             },
+            not_done: { type: 'array', items: { type: 'string' }, description: 'anything in the task you did not finish, one item each; leave empty when everything is done' },
           },
           required: ['summary', 'test_summary', 'status'],
         },
@@ -445,7 +446,8 @@ ${projectContext}
                 onOutput(`[${this.label}] ✅ Task finished: ${args.status}`);
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles),
                   review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined,
-                  claims: ToolLoopWorker.claimsFrom(args.claims) };
+                  claims: ToolLoopWorker.claimsFrom(args.claims),
+                  not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {

@@ -359,3 +359,12 @@ describe('the sandbox never mounts dependencies over a symlinked node_modules', 
     assert.ok(logs.some(l => /is a symlink; Linux dependencies are not mounted over it/.test(l)));
   });
 });
+
+describe('an advisory plan field never costs a repair round', () => {
+  it('drops an unknown complexity value', async () => {
+    const { validateBlueprint } = await import('./Planner.js');
+    const input = { requirement: 'x', codebaseContext: '', memoryPatterns: '', featureHistory: '', repositoryFiles: new Set(['src/a.ts']) };
+    const plan = { feature: 'Some feature', requirements_covered: [], tasks: [{ id: 'T1', title: 'Do the thing', description: 'Do the thing well', agent_role: 'coder', phase: 1, dependencies: [], blockedBy: [], files_hint: ['src/a.ts'], creates_files: [], acceptance_criteria: ['works'], verification: ['npm test'], complexity: 'medium' }] };
+    assert.equal(validateBlueprint(plan, input).tasks[0].complexity, undefined);
+  });
+});

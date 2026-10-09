@@ -131,6 +131,8 @@ export const HandoffSchema = z.object({
    * fabricated source and rejects the task (Softhouse's honesty tags).
    */
   claims: z.array(z.object({ text: z.string(), source: z.string() })).optional(),
+  /** Parts of the task the worker itself reports as unfinished; a non-empty list of acceptance work rejects the task. */
+  not_done: z.array(z.string()).optional(),
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;
