@@ -180,3 +180,22 @@ describe('planner: a test writer may depend on its implementation instead of nam
     assert.throws(() => validateBlueprint(without, input), /set its production_targets to the implementation files .* or add the id of the task that implements them to its dependencies/);
   });
 });
+
+describe('an acceptance command that times out at planning rejects the plan', () => {
+  it('names the slow command instead of recording it as the expected red', async () => {
+    const f = factoryOn('/tmp');
+    f.taskVerifier.runAcceptance = async () => ({ ran: true, passed: false, exitCode: null, output: 'timed out after 90000ms', command: 'npm test', unrunnable: false, timedOut: true });
+    const raw = { id: 'T2', title: 'Rules', description: 'Enforce rules', agent_role: 'coder', phase: 1, files_hint: ['src/a.ts'], verification_command: 'npm test' };
+    await assert.rejects(f.prepareTasks([raw]), /T2: npm test \(unrunnable: did not finish in 90s at planning/);
+  });
+
+  it('marks a run killed at its limit as timed out', async () => {
+    const { TaskVerifier } = await import('./TaskVerifier.js');
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-slow-'));
+    await fs.writeFile(path.join(dir, 'slow.js'), 'setTimeout(() => {}, 5000);\n');
+    const result = await new TaskVerifier().runAcceptance(dir, { id: 'T1', verification_command: 'node slow.js', attempts: 0 }, { timeoutMs: 300 });
+    assert.equal(result.passed, false);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.unrunnable, false);
+  });
+});

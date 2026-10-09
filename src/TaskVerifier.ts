@@ -16,6 +16,8 @@ export interface AcceptanceResult {
   evidencePath?: string;
   /** The command cannot run here at all: refused by policy, or not installed. */
   unrunnable: boolean;
+  /** Killed at its time limit: neither a pass nor a meaningful red. */
+  timedOut?: boolean;
 }
 
 export interface ProjectTestConfig {
@@ -689,6 +691,7 @@ export class TaskVerifier {
     let output = '';
     let passed = false;
     let unrunnable = false;
+    let timedOutRun = false;
     if (violation) {
       output = `Acceptance command refused by the command policy: ${violation}`;
       unrunnable = true;
@@ -701,7 +704,8 @@ export class TaskVerifier {
         passed = true;
       } catch (error: any) {
         exitCode = typeof error?.exitCode === 'number' ? error.exitCode : null;
-        const timedOut = Boolean(error?.timedOut);
+        const timedOut = Boolean(error?.timedOut) || exitCode === 143 || exitCode === 124;
+        timedOutRun = timedOut;
         output = `${error?.stdout || ''}\n${error?.stderr || ''}\n${exitCode === null ? (timedOut ? `timed out after ${options.timeoutMs ?? 180000}ms` : (error?.shortMessage || error?.message || '')) : ''}`.trim();
         // A missing binary or a spawn failure means the gate can never fire;
         // a slow suite that timed out is red, not absent.
@@ -732,7 +736,7 @@ export class TaskVerifier {
         '',
       ].join('\n'), 'utf8');
     }
-    return { ran: true, passed, exitCode, output: this.clip(output), command, cwd, evidencePath, unrunnable };
+    return { ran: true, passed, exitCode, output: this.clip(output), command, cwd, evidencePath, unrunnable, ...(timedOutRun ? { timedOut: true } : {}) };
   }
 
   /** A command that names its ecosystem runs from that ecosystem's root in a split repo. */

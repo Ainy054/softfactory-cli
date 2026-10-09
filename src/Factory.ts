@@ -1580,12 +1580,14 @@ export class Factory extends EventEmitter {
         for (const task of tasks) {
             if (!task.verification_command || task.executor !== 'agent') continue;
             const probe = await this.taskVerifier.runAcceptance(this.baseDir, task, { timeoutMs: 90000 });
-            const summary = probe.unrunnable
+            const summary = probe.timedOut
+                ? 'unrunnable: did not finish in 90s at planning, so it can neither be red now nor gate a merge in time; use the focused test for this task'
+                : probe.unrunnable
                 ? `unrunnable: ${probe.output.split('\n')[0].slice(0, 160)}`
                 : probe.passed ? 'already passing on the base branch' : `red (exit ${probe.exitCode})`;
             task.acceptance_baseline = { exit_code: probe.exitCode, summary };
             this.log(`Planning-time acceptance ${task.id}: ${task.verification_command} → ${summary}`);
-            if (probe.unrunnable) unrunnable.push(`${task.id}: ${task.verification_command} (${summary})`);
+            if (probe.unrunnable || probe.timedOut) unrunnable.push(`${task.id}: ${task.verification_command} (${summary})`);
         }
         if (unrunnable.length > 0) {
             throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
