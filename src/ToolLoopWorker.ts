@@ -31,6 +31,22 @@ export class ToolLoopWorker implements IWorker {
   }
   static readonly NO_PROGRESS_WARN = 6;      // a nudge: enough reading, change a file
   static readonly NO_PROGRESS_ABORT = 12;    // allow initial inspection; cycle guards stop repetitive exploration sooner
+  static readonly NO_PROGRESS_MAX = 30;
+
+  /**
+   * The read budget before the first edit, scaled to the files the task
+   * names: one extra call per 200 lines, up to 30 in all. A flat 12 stopped
+   * a worker before its first edit to the 2,400-line Factory.ts, which takes
+   * twelve reads to see once (dogfood issue #4).
+   */
+  static async progressLimits(worktreePath: string, files: string[]): Promise<{ warn: number; abort: number }> {
+    let lines = 0;
+    for (const file of files) {
+      try { lines += (await fs.readFile(path.join(worktreePath, file), 'utf8')).split('\n').length; } catch { /* not created yet */ }
+    }
+    const abort = Math.min(ToolLoopWorker.NO_PROGRESS_MAX, ToolLoopWorker.NO_PROGRESS_ABORT + Math.ceil(lines / 200));
+    return { warn: Math.max(ToolLoopWorker.NO_PROGRESS_WARN, Math.floor(abort / 2)), abort };
+  }
   static readonly MAX_ITERATIONS = 30;
   private readonly verifier = new TaskVerifier();
 
@@ -248,6 +264,7 @@ ${projectContext}
     // "calls repeat" but "nothing is changing", so count calls since the last
     // successful edit and stop on that regardless of what the calls look like.
     let callsSinceProgress = 0;
+    const limits = await ToolLoopWorker.progressLimits(worktreePath, [...new Set([...task.files_hint, ...task.creates_files])]);
     let stalledWithoutProgress = false;
     let finishAborted = false;
     let lastFinishFailure = '';
@@ -457,11 +474,11 @@ ${projectContext}
           // A rejected finish_task is not progress; only an accepted one is.
           if (mutated || (name === 'finish_task' && handoffResult)) {
             callsSinceProgress = 0;
-          } else if (++callsSinceProgress >= ToolLoopWorker.NO_PROGRESS_ABORT) {
+          } else if (++callsSinceProgress >= limits.abort) {
             stalledWithoutProgress = true;
             onOutput(`[${this.label}] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
-          } else if (callsSinceProgress === ToolLoopWorker.NO_PROGRESS_WARN) {
-            toolResult += `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. You have enough context: create or edit the file now with write_file or replace_content, then run the acceptance command. The attempt ends after ${ToolLoopWorker.NO_PROGRESS_ABORT} calls without an edit.`;
+          } else if (callsSinceProgress === limits.warn) {
+            toolResult += `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. You have enough context: create or edit the file now with write_file or replace_content, then run the acceptance command. The attempt ends after ${limits.abort} calls without an edit.`;
             onOutput(`[${this.label}] ${callsSinceProgress} calls without an edit; nudged.`);
           }
 
@@ -498,9 +515,9 @@ ${projectContext}
         : finishAborted
         ? `${who} called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`
         : stalledWithoutProgress && changedFiles.size > 0
-        ? `${who} stopped after ${ToolLoopWorker.NO_PROGRESS_ABORT} tool calls with no further edit; the ${changedFiles.size} edited file(s) stand and go to verification. Call finish_task once the focused tests pass instead of re-running the suite.`
+        ? `${who} stopped after ${limits.abort} tool calls with no further edit; the ${changedFiles.size} edited file(s) stand and go to verification. Call finish_task once the focused tests pass instead of re-running the suite.`
         : stalledWithoutProgress
-        ? `${who} made ${ToolLoopWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
+        ? `${who} made ${limits.abort} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
         : repeatedCall?.startsWith('scope:')
         ? `${who} attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
         : repeatedCall?.startsWith('syntax:')

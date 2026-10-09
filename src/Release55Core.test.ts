@@ -325,3 +325,15 @@ describe('the edit tool formats only in the project\'s own style', () => {
     assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), clean);
   });
 });
+
+describe('the read budget before the first edit scales with the task\'s files', () => {
+  it('is 12 for small files and grows a call per 200 lines, up to 30', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-budget-'));
+    await fs.writeFile(path.join(dir, 'small.ts'), 'x\n'.repeat(50));
+    await fs.writeFile(path.join(dir, 'big.ts'), 'x\n'.repeat(2400));
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['small.ts']), { warn: 6, abort: 13 });
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['big.ts']), { warn: 12, abort: 25 });
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['big.ts', 'big.ts', 'missing.ts']), { warn: 15, abort: 30 });
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, []), { warn: 6, abort: 12 });
+  });
+});
