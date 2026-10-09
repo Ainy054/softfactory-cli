@@ -398,8 +398,12 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     if (task.executor === 'agent' && task.files_hint.length === 0 && task.creates_files.length === 0) {
       errors.push(`${task.id} changes no files; a command-only task ("run the tests", "run the build") is not worker work, so fold its command into the verification_command of the task it checks`);
     }
-    if (task.agent_role === 'test_writer' && task.production_targets.length === 0 && /(?:service|router|navigation|loading|keyboard|async|implement|create|add )/i.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
-      errors.push(`${task.id} requires production_targets or an explicit implementation dependency before tests`);
+    // The message always offered "or an implementation dependency", but the
+    // check never looked at dependencies, so a planner that added one was
+    // rejected again and the run died in planning (dogfood issue #5).
+    const implementedBy = [...task.dependencies, ...task.blockedBy].filter(dep => blueprint.tasks.some(other => other.id === dep && other.agent_role !== 'test_writer'));
+    if (task.agent_role === 'test_writer' && task.production_targets.length === 0 && implementedBy.length === 0 && /(?:service|router|navigation|loading|keyboard|async|implement|create|add )/i.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
+      errors.push(`${task.id} is a test_writer for behaviour that is not built yet: set its production_targets to the implementation files the tests exercise (for example ["src/x.ts"]), or add the id of the task that implements them to its dependencies`);
     }
     for (const check of task.verification) {
       if (/\bvitest\s+list\b/.test(check)) errors.push(`${task.id} uses unsupported Vitest command "vitest list"; use "vitest run --reporter=json" instead`);

@@ -167,3 +167,16 @@ describe('#11 recover a crashed worker\'s correct work', () => {
     assert.equal(await f.recoverCrashedWork(task(), dir, new WorkerEnvironmentError('down')), null);
   });
 });
+
+describe('planner: a test writer may depend on its implementation instead of naming targets', () => {
+  it('accepts the dependency the error message always offered, and says how to fix it when missing', async () => {
+    const { validateBlueprint } = await import('./Planner.js');
+    const input = { requirement: '## Scope\nx', codebaseContext: '', memoryPatterns: '', featureHistory: '', repositoryFiles: new Set(['src/a.ts']) };
+    const base = { agent_role: 'coder', phase: 1, dependencies: [], blockedBy: [], files_hint: ['src/a.ts'], creates_files: [], acceptance_criteria: ['a works'], verification: ['npm test'] };
+    const tester = { ...base, id: 'T2', title: 'Tests', description: 'Add tests for the new parser', agent_role: 'test_writer', phase: 2, files_hint: ['src/a.test.ts'], creates_files: ['src/a.test.ts'] };
+    const withDep = { feature: 'Parser tests', requirements_covered: ['Scope'], tasks: [{ ...base, id: 'T1', title: 'Impl', description: 'Implement the parser' }, { ...tester, dependencies: ['T1'] }] };
+    assert.equal(validateBlueprint(withDep, input).tasks.length, 2);
+    const without = { ...withDep, tasks: [withDep.tasks[0], { ...tester }] };
+    assert.throws(() => validateBlueprint(without, input), /set its production_targets to the implementation files .* or add the id of the task that implements them to its dependencies/);
+  });
+});
