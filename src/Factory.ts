@@ -18,6 +18,7 @@ import { Inspector } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult } from './Uat.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
+import { appendFollowUps, openBacklog } from './Backlog.js';
 import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
 import { RunJournal } from './RunJournal.js';
 import { GitHub, buildPullRequestBody } from './PullRequest.js';
@@ -908,7 +909,7 @@ export class Factory extends EventEmitter {
             // Merge passed tasks sequentially (git isn't concurrent-safe)
             for (const result of results) {
                 if (result.status === 'fulfilled' && result.value) {
-                    const { task, branchName } = result.value;
+                    const { task, branchName, followUps } = result.value;
                     const stale = await this.forkFreshness(task, branchName, worktreeMap.get(task.id));
                     if (stale) {
                         task.status = 'failed';
@@ -927,6 +928,10 @@ export class Factory extends EventEmitter {
                             date: new Date().toISOString().slice(0, 10), feature_id: this.state.feature_id, task_id: task.id, title: task.title,
                             files: [...new Set([...task.files_hint, ...task.creates_files])], acceptance: task.verification_command || '', summary: task.handoff_summary || '',
                         }).catch(() => undefined);
+                        // A gap noticed outside the task is recorded next to the
+                        // handoff, so the next plan can act on it instead of the
+                        // notice dying with the worker that saw it.
+                        await appendFollowUps(this.baseDir, this.state.feature_id, task.id, followUps ?? []).catch(() => undefined);
                         await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
@@ -1019,7 +1024,7 @@ export class Factory extends EventEmitter {
             this.log(`Build completed: ${this.state.feature}`);
         }
     }
-    async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<{ task: Task; branchName: string } | null> {
+    async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<{ task: Task; branchName: string; followUps: string[] } | null> {
         task.error_history = task.error_history || [];
         task.escalation_level = task.escalation_level || 0;
         const processFailure = (feedback: string) => {
@@ -1413,7 +1418,9 @@ export class Factory extends EventEmitter {
                     if (captured) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Training candidate saved (sanitized, verified)` });
                 }
 
-                return { task, branchName };
+                // Gaps the worker noticed outside its own task travel with the
+                // accepted handoff so the merge step can record them in the backlog.
+                return { task, branchName, followUps: handoff.follow_ups ?? [] };
             }
             else {
                 this.log(`FAILED: ${task.id}. Feedback: ${review.feedback}`);
@@ -2328,10 +2335,17 @@ export class Factory extends EventEmitter {
         const repositoryFiles = files ?? await this.getRepositoryFiles().catch(() => [] as string[]);
         const scoutLines = await scout(this.baseDir, requirement, repositoryFiles).catch(() => [] as string[]);
         if (scoutLines.length) this.log(`Scout: ${scoutLines.length} file(s) already mention this requirement.`);
+        // Gaps workers noticed outside their tasks in earlier runs. They are
+        // hints for the planner, not part of this requirement, so the section
+        // says so explicitly and is capped so it cannot crowd out the plan.
+        const backlog = await openBacklog(this.baseDir).catch(() => []);
+        if (backlog.length) this.log(`Backlog: ${backlog.length} open item(s) from earlier runs given to the planner.`);
+        const backlogLines = backlog.slice(0, 10).map(e => `- [${e.id}] ${e.text}`);
         return [
             features,
             similar.length ? `Similar tasks already merged in this repository (reuse their split and their checks where they fit):\n${similar.join('\n')}` : '',
             scoutLines.length ? `Already in the repository (reuse or extend these; plan only the gap):\n${scoutLines.join('\n')}` : '',
+            backlogLines.length ? `Backlog from earlier runs (plan these only if the requirement covers them):\n${backlogLines.join('\n')}` : '',
         ].filter(Boolean).join('\n\n');
     }
 
