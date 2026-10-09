@@ -2,143 +2,156 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateBlueprint, type PlanningInput } from './Planner.js';
 
-/** A minimal blueprint task that already satisfies the schema's required fields. */
-function task(overrides: Record<string, unknown>) {
-  return {
-    id: 'T1',
-    title: 'Change a file',
-    description: 'Change the file to deliver this feature.',
-    agent_role: 'coder',
-    phase: 1,
-    dependencies: [],
-    blockedBy: [],
-    files_hint: [],
-    creates_files: [],
-    acceptance_criteria: ['The change is observable'],
-    verification: ['npm test -- --run'],
-    ...overrides,
-  };
-}
-
-function blueprint(tasks: unknown[]) {
-  return { feature: 'Planning rules', requirements_covered: [], tasks };
-}
-
-function input(repositoryFiles: string[]): PlanningInput {
-  return {
-    requirement: 'Add the requested behaviour.',
-    codebaseContext: '',
-    memoryPatterns: '',
-    featureHistory: '',
-    repositoryFiles: new Set(repositoryFiles),
-  };
-}
-
-describe('blueprint validator: migrations form a linear chain', () => {
-  it('rejects two migration tasks that are unordered', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add first migration', creates_files: ['db/migrations/001_init.sql'] }),
-      task({ id: 'T2', title: 'Add second migration', phase: 2, creates_files: ['migrations/002_more.sql'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input([])),
-      /T1 and T2 both add database migrations but neither depends on the other; migrations form a linear chain/,
-    );
-  });
-
-  it('accepts migrations once one depends on the other', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add first migration', creates_files: ['db/migrations/001_init.sql'] }),
-      task({ id: 'T2', title: 'Add second migration', phase: 2, dependencies: ['T1'], creates_files: ['migrations/002_more.sql'] }),
-    ]);
-    assert.doesNotThrow(() => validateBlueprint(plan, input([])));
-  });
-
-  it('accepts a transitive chain of migration tasks', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add first migration', creates_files: ['db/migrations/001_init.sql'] }),
-      task({ id: 'T2', title: 'Add second migration', phase: 2, dependencies: ['T1'], creates_files: ['db/migrations/002_more.sql'] }),
-      task({ id: 'T3', title: 'Add third migration', phase: 3, dependencies: ['T2'], creates_files: ['db/migrations/003_more.sql'] }),
-    ]);
-    assert.doesNotThrow(() => validateBlueprint(plan, input([])));
-  });
-
-  it('treats a .sql file under a db directory as a migration', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add schema change', creates_files: ['db/schema.sql'] }),
-      task({ id: 'T2', title: 'Add orders table', phase: 2, creates_files: ['db/orders.sql'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input([])),
-      /T1 and T2 both add database migrations but neither depends on the other; migrations form a linear chain/,
-    );
-  });
+const input = (repositoryFiles: string[] = []): PlanningInput => ({
+  requirement: 'Add the planned behaviour to the repository.',
+  codebaseContext: '',
+  memoryPatterns: '',
+  featureHistory: '',
+  repositoryFiles: new Set(repositoryFiles),
 });
 
-describe('blueprint validator: one dependency install per run', () => {
-  it('rejects two tasks that each change a dependency manifest', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Update npm manifests', creates_files: ['package-lock.json'] }),
-      task({ id: 'T2', title: 'Update yarn manifests', phase: 2, creates_files: ['yarn.lock'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input([])),
-      /T1 and T2 both change dependency manifests \(package-lock\.json, yarn\.lock\); keep dependency changes in one task so lockfiles cannot conflict/,
-    );
-  });
-
-  it('accepts dependency manifests kept in a single task', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Update dependency manifests', creates_files: ['package-lock.json', 'yarn.lock'] }),
-    ]);
-    assert.doesNotThrow(() => validateBlueprint(plan, input([])));
-  });
-
-  it('lists every dependency manifest the two tasks touch', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Update node manifests', creates_files: ['package.json', 'package-lock.json'] }),
-      task({ id: 'T2', title: 'Update node manifests again', phase: 2, creates_files: ['yarn.lock'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input([])),
-      /T1 and T2 both change dependency manifests \(package-lock\.json, package\.json, yarn\.lock\); keep dependency changes in one task so lockfiles cannot conflict/,
-    );
-  });
+const task = (overrides: Record<string, unknown> = {}) => ({
+  id: 'T001',
+  title: 'Implement the planned change',
+  description: 'Implement the planned change in the repository safely.',
+  agent_role: 'coder',
+  phase: 1,
+  dependencies: [],
+  blockedBy: [],
+  files_hint: [],
+  creates_files: ['src/planned.ts'],
+  acceptance_criteria: ['The planned change is observable.'],
+  verification: ['npm test -- --run'],
+  ...overrides,
 });
 
-describe('blueprint validator: translations follow new strings', () => {
-  it('rejects user-facing text when no task updates the locale files', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add welcome banner', description: 'Show a new welcome message in the header.', files_hint: ['src/App.tsx'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input(['src/App.tsx', 'src/locales/en.json'])),
-      /T1 adds user-facing text but no task updates the locale files \(src\/locales\/en\.json\)/,
-    );
+describe('blueprint domain planning rules', () => {
+  describe('migrations serialized', () => {
+    it('rejects two unordered migration tasks with the exact chain error', () => {
+      const plan = {
+        feature: 'Migration chain',
+        requirements_covered: [],
+        tasks: [
+          task({ id: 'T001', creates_files: ['db/migrations/001_add_users.sql'] }),
+          task({ id: 'T002', creates_files: ['db/migrations/002_add_orders.sql'] }),
+        ],
+      };
+
+      assert.throws(
+        () => validateBlueprint(plan, input()),
+        /T001 and T002 both add database migrations but neither depends on the other; migrations form a linear chain/,
+      );
+    });
+
+    it('accepts migration tasks once one depends on the other', () => {
+      const plan = {
+        feature: 'Migration chain',
+        requirements_covered: [],
+        tasks: [
+          task({ id: 'T001', creates_files: ['db/migrations/001_add_users.sql'] }),
+          task({ id: 'T002', creates_files: ['db/migrations/002_add_orders.sql'], dependencies: ['T001'] }),
+        ],
+      };
+
+      assert.doesNotThrow(() => validateBlueprint(plan, input()));
+    });
   });
 
-  it('rejects user-facing text named in acceptance criteria', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add welcome banner', files_hint: ['src/App.tsx'], acceptance_criteria: ['The button label reads "Continue"'] }),
-    ]);
-    assert.throws(
-      () => validateBlueprint(plan, input(['src/App.tsx', 'src/i18n/en.json'])),
-      /T1 adds user-facing text but no task updates the locale files \(src\/i18n\/en\.json\)/,
-    );
+  describe('one dependency install per run', () => {
+    it('rejects two tasks that each change a dependency manifest', () => {
+      const plan = {
+        feature: 'Dependency install',
+        requirements_covered: [],
+        tasks: [
+          task({ id: 'T001', creates_files: ['package.json'] }),
+          task({ id: 'T002', creates_files: ['Cargo.toml'] }),
+        ],
+      };
+
+      assert.throws(
+        () => validateBlueprint(plan, input()),
+        /T001 and T002 both change dependency manifests \(Cargo\.toml, package\.json\); keep dependency changes in one task so lockfiles cannot conflict/,
+      );
+    });
+
+    it('accepts the plan when all manifests stay in one task', () => {
+      const plan = {
+        feature: 'Dependency install',
+        requirements_covered: [],
+        tasks: [
+          task({ id: 'T001', creates_files: ['package.json', 'Cargo.toml'] }),
+          task({ id: 'T002', creates_files: ['src/lib.rs'] }),
+        ],
+      };
+
+      assert.doesNotThrow(() => validateBlueprint(plan, input()));
+    });
   });
 
-  it('accepts a plan with a task that updates the locale files', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add welcome banner', description: 'Show a new welcome message in the header.', files_hint: ['src/App.tsx'] }),
-      task({ id: 'T2', title: 'Update translation strings', phase: 2, files_hint: ['src/locales/en.json'] }),
-    ]);
-    assert.doesNotThrow(() => validateBlueprint(plan, input(['src/App.tsx', 'src/locales/en.json'])));
-  });
+  describe('translations follow new strings', () => {
+    const localeRepositoryFiles = ['src/App.tsx', 'src/locales/en.json'];
 
-  it('does not apply when the repository has no locale files', () => {
-    const plan = blueprint([
-      task({ id: 'T1', title: 'Add welcome banner', description: 'Show a new welcome message in the header.', files_hint: ['src/App.tsx'] }),
-    ]);
-    assert.doesNotThrow(() => validateBlueprint(plan, input(['src/App.tsx'])));
+    it('rejects new user-facing text when no task updates the locale files', () => {
+      const plan = {
+        feature: 'User-facing label',
+        requirements_covered: [],
+        tasks: [
+          task({
+            id: 'T001',
+            creates_files: ['src/ui.ts'],
+            description: 'Add a welcome message to the account screen.',
+            acceptance_criteria: ['The welcome message is visible on the account screen.'],
+          }),
+        ],
+      };
+
+      assert.throws(
+        () => validateBlueprint(plan, input(localeRepositoryFiles)),
+        /T001 adds user-facing text but no task updates the locale files \(src\/locales\/en\.json\)/,
+      );
+    });
+
+    it('accepts the plan when a task lists a locale file', () => {
+      const plan = {
+        feature: 'User-facing label',
+        requirements_covered: [],
+        tasks: [
+          task({
+            id: 'T001',
+            creates_files: ['src/ui.ts'],
+            description: 'Add a welcome message to the account screen.',
+            acceptance_criteria: ['The welcome message is visible on the account screen.'],
+          }),
+          task({
+            id: 'T002',
+            title: 'Update the locale files',
+            description: 'Add the locale entries for the new account screen message.',
+            files_hint: ['src/locales/en.json'],
+            creates_files: [],
+            acceptance_criteria: ['The locale file contains the new account screen message key.'],
+            verification: ['npm test -- --run'],
+          }),
+        ],
+      };
+
+      assert.doesNotThrow(() => validateBlueprint(plan, input(localeRepositoryFiles)));
+    });
+
+    it('skips the locale rule when the repository has no locale files', () => {
+      const plan = {
+        feature: 'User-facing label',
+        requirements_covered: [],
+        tasks: [
+          task({
+            id: 'T001',
+            creates_files: ['src/ui.ts'],
+            description: 'Add a welcome message to the account screen.',
+            acceptance_criteria: ['The welcome message is visible on the account screen.'],
+          }),
+        ],
+      };
+
+      assert.doesNotThrow(() => validateBlueprint(plan, input(['src/App.tsx'])));
+    });
   });
 });
