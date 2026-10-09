@@ -28,7 +28,7 @@ async function repo(files: Record<string, string>) {
 
 const factoryOn = (dir: string): any => {
   const f: any = new Factory(dir, '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none' });
-  f.state = { feature_id: 'f-55', status: 'active', tasks: [] };
+  f.state = { feature_id: 'f-55', status: 'active', tasks: [], brief: '' };
   f.logs = [];
   f.on('log', (l: string) => f.logs.push(l));
   return f;
@@ -231,7 +231,7 @@ describe('a new requirement never resumes a different feature', () => {
     const { dir } = await repo({ 'a.txt': 'a\n' });
     const f: any = new Factory(dir, '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none' });
     await fs.mkdir(path.join(dir, '.softfactory', 'archive'), { recursive: true });
-    f.state = { feature_id: 'f-6', feature: 'project-rules-scan', requirement: 'issue six text', status: 'active', tasks: [], usage: { input_tokens: 0, output_tokens: 0 } };
+    f.state = { feature_id: 'f-6', feature: 'project-rules-scan', requirement: 'issue six text', brief: '', status: 'active', tasks: [], usage: { input_tokens: 0, output_tokens: 0 } };
     await f.saveState();
     return { dir, f };
   }
