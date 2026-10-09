@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, backendRefusal, requirementSection, acceptanceLine } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, backendRefusal, requirementSection, acceptanceLine, briefSection } from './IWorker.js';
 
 /** Runs the authenticated Codex CLI directly inside the isolated worktree. */
 export class CodexWorker implements IWorker {
@@ -33,6 +33,7 @@ ${task.review_questions?.length ? `Review questions (an independent reviewer ver
 ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 ${requirementSection(options.requirement)}
+${briefSection(task, options.brief)}
 ${options.retryBrief || ''}
 Before finishing, write ${handoffPath} as JSON with task_id, status, files_changed, summary, claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;
     options.onPrompt?.(prompt);

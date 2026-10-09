@@ -41,6 +41,12 @@ export const TaskSchema = z.object({
   verification_command: z.string().optional(),
   complexity: z.enum(['simple', 'moderate', 'complex']).optional(),
   allocation_reason: z.string().optional(),
+  /** A pointer into a shared spec, such as "docs/api.md §3". */
+  spec: z.string().optional(),
+  /** Things the worker must not touch, even if they seem related. */
+  out_of_scope: z.array(z.string()).default([]),
+  /** Invariants and hints the planner does not want to lose in the task description. */
+  notes_to_executor: z.array(z.string()).default([]),
   replan_reason: z.string().optional(),
   /** How the last merge decision was reached: a model reviewed the diff, or only mechanical gates ran. */
   inspection: z.enum(['model', 'mechanical-only', 'blind-review']).optional(),
@@ -65,6 +71,8 @@ export const FactoryStateSchema = z.object({
   feature: z.string(),
   /** The user's requirement, verbatim, so every attempt (and every resume) can hand it to the worker. */
   requirement: z.string().default(''),
+  /** A spec, value table or rename map shared by every task in this run, written once. */
+  brief: z.string().default(''),
   /** Exports with no call site when the run started (file#name); the final gate refuses any new one. */
   wiring_baseline: z.array(z.string()).optional(),
   status: z.enum(['planning', 'planned', 'active', 'paused', 'completed', 'failed']),
@@ -93,7 +101,11 @@ export const FactoryStateSchema = z.object({
   pull_request: z.object({ number: z.number(), url: z.string(), branch: z.string() }).optional(),
 });
 
-export type FactoryState = z.infer<typeof FactoryStateSchema>;
+/**
+ * The schema supplies `brief` a default, but state objects are also assembled
+ * by hand before the schema runs, so the in-memory type keeps it optional.
+ */
+export type FactoryState = Omit<z.infer<typeof FactoryStateSchema>, 'brief'> & { brief?: string };
 
 export const LessonSchema = z.object({
   id: z.string(), lesson: z.string().min(12).max(500), tags: z.array(z.string()).max(8), scope: z.enum(['project', 'language', 'path']).default('project'), confidence: z.number().min(0).max(1),

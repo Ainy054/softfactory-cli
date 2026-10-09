@@ -31,11 +31,19 @@ const BlueprintTaskSchema = z.object({
   allocation_reason: z.string().optional(),
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
   review_questions: z.array(z.string()).default([]),
+  /** A pointer into a shared spec, such as "docs/api.md §3". */
+  spec: z.string().optional(),
+  /** Things the worker must not touch, even if they seem related. */
+  out_of_scope: z.array(z.string()).default([]),
+  /** Invariants and hints the planner does not want to lose in the task description. */
+  notes_to_executor: z.array(z.string()).default([]),
 });
 
 export const BlueprintSchema = z.object({
   feature: z.string().min(4),
   requirements_covered: z.array(z.string()).default([]),
+  /** A spec, value table or rename map shared by several tasks, written once. */
+  brief: z.string().max(6000).optional(),
   tasks: z.array(BlueprintTaskSchema).min(1),
 });
 
@@ -77,6 +85,7 @@ export const OUTPUT_SCHEMA = {
   properties: {
     feature: { type: 'string' },
     requirements_covered: { type: 'array', items: { type: 'string' } },
+    brief: { type: 'string', maxLength: 6000 },
     tasks: {
       type: 'array',
       minItems: 1,
@@ -104,6 +113,9 @@ export const OUTPUT_SCHEMA = {
           verification_command: { type: 'string' },
           complexity: { type: 'string', enum: ['simple', 'moderate', 'complex'] },
           allocation_reason: { type: 'string' },
+          spec: { type: 'string' },
+          out_of_scope: { type: 'array', items: { type: 'string' } },
+          notes_to_executor: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -115,6 +127,7 @@ const PLANNING_RULES = (workerCapability?: 'local' | 'cloud') => `Planning rules
 - Never transfer behavior from one component or domain to another.
 - Reference an existing path only when it appears in Repository Context. Put justified new paths in both files_hint and creates_files.
 - Prefer cohesive tasks over many sequential tasks editing the same file. Keep each task under roughly 300 changed lines.
+- A spec shared by 3+ tasks goes once in \`brief\`; descriptions keep only their delta.
 ${workerCapability === 'local' ? `
 LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not a frontier model:
 - At most 2 files in files_hint per task, counting creates_files. Split anything larger.
@@ -124,16 +137,15 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - Sequencing is cheap; a large task is not. Prefer more, smaller, dependency-ordered tasks.
 ` : ''}
 - Put tests before dependent implementation where useful. Put the final cross-cutting quality gate in the last phase.
-- Every agent task changes files. Never emit a task whose only work is running a command ("run the full test suite", "run the build"): that is the verification_command of the task it checks.
+- Every agent task changes files; "run the tests" is the verification_command of the task it checks, never a task.
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
-- acceptance_criteria must be observable outcomes. verification must contain concrete commands or inspection checks.
-- For every test_writer task, declare test_targets and production_targets. If the criterion requires behavior that is not already present, add a dependency on the implementation task first.
+- acceptance_criteria are observable outcomes; verification lists concrete commands or checks.
+- A test_writer declares test_targets and production_targets, and depends on the implementation task when the behaviour does not exist yet.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
-- executor routes WHO performs a task, and it is a safety boundary. "agent" (the default) is repository-contained work a worker can verify inside its worktree. "orchestrator" is anything that touches the host or a live system: secret values and .env contents, crontab, host config, deploys, container restarts, git push, migrations against a live database. "user" is a decision only the product owner can make. Workers never receive orchestrator or user tasks, so never fold such work into an agent task; split it out.
-- verification_command runs this task's own test file, never the whole suite; a check needing the running system is "orchestrator: <command>".
-- verification_command is ONE command the orchestrator executes verbatim in the task's worktree as the merge gate. No shell operators (no &&, ;, redirects, cd). The executable must be one of npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another read-only tool. npx is not allowed: write "npm test -- --run src/x.test.ts", not "npx vitest run src/x.test.ts". A preload flag may name an installed package ("node --import tsx --test src/x.test.ts" is fine) but never a file. Choose the narrowest command that proves the acceptance criteria.
+- executor is a safety boundary: "agent" (default) is repository work a worker verifies in its worktree; "orchestrator" touches the host or a live system (secrets, .env, host config, deploys, restarts, git push, live migrations); "user" is a product decision. Split such work out of agent tasks.
+- verification_command: ONE command, run verbatim as the merge gate, testing only this task's own file (never the whole suite). No shell operators. Executable: npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another. No npx ("npm test -- --run src/x.test.ts"); a preload may name a package, never a file. A check needing the running system is "orchestrator: <command>".
 - review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
 
 function escalationBlock(recurring?: string[]): string {

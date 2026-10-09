@@ -21,6 +21,11 @@ export interface WorkerOptions {
    */
   requirement?: string;
   /**
+   * A spec, value table or rename map shared by every task in this run,
+   * written once so each task's description carries only its delta.
+   */
+  brief?: string;
+  /**
    * From the second attempt: exact signatures of the task's files and what
    * not to do again. Softhouse: a retry is a different prompt, not only a
    * bigger model; one that differs only in feedback repeats the failure.
@@ -64,6 +69,17 @@ export function acceptanceLine(command: string | undefined): string {
   return isDeferredAcceptance(command)
     ? `Live check (the orchestrator runs this against the running system after merge; you cannot run it, so make sure your change satisfies it): ${deferredCommand(command)}`
     : `Acceptance command (run verbatim by the orchestrator after you finish; make it pass): ${command}`;
+}
+
+/** The shared brief, spec, out-of-scope and notes block every worker prompt carries, when present. */
+export function briefSection(task: Pick<Task, 'spec' | 'out_of_scope' | 'notes_to_executor'>, brief?: string): string {
+  let section = '';
+  const shared = brief?.trim();
+  if (shared) section += `\nRUN BRIEF (shared by every task in this run):\n${shared}\n`;
+  if (task.spec) section += `\nSpec: ${task.spec}\n`;
+  if (task.out_of_scope?.length) section += `\nOut of scope (do not touch):\n${task.out_of_scope.map(o => `- ${o}`).join('\n')}\n`;
+  if (task.notes_to_executor?.length) section += `\nNotes from the planner:\n${task.notes_to_executor.map(n => `- ${n}`).join('\n')}\n`;
+  return section;
 }
 
 /** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */

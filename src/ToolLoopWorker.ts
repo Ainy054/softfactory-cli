@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError, briefSection } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
@@ -93,7 +93,7 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string): string {
+  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
     if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
     if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
@@ -119,9 +119,11 @@ ${projectContext}
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
     }
     userPrompt += requirementSection(requirement);
+    userPrompt += briefSection(task, brief);
     if (retryBrief) userPrompt += `\n${retryBrief}\n`;
     return userPrompt;
   }
+
 
   static readonly TOOLS: ToolDefinition[] = [
     {
@@ -238,7 +240,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
-      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief) },
     ];
     // Emit the exact prompt the model will receive, once per attempt, before
     // any transport work. The orchestrator saves it so a retry can be compared
