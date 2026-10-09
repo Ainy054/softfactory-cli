@@ -2347,7 +2347,9 @@ export class Factory extends EventEmitter {
             else if (!/^command:/i.test(source)) unverified.push(claim.text.slice(0, 160));
         }
         for (const answer of handoff.review_answers || []) {
-            for (const m of answer.matchAll(/(?<![\w/])((?:[\w@+-]+\/)*[\w@+-]+\.(?:ts|tsx|js|jsx|mjs|cjs|go|py|rs|java|rb|sql|yaml|yml|json)):(\d+)(?:-(\d+))?/g)) {
+            // Dots allowed inside names, and no match may start mid-name: a pattern
+            // without both read "src/PlanningRules.test.ts:60" as "test.ts:60".
+            for (const m of answer.matchAll(/(?<![\w/.@+-])((?:[\w@+.-]+\/)*[\w@+.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|go|py|rs|java|rb|sql|yaml|yml|json)):(\d+)(?:-(\d+))?/g)) {
                 await check('A review answer', m[0], m[1], Number(m[2]), Number(m[3] || m[2]));
             }
         }

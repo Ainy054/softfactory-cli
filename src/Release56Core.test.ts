@@ -181,3 +181,15 @@ describe('#25 split acceptance', () => {
     assert.equal(factory.state.status, 'failed');
   });
 });
+
+describe('honesty tags read dotted file names whole', () => {
+  it('checks src/PlanningRules.test.ts:60, not test.ts:60', async () => {
+    const dir = await repo({ 'src/PlanningRules.test.ts': Array.from({ length: 80 }, (_, i) => `line ${i}`).join('\n') });
+    const factory: any = new Factory(dir, '', { strategy: 'local', sandbox: 'none' });
+    factory.state = { feature_id: 'f', tasks: [] };
+    const ok = await factory.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', review_answers: ['Covered at src/PlanningRules.test.ts:60-74 and PlanningRules.test.ts is the file.'] }, dir);
+    assert.equal(ok, null);
+    const bad = await factory.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', review_answers: ['See src/PlanningRules.test.ts:500.'] }, dir);
+    assert.match(bad, /cites src\/PlanningRules\.test\.ts:500, but src\/PlanningRules\.test\.ts has 80 lines/);
+  });
+});
