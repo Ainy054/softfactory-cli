@@ -291,6 +291,9 @@ describe('planning a ticket', () => {
 });
 
 describe('the edit tool formats only in the project\'s own style', () => {
+  // Prettier comes from npx's cache on a developer machine; the network-less
+  // sandbox has none, and npx would spend a minute failing to reach the registry.
+  const prettier = execa('npx', ['--no-install', 'prettier', '--version'], { timeout: 10_000, reject: false, env: { ...process.env, npm_config_offline: 'true' } }).then(r => r.exitCode === 0);
   const ugly = "export const a = {x:1,y:2}\nexport function f(a:number,b:number){return a+b}\n";
   async function project(config: boolean) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-fmt-'));
@@ -308,7 +311,8 @@ describe('the edit tool formats only in the project\'s own style', () => {
     assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), ugly);
   });
 
-  it('leaves an unformatted file alone even when the project uses Prettier, so untouched lines never change', async () => {
+  it('leaves an unformatted file alone even when the project uses Prettier, so untouched lines never change', async (t) => {
+    if (!await prettier) return t.skip('Prettier is not available offline here');
     const { AutoHeal } = await import('./AutoHeal.js');
     const dir = await project(true);
     assert.equal(await AutoHeal.hasPrettierConfig(dir), true);
@@ -316,7 +320,8 @@ describe('the edit tool formats only in the project\'s own style', () => {
     assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), ugly);
   });
 
-  it('formats a file the project already keeps Prettier-clean', async () => {
+  it('formats a file the project already keeps Prettier-clean', async (t) => {
+    if (!await prettier) return t.skip('Prettier is not available offline here');
     const { AutoHeal } = await import('./AutoHeal.js');
     const dir = await project(true);
     const clean = 'export const a = { x: 1, y: 2 };\n';
