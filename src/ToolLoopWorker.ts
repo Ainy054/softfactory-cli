@@ -238,6 +238,10 @@ ${projectContext}
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
       { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief) },
     ];
+    // Emit the exact prompt the model will receive, once per attempt, before
+    // any transport work. The orchestrator saves it so a retry can be compared
+    // against the attempt before it and a rerun stays reproducible.
+    options?.onPrompt?.(`${messages[0].content}\n\n${messages[1].content}`);
     const tools = ToolLoopWorker.TOOLS;
     const safeCtx = this.getSafeContextWindow(model);
     // A little more exploration on each retry; the first attempt stays near-deterministic.

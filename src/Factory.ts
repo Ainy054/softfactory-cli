@@ -97,6 +97,8 @@ export class Factory extends EventEmitter {
     lastMetrics: RunMetrics | undefined;
     private prFinalized = false;
     private journals = new Map<string, RunJournal>();
+    /** In-flight prompt-file writes, settled before a task moves on. */
+    private pendingPromptSaves: Promise<unknown>[] = [];
     protectedPaths = new ProtectedPaths([]);
     sandbox: SandboxManager;
     workerRegistry: WorkerRegistry;
@@ -982,6 +984,9 @@ export class Factory extends EventEmitter {
                     sandbox: this.sandbox,
                     signal: attempt.signal,
                     onUsage: usage => this.recordUsage(usage),
+                    onPrompt: (prompt: string) => {
+                        this.pendingPromptSaves.push(this.savePrompt(task, prompt).catch(() => undefined));
+                    },
                     onOutput: (line: string) => {
                         this.emitEvent({ type: 'worker:output', taskId: task.id, line });
                     },
@@ -1003,6 +1008,10 @@ export class Factory extends EventEmitter {
                 clearTimeout(attemptTimer);
                 if (graceTimer) clearTimeout(graceTimer);
             }
+            // The worker was handed its prompt before the backend ran; settle
+            // the prompt files and their journal entries before the next step,
+            // so a rerun or a reviewer finds the record the attempt produced.
+            await this.flushSavedPrompts();
             // A worker's own "not done" list is binding: a task that reports
             // acceptance work as unfinished is rejected whatever the checks say.
             const notDone = this.notDoneViolation(task, handoff);
@@ -2419,6 +2428,36 @@ export class Factory extends EventEmitter {
         catch {
             return false;
         }
+    }
+    /**
+     * Saves the exact prompt a worker was handed and journals its hash, so a
+     * retry can be compared with the attempt before it and a rerun is
+     * reproducible. Redacted first: a credential that reached the prompt must
+     * not be written to disk, and only then is the file safe to hash into the
+     * journal. The file and its directory are owner-only.
+     */
+    async savePrompt(task: Task, prompt: string): Promise<string | undefined> {
+        const featureId = this.state?.feature_id;
+        if (!featureId) return undefined;
+        const dir = path.join(this.baseDir, '.softfactory', 'runs', featureId, 'prompts');
+        await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+        const attempt = (task.attempts ?? 0) + 1;
+        let filePath = path.join(dir, `${task.id}-attempt${attempt}.md`);
+        // Never overwrite: a rerun or a ghost reset re-numbers attempts, and
+        // the journal holds the hash of the file written the first time.
+        for (let n = 2; await this.exists(filePath); n++) {
+            filePath = path.join(dir, `${task.id}-attempt${attempt}-${n}.md`);
+        }
+        await fs.writeFile(filePath, redactSecrets(prompt), { encoding: 'utf8', mode: 0o600 });
+        const relative = path.relative(this.baseDir, filePath);
+        await this.journal()?.append('task:prompt', { task_id: task.id, attempt, path: relative }, [relative]).catch(() => undefined);
+        return relative;
+    }
+    /** Settles the prompt writes started by onPrompt before the task moves on. */
+    async flushSavedPrompts(): Promise<void> {
+        const pending = this.pendingPromptSaves;
+        this.pendingPromptSaves = [];
+        await Promise.all(pending);
     }
     emitEvent(event: FactoryEvent) {
         this.emit(event.type, event);

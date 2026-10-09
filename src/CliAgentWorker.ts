@@ -238,6 +238,7 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
     const handoffPath = path.join(worktreePath, handoffRelative);
     await fs.mkdir(path.dirname(handoffPath), { recursive: true });
     const prompt = this.buildPrompt(task, handoffRelative, options);
+    options.onPrompt?.(prompt);
     const container = options.sandbox?.active ? options.sandbox.agentContainer() : undefined;
     const placement: Placement = container ? 'container' : 'host';
     const args = this.definition.args(prompt, model, placement);
