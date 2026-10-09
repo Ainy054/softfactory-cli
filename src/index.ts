@@ -15,11 +15,12 @@ const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan', '--no-uat', '--init', '--abandon', '--yes',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
-  '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr'
+  '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
+  '--queue', '--next'
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -163,11 +164,15 @@ async function main() {
     process.exit(0);
   }
 
-  const noTui = args.includes('--no-tui') || !process.stdout.isTTY;
   const resumeMode = args.includes('--resume');
   const retryBlocked = args.includes('--retry-blocked');
   const refineMode = args.includes('--refine');
   const planMode = args.includes('--plan');
+  const queueMode = args.includes('--queue');
+  const nextMode = args.includes('--next');
+  // Queue/next are dispatch-only: they never need the plan-approval TUI, so
+  // they always take the plain-stdout path.
+  const noTui = args.includes('--no-tui') || queueMode || nextMode || !process.stdout.isTTY;
   const noDocker = args.includes('--no-docker');
   const markDoneId = getFlagValue(args, '--mark-done');
 
@@ -214,8 +219,14 @@ async function main() {
     issue = { number: loaded.number, url: loaded.url, title: loaded.title };
   }
 
-  if (!resumeMode && !markDoneId && !requirement) {
+  if (!resumeMode && !nextMode && !markDoneId && !requirement) {
     console.error(USAGE);
+    process.exit(1);
+  }
+
+  if (queueMode && !requirement) {
+    console.error('Error: --queue requires a requirement description.');
+    console.error('Example: softfactory --queue "Add user authentication with JWT"');
     process.exit(1);
   }
 
@@ -270,7 +281,7 @@ async function main() {
   if (noTui) {
     if (askForApproval) factory.approvePlan = terminalApprover();
     factory.on('worker:output', (event: { taskId: string; line: string }) => console.log(`[${event.taskId}] ${String(event.line).slice(0, 240)}`));
-    await startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode });
+    await startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, queueMode, nextMode });
   } else {
     const { render } = await import('ink');
     const React = await import('react');
