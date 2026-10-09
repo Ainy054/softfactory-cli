@@ -60,6 +60,8 @@ export interface FactoryOptions {
     issue?: { number: number; url: string; title: string };
     /** Skip .softfactory/uat.json at the end of the run. */
     skipUat?: boolean;
+    /** Archive an unfinished feature, unfinished, so a new requirement can start. */
+    abandon?: boolean;
 }
 
 export class Factory extends EventEmitter {
@@ -87,6 +89,7 @@ export class Factory extends EventEmitter {
     runNotes: Array<{ taskId: string; note: string }> = [];
     prMode: boolean;
     skipUat = false;
+    abandon = false;
     issue: { number: number; url: string; title: string } | undefined;
     /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
     github: GitHub;
@@ -122,8 +125,9 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false } = options;
         this.skipUat = skipUat;
+        this.abandon = abandon;
         this.prMode = prMode;
         this.issue = issue;
         this.github = new GitHub(baseDir);
@@ -525,6 +529,21 @@ export class Factory extends EventEmitter {
     async build(requirement: string) {
         if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
             await this.archiveCurrentState();
+        }
+        if (this.state && (this.state.status === 'active' || this.state.status === 'planned') && this.abandon) {
+            this.log(`ABANDONED: ${this.state.feature} (${this.state.feature_id}) — archived unfinished so a new requirement can start.`);
+            await this.journal()?.append('run:abandoned', { feature: this.state.feature }).catch(() => undefined);
+            this.state.status = 'failed';
+            await this.saveState();
+            await this.archiveCurrentState();
+            this.state = null as any;
+        }
+        if (this.state && (this.state.status === 'active' || this.state.status === 'planned')
+            && requirement.trim() && this.state.requirement?.trim() && this.state.requirement.trim() !== requirement.trim()) {
+            // A new requirement never continues someone else's feature: an
+            // --issue 4 run once resumed the interrupted issue-6 feature and
+            // spent 1.5M tokens on it.
+            throw new Error(`A different feature is in progress: "${this.state.feature}" (${this.state.feature_id}). Run with --resume to continue it, or add --abandon to archive it unfinished and start this requirement.`);
         }
         if (this.state && (this.state.status === 'active' || this.state.status === 'planned')) {
             this.log(`Resuming ${this.state.status === 'planned' ? 'planned' : 'in-progress'} feature: ${this.state.feature}`);

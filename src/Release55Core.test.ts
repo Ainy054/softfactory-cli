@@ -224,3 +224,43 @@ describe('a diff that reformats code it did not need to change is rejected', () 
     assert.equal(await Factory.reformatViolation(small.diff, small.dir), null);
   });
 });
+
+describe('a new requirement never resumes a different feature', () => {
+  async function withActive() {
+    const { dir } = await repo({ 'a.txt': 'a\n' });
+    const f: any = new Factory(dir, '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none' });
+    await fs.mkdir(path.join(dir, '.softfactory', 'archive'), { recursive: true });
+    f.state = { feature_id: 'f-6', feature: 'project-rules-scan', requirement: 'issue six text', status: 'active', tasks: [], usage: { input_tokens: 0, output_tokens: 0 } };
+    await f.saveState();
+    return { dir, f };
+  }
+
+  it('refuses, naming the feature and both ways forward', async () => {
+    const { f } = await withActive();
+    let resumed = false;
+    f.runWorkshopLoop = async () => { resumed = true; };
+    await assert.rejects(f.build('issue four text'), /A different feature is in progress: "project-rules-scan" \(f-6\)\. Run with --resume to continue it, or add --abandon/);
+    assert.equal(resumed, false);
+  });
+
+  it('still resumes when the requirement is the same', async () => {
+    const { f } = await withActive();
+    let resumed = false;
+    f.runWorkshopLoop = async () => { resumed = true; };
+    f.validateDoneTasks = async () => {};
+    await f.build('issue six text');
+    assert.equal(resumed, true);
+  });
+
+  it('--abandon archives the unfinished feature and plans the new requirement', async () => {
+    const { dir } = await withActive();
+    const f: any = new Factory(dir, '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none', abandon: true });
+    f.state = JSON.parse(await fs.readFile(path.join(dir, '.softfactory', 'factory.json'), 'utf8'));
+    let planned = '';
+    f.planner = { provider: 'deepseek', generateBlueprint: async (input: any) => { planned = input.requirement; throw new Error('stop after planning'); } };
+    await assert.rejects(f.build('issue four text'), /stop after planning/);
+    assert.equal(planned, 'issue four text');
+    const archived = JSON.parse(await fs.readFile(path.join(dir, '.softfactory', 'archive', 'f-6.json'), 'utf8'));
+    assert.equal(archived.status, 'failed');
+  });
+});
