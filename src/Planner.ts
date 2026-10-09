@@ -387,6 +387,40 @@ function isSafeRelativeFile(file: string): boolean {
   return Boolean(file) && !path.isAbsolute(file) && !file.split(/[\\/]/).includes('..');
 }
 
+const DEPENDENCY_MANIFESTS = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'go.mod', 'go.sum', 'requirements.txt', 'pyproject.toml', 'Cargo.toml', 'Cargo.lock']);
+
+function fileSegments(file: string): string[] {
+  return file.split(/[\\/]/).filter(Boolean);
+}
+
+/** A migration is a path under a migrations/migrate directory, or a .sql file under a db directory. */
+function isMigrationFile(file: string): boolean {
+  const segments = fileSegments(file);
+  const base = segments[segments.length - 1] ?? '';
+  const dirs = segments.slice(0, -1);
+  if (dirs.includes('migrations') || dirs.includes('migrate')) return true;
+  return base.endsWith('.sql') && dirs.includes('db');
+}
+
+/** A dependency manifest is a manifest filename at any depth (package.json, go.mod, ...). */
+function isDependencyManifest(file: string): boolean {
+  const segments = fileSegments(file);
+  return DEPENDENCY_MANIFESTS.has(segments[segments.length - 1] ?? '');
+}
+
+const LOCALE_DIRS = new Set(['locale', 'locales', 'i18n', 'lang']);
+const USER_FACING_TEXT = /(message|label|text shown|translation|copy)/i;
+
+/**
+ * A locale file lives under a locale/locales/i18n/lang directory segment.
+ * Matching path segments (rather than a bare substring regex) keeps names like
+ * "localization", "ci18n" or "mylang" from being treated as locale paths.
+ */
+function isLocaleFile(file: string): boolean {
+  const segments = fileSegments(file);
+  return segments.slice(0, -1).some(segment => LOCALE_DIRS.has(segment));
+}
+
 export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint {
   const blueprint = BlueprintSchema.parse(raw);
   const errors: string[] = [];
@@ -479,6 +513,64 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
       const previous = claims.get(key);
       if (previous) errors.push(`same-phase file conflict: ${previous} and ${task.id} both claim ${file}`);
       claims.set(key, task.id);
+    }
+  }
+
+  // 5.6 domain planning rules. Softhouse's planner enforces these; a plain
+  // error string lets the planner's repair loop fix the draft.
+
+  // A task transitively reaches another when it (directly or indirectly)
+  // depends on it through dependencies or blockedBy.
+  const reaches = (from: string, to: string): boolean => {
+    const source = taskById.get(from);
+    const stack = source ? [...source.dependencies, ...source.blockedBy] : [];
+    const seen = new Set<string>();
+    while (stack.length) {
+      const next = stack.pop()!;
+      if (next === to) return true;
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const task = taskById.get(next);
+      if (task) stack.push(...task.dependencies, ...task.blockedBy);
+    }
+    return false;
+  };
+
+  const taskFiles = (task: Blueprint['tasks'][number]) => [...task.files_hint, ...task.creates_files];
+
+  // Rule 1: migrations must form a linear chain; two migration tasks must be ordered.
+  const migrationTasks = blueprint.tasks.filter(task => taskFiles(task).some(isMigrationFile));
+  for (let i = 0; i < migrationTasks.length; i += 1) {
+    for (let j = i + 1; j < migrationTasks.length; j += 1) {
+      const a = migrationTasks[i];
+      const b = migrationTasks[j];
+      if (!reaches(a.id, b.id) && !reaches(b.id, a.id)) {
+        errors.push(`${a.id} and ${b.id} both add database migrations but neither depends on the other; migrations form a linear chain`);
+      }
+    }
+  }
+
+  // Rule 2: at most one task may change dependency manifests.
+  const manifestTasks = blueprint.tasks.filter(task => taskFiles(task).some(isDependencyManifest));
+  for (let i = 0; i < manifestTasks.length; i += 1) {
+    for (let j = i + 1; j < manifestTasks.length; j += 1) {
+      const a = manifestTasks[i];
+      const b = manifestTasks[j];
+      const shared = [...new Set([...taskFiles(a), ...taskFiles(b)].filter(isDependencyManifest))].sort();
+      errors.push(`${a.id} and ${b.id} both change dependency manifests (${shared.join(', ')}); keep dependency changes in one task so lockfiles cannot conflict`);
+    }
+  }
+
+  // Rule 3: when the repository has locale files, user-facing text needs a locale task.
+  const localeFiles = [...input.repositoryFiles].filter(isLocaleFile).sort();
+  if (localeFiles.length > 0) {
+    const planUpdatesLocale = blueprint.tasks.some(task => taskFiles(task).some(isLocaleFile));
+    if (!planUpdatesLocale) {
+      for (const task of blueprint.tasks) {
+        if (USER_FACING_TEXT.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
+          errors.push(`${task.id} adds user-facing text but no task updates the locale files (${localeFiles[0]})`);
+        }
+      }
     }
   }
 
