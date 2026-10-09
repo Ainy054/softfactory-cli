@@ -1167,6 +1167,17 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'missing_test_evidence', testEvidence);
                 return null;
             }
+            // A test writer that edits production code to make its own tests
+            // pass is not writing tests. Softhouse tags this
+            // `tests-rewrote-source`.
+            const scopeViolation = testWriterScopeViolation(task, diff);
+            if (scopeViolation) {
+                const scopeFiles = testWriterScopeFiles(task, diff).join(', ');
+                this.log(`REJECTED: ${task.id} — test writer changed source: ${scopeFiles}`);
+                processFailure(scopeViolation);
+                await this.recordAttempt(task, 'tests_rewrote_source', scopeFiles);
+                return null;
+            }
             // A task must not be able to pass by removing the thing that checks
             // it. godo's T1 renamed the `test` script to `test:unit`, which made
             // verification report "no test script configured -> pass", and it
@@ -1295,6 +1306,15 @@ export class Factory extends EventEmitter {
         const added = diff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).join('\n');
         const looksLikeTest = /(?:\b(?:describe|it|test|pytest|unittest)\s*\(|\bfunc\s+Test[A-Z]|\bTest\s*\()/m.test(added);
         return looksLikeTest ? null : 'Test-writer changes contain no test cases. Add executable assertions instead of a placeholder file.';
+    }
+
+    /**
+     * A test writer may only add or change test files. Editing production code
+     * so its own tests pass is not writing tests; Softhouse tags it
+     * `tests-rewrote-source`. See the exported helper of the same name.
+     */
+    testWriterScopeViolation(task: { agent_role?: string }, diff: string): string | null {
+        return testWriterScopeViolation(task, diff);
     }
 
     /**
@@ -2350,4 +2370,39 @@ export class Factory extends EventEmitter {
             console.log(`[SoftFactory] ${msg}`);
         }
     }
+}
+
+/** The files a diff adds or changes, read from its `diff --git a/<path> b/<path>` headers. */
+export function diffHeaderFiles(diff: string): string[] {
+    const files: string[] = [];
+    for (const line of diff.split('\n')) {
+        const match = line.match(/^diff --git a\/(\S+) b\/(\S+)/);
+        if (match) files.push(match[2] || match[1]);
+    }
+    return [...new Set(files)];
+}
+
+/** True for a path that is a test file by language convention. */
+export function isTestFilePath(file: string): boolean {
+    return /\.(test|spec)\.[cm]?[jt]sx?$/.test(file)
+        || /_test\.go$/.test(file)
+        || /(^|\/)(__tests__|test|tests)\//.test(file)
+        || /(^|\/)test_[^/]+\.py$|_test\.py$/.test(file);
+}
+
+/** The non-test files a test-writer diff touches; empty for any other role. */
+export function testWriterScopeFiles(task: { agent_role?: string }, diff: string): string[] {
+    if (task.agent_role !== 'test_writer') return [];
+    return diffHeaderFiles(diff).filter(file => !isTestFilePath(file));
+}
+
+/**
+ * Reject a `test_writer` whose diff touches production code. Returns a message
+ * naming every non-test file, or null when the diff is test-only (or the task
+ * is not a test writer). Softhouse tags this `tests-rewrote-source`.
+ */
+export function testWriterScopeViolation(task: { agent_role?: string }, diff: string): string | null {
+    const offenders = testWriterScopeFiles(task, diff);
+    if (offenders.length === 0) return null;
+    return `A test_writer may only add or change test files, but this diff touches non-test files: ${offenders.join(', ')}. Revert the source changes and keep the task to tests.`;
 }
