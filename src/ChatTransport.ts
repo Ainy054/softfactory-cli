@@ -1,3 +1,4 @@
+import { requestJson, HttpStatusError } from './HttpRetry.js';
 import { compatEndpoint, modelListed, safeLocalContextWindow } from './TextModel.js';
 
 /**
@@ -217,14 +218,13 @@ export class OpenAiCompatibleChatTransport implements ChatTransport {
       return { role: message.role, content: message.content };
     });
     const temperature = (this.config.supportsTemperature ?? (() => true))(request.model) ? { temperature: request.temperature } : {};
-    const response = await this.fetch(this.config.chatUrl, {
+    const data = await requestJson<any>(this.fetch, this.config.chatUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.apiKey}` },
-      signal: request.signal,
       body: JSON.stringify({ model: request.model, messages, tools: request.tools, stream: false, ...temperature }),
+    }, { label: `${this.label} API`, signal: request.signal }).catch(error => {
+      throw error instanceof HttpStatusError ? new Error(`${this.label} API error: ${error.statusText} - ${error.body}`) : error;
     });
-    if (!response.ok) throw new Error(`${this.label} API error: ${response.statusText} - ${await response.text()}`);
-    const data = await response.json() as any;
     const message = data.choices?.[0]?.message || {};
     return {
       content: typeof message.content === 'string' ? message.content : '',
@@ -299,12 +299,12 @@ export class AnthropicChatTransport implements ChatTransport {
   async chat(request: ChatRequest): Promise<ChatReply> {
     const { system, messages } = AnthropicChatTransport.toAnthropic(request.messages);
     const tools = request.tools.map(tool => ({ name: tool.function.name, description: tool.function.description, input_schema: tool.function.parameters }));
-    const response = await this.fetch(`${AnthropicChatTransport.URL}/messages`, {
-      method: 'POST', headers: this.headers, signal: request.signal,
+    const data = await requestJson<any>(this.fetch, `${AnthropicChatTransport.URL}/messages`, {
+      method: 'POST', headers: this.headers,
       body: JSON.stringify({ model: request.model, max_tokens: 16000, system, messages, tools, temperature: request.temperature }),
+    }, { label: 'Anthropic API', signal: request.signal }).catch(error => {
+      throw error instanceof HttpStatusError ? new Error(`Anthropic API error: ${error.statusText} - ${error.body}`) : error;
     });
-    if (!response.ok) throw new Error(`Anthropic API error: ${response.statusText} - ${await response.text()}`);
-    const data = await response.json() as any;
     const blocks: any[] = Array.isArray(data.content) ? data.content : [];
     return {
       content: blocks.filter(block => block.type === 'text').map(block => block.text).join(''),

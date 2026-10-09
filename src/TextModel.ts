@@ -1,3 +1,4 @@
+import { requestJson, HttpStatusError } from './HttpRetry.js';
 import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -67,6 +68,16 @@ export function safeLocalContextWindow(modelName: string): number {
   const isLargeModel = /(?:1[0-9]|[2-9][0-9])b\b/i.test(modelName);
   if (isLargeModel && totalGb < 32) return 4096;
   return 8192;
+}
+
+/** A model API call that survives a dropped connection; failures that remain are environment faults. */
+async function modelRequest(fetchImpl: typeof fetch, url: string, init: RequestInit, timeoutMs: number, label: string): Promise<any> {
+  try {
+    return await requestJson(fetchImpl, url, init, { label, timeoutMs });
+  } catch (error: any) {
+    if (error instanceof HttpStatusError) throw new WorkerEnvironmentError(`${label} request failed: ${error.status} ${error.body.slice(0, 300)}`);
+    throw new WorkerEnvironmentError(`${url} is not reachable: ${error?.message || 'fetch failed'}`);
+  }
 }
 
 async function fetchWithTimeout(fetchImpl: typeof fetch, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -260,13 +271,11 @@ export class OpenAiTextModel implements ITextModel {
   async isAvailable(): Promise<boolean> { return Boolean(process.env.OPENAI_API_KEY); }
 
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
-    const response = await fetchWithTimeout(this.fetchImpl, 'https://api.openai.com/v1/responses', {
+    const data: any = await modelRequest(this.fetchImpl, 'https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY || ''}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: this.model, input: prompt, store: false }),
-    }, options.timeoutMs ?? 300000);
-    if (!response.ok) throw new WorkerEnvironmentError(`OpenAI request failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    const data: any = await response.json();
+    }, options.timeoutMs ?? 300000, 'OpenAI');
     const text = data.output_text || data.output?.flatMap((item: any) => item.content || []).map((part: any) => part.text || '').join('') || '';
     if (!text) throw new Error(`OpenAI model ${this.model} returned no text.`);
     return text;
@@ -280,13 +289,11 @@ export class AnthropicTextModel implements ITextModel {
   async isAvailable(): Promise<boolean> { return Boolean(process.env.ANTHROPIC_API_KEY); }
 
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
-    const response = await fetchWithTimeout(this.fetchImpl, 'https://api.anthropic.com/v1/messages', {
+    const data: any = await modelRequest(this.fetchImpl, 'https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY || '', 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({ model: this.model, max_tokens: 8000, messages: [{ role: 'user', content: prompt }] }),
-    }, options.timeoutMs ?? 300000);
-    if (!response.ok) throw new WorkerEnvironmentError(`Anthropic request failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    const data: any = await response.json();
+    }, options.timeoutMs ?? 300000, 'Anthropic');
     const text = (data.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('');
     if (!text) throw new Error(`Anthropic model ${this.model} returned no text.`);
     return text;
@@ -318,14 +325,12 @@ export class OpenAiCompatibleTextModel implements ITextModel {
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     if (!this.endpoint.baseUrl) throw new WorkerEnvironmentError(`${this.endpoint.label}: no base URL configured (set SOFTFACTORY_COMPAT_BASE_URL).`);
     if (!this.apiKey) throw new WorkerEnvironmentError(`${this.endpoint.apiKeyEnv} is not set.`);
-    const response = await fetchWithTimeout(this.fetchImpl, `${this.endpoint.baseUrl}/chat/completions`, {
+    const data: any = await modelRequest(this.fetchImpl, `${this.endpoint.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.apiKey}` },
       // No response_format: not every compatible endpoint accepts it, and the callers parse JSON out of text anyway.
       body: JSON.stringify({ model: this.model, messages: [{ role: 'user', content: prompt }], stream: false, temperature: options.temperature ?? 0.1 }),
-    }, options.timeoutMs ?? 8 * 60_000);
-    if (!response.ok) throw new WorkerEnvironmentError(`${this.endpoint.label} request failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    const data: any = await response.json();
+    }, options.timeoutMs ?? 8 * 60_000, this.endpoint.label);
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error(`${this.endpoint.label} model ${this.model} returned an empty response.`);
     return content;
@@ -351,7 +356,7 @@ export class DeepSeekTextModel implements ITextModel {
 
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     if (!process.env.DEEPSEEK_API_KEY) throw new WorkerEnvironmentError('DEEPSEEK_API_KEY is not set.');
-    const response = await fetchWithTimeout(this.fetchImpl, 'https://api.deepseek.com/v1/chat/completions', {
+    const data: any = await modelRequest(this.fetchImpl, 'https://api.deepseek.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` },
       body: JSON.stringify({
@@ -361,9 +366,7 @@ export class DeepSeekTextModel implements ITextModel {
         temperature: options.temperature ?? 0.1,
         ...(options.json ? { response_format: { type: 'json_object' } } : {}),
       }),
-    }, options.timeoutMs ?? 8 * 60_000);
-    if (!response.ok) throw new WorkerEnvironmentError(`DeepSeek request failed: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    const data: any = await response.json();
+    }, options.timeoutMs ?? 8 * 60_000, 'DeepSeek');
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error(`DeepSeek model ${this.model} returned an empty response.`);
     return content;
