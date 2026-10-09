@@ -149,6 +149,7 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--yes` | Start the plan without asking, even in an interactive terminal | ask when interactive |
 | `--abandon` | Archive an unfinished feature so a new requirement can start; without it, a different requirement stops instead of resuming someone else's feature | — |
 | `--init` | Write starter `worker-context.md`, `uat.example.json` and `protected-paths.txt` into `.softfactory/`; never overwrites | — |
+| `--adopt` | Accept the running softfactory version: write it as `softfactory_version` into `.softfactory/config.json`, print it and exit. A pinned project whose major version differs refuses to run until you do | — |
 
 Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (and `DASHSCOPE_BASE_URL`, default the international compatible-mode endpoint), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `META_API_KEY`; `SOFTFACTORY_COMPAT_BASE_URL`, `SOFTFACTORY_COMPAT_API_KEY`, `SOFTFACTORY_COMPAT_LABEL`, `SOFTFACTORY_COMPAT_CONTEXT` for any other OpenAI-compatible endpoint; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_AGENT_IMAGE` (or `agentImage`) for the agent container's image when the project needs more than node in it; `SOFTFACTORY_EGRESS_ALLOW` for extra hosts (`host` or `host:port`, `*.example.com`) the agent container may reach; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
 
@@ -176,7 +177,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | Path | Contents |
 | :--- | :--- |
 | `factory.json` | The run state: feature, tasks, statuses, attempts, inspection results. Versioned. |
-| `config.json` | Yours to write: project settings. `commitRecords: true` commits each run's evidence, journal, prompts, handoff rows and metrics, redacted, under `softfactory-records/<feature>/` on the branch the work merged into (off by default) |
+| `config.json` | Yours to write: project settings, and the home of the `softfactory_version` pin that `--init` and `--adopt` write — a build whose major version differs from the pin refuses to start until you run `--adopt`. `commitRecords: true` commits each run's evidence, journal, prompts, handoff rows and metrics, redacted, under `softfactory-records/<feature>/` on the branch the work merged into (off by default) |
 | `queue/<feature_id>.json` | Plans parked by `--queue`, waiting for `--next` to move the oldest into `factory.json` |
 | `evidence/<feature>/<task>-attempt<N>.log` | The acceptance command, its output, and `RESULT: PASS` or `FAIL` |
 | `runs/<feature>/prompts/<task>-attempt<N>.md` | The exact prompt each worker attempt received, redacted; its hash is in the journal |
