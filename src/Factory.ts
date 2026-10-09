@@ -76,6 +76,8 @@ export class Factory extends EventEmitter {
     statePath: string;
     historyPath: string;
     archiveDir: string;
+    /** Approved plans waiting for the current run to finish, one state file each. */
+    queueDir: string;
     memoryPath: string;
     worktreeManager: WorktreeManager;
     /** Reviews diffs on the configured provider's model; the merge gate for hybrid and cloud runs. */
@@ -151,6 +153,7 @@ export class Factory extends EventEmitter {
         this.statePath = path.join(baseDir, '.softfactory', 'factory.json');
         this.historyPath = path.join(baseDir, '.softfactory', 'history.json');
         this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
+        this.queueDir = path.join(baseDir, '.softfactory', 'queue');
         this.memoryPath = path.join(baseDir, '.softfactory', 'FACTORY_MEMORY.md');
         this.worktreeManager = new WorktreeManager(baseDir);
         // An explicit --local-model must pin every local tier. Passing undefined
@@ -207,6 +210,7 @@ export class Factory extends EventEmitter {
     async init() {
         await fs.mkdir(path.join(this.baseDir, '.softfactory'), { recursive: true });
         await fs.mkdir(this.archiveDir, { recursive: true });
+        await fs.mkdir(this.queueDir, { recursive: true });
         this.protectedPaths = await ProtectedPaths.load(this.baseDir);
         if (this.protectedPaths.size > 0) this.log(`Protected paths: ${this.protectedPaths.size} pattern(s) from ${ProtectedPaths.FILE}`);
         await this.sandbox.detect();
@@ -492,6 +496,31 @@ export class Factory extends EventEmitter {
             this.log('Use --resume to continue it, or wait for it to complete/fail before planning a new one.');
             return;
         }
+        this.state = await this.planFeatureState(requirement);
+        await this.saveState();
+        await this.journalPlan();
+        await this.updateHistory('planned');
+        this.emitEvent({ type: 'state:update', state: this.state });
+        this.emitEvent({ type: 'build:complete', status: 'planned', feature: this.state.feature });
+        this.log(`Plan saved with ${this.state.tasks.length} task(s):`);
+        for (const task of this.state.tasks) {
+            const deps = [...task.dependencies, ...task.blockedBy];
+            const depStr = deps.length > 0 ? ` (depends: ${deps.join(', ')})` : '';
+            this.log(`  [P${task.phase}] ${task.id}: ${task.title}${depStr}`);
+            this.log(`         ${task.description.slice(0, 120)}${task.description.length > 120 ? '...' : ''}`);
+            if (task.files_hint.length > 0) {
+                this.log(`         files: ${task.files_hint.join(', ')}`);
+            }
+        }
+        this.log(`\nTo execute this plan: softfactory --resume`);
+    }
+    /**
+     * The planning half of plan(): repository context, planner, the
+     * acceptance probe inside planTasks, and the state shape every planned
+     * feature has. It saves nothing, so plan() writes it to factory.json and
+     * queue() parks the very same shape in the queue directory.
+     */
+    private async planFeatureState(requirement: string): Promise<FactoryState> {
         this.log(`Generating plan for: ${requirement}`);
         const codebaseContext = await this.getRepoContext(requirement);
         const repositoryFiles = new Set(await this.getRepositoryFiles());
@@ -501,7 +530,7 @@ export class Factory extends EventEmitter {
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
         const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
-        this.state = {
+        return {
             feature_id: featureId,
             feature: blueprint.feature,
             status: 'planned',
@@ -520,22 +549,63 @@ export class Factory extends EventEmitter {
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
-        await this.saveState();
-        await this.journalPlan();
-        await this.updateHistory('planned');
-        this.emitEvent({ type: 'state:update', state: this.state });
-        this.emitEvent({ type: 'build:complete', status: 'planned', feature: this.state.feature });
-        this.log(`Plan saved with ${this.state.tasks.length} task(s):`);
-        for (const task of this.state.tasks) {
-            const deps = [...task.dependencies, ...task.blockedBy];
-            const depStr = deps.length > 0 ? ` (depends: ${deps.join(', ')})` : '';
-            this.log(`  [P${task.phase}] ${task.id}: ${task.title}${depStr}`);
-            this.log(`         ${task.description.slice(0, 120)}${task.description.length > 120 ? '...' : ''}`);
-            if (task.files_hint.length > 0) {
-                this.log(`         files: ${task.files_hint.join(', ')}`);
+    }
+    /**
+     * Plans like plan() and parks the result: the planned state is written to
+     * .softfactory/queue/<feature_id>.json and factory.json is left alone, so
+     * a requirement can wait behind the run in progress and start later with
+     * --next. Queueing is deliberately allowed while another feature is active.
+     */
+    async queue(requirement: string) {
+        const state = await this.planFeatureState(requirement);
+        await fs.mkdir(this.queueDir, { recursive: true });
+        // Feature ids are second-precision, so two plans queued in the same
+        // second would collide and the second would overwrite the first.
+        const baseId = state.feature_id;
+        for (let n = 2; await this.exists(path.join(this.queueDir, `${state.feature_id}.json`)); n++) {
+            state.feature_id = `${baseId}-${n}`;
+        }
+        if (state.integration_branch) state.integration_branch = `softfactory/${state.feature_id}`;
+        const queuePath = path.join(this.queueDir, `${state.feature_id}.json`);
+        await fs.writeFile(queuePath, JSON.stringify(state, null, 2));
+        this.log(`QUEUED: ${state.feature} as ${state.feature_id} (${state.tasks.length} tasks); run --next to start it.`);
+    }
+    /**
+     * Starts the oldest queued plan (by created_at) once nothing is in
+     * progress: the current state is archived, the queued state becomes the
+     * current one, its queue file is removed, and the run continues exactly
+     * as --resume does for a planned feature.
+     */
+    async next() {
+        if (this.state && (this.state.status === 'active' || this.state.status === 'planned' || this.state.status === 'paused')) {
+            this.log(`A feature is in progress: ${this.state.feature}; finish it or --abandon it first`);
+            return;
+        }
+        let files: string[] = [];
+        try {
+            files = (await fs.readdir(this.queueDir)).filter(f => f.endsWith('.json')).sort();
+        } catch { /* no queue directory yet: nothing was queued */ }
+        const queued: Array<{ file: string; state: FactoryState }> = [];
+        for (const file of files) {
+            try {
+                queued.push({ file, state: this.loadState(await fs.readFile(path.join(this.queueDir, file), 'utf-8')) });
+            } catch (error: any) {
+                this.log(`Skipping unreadable queued plan ${file}: ${error?.message || 'unknown error'}`);
             }
         }
-        this.log(`\nTo execute this plan: softfactory --resume`);
+        if (queued.length === 0) {
+            this.log('Queue is empty.');
+            return;
+        }
+        queued.sort((a, b) => a.state.created_at.localeCompare(b.state.created_at) || a.file.localeCompare(b.file));
+        const [nextPlan] = queued;
+        if (this.state) await this.archiveCurrentState();
+        this.state = nextPlan.state;
+        this.state.status = 'planned';
+        await this.saveState();
+        await fs.unlink(path.join(this.queueDir, nextPlan.file));
+        this.log(`Starting queued feature: ${this.state.feature} (${this.state.feature_id})`);
+        await this.resume();
     }
     async build(requirement: string) {
         if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
