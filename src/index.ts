@@ -10,9 +10,11 @@ import { WorkerStrategy, CloudProvider, CLOUD_PROVIDERS, AGENT_PROVIDERS } from 
 import type { PlannerProvider } from './Planner.js';
 import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
+import { readPin, writePin, pinCheck } from './VersionPin.js';
+import { SOFTFACTORY_VERSION } from './version.js';
 
 const KNOWN_FLAGS = [
-  '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan', '--no-uat', '--init', '--abandon', '--yes',
+  '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan', '--no-uat', '--init', '--abandon', '--yes', '--adopt',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
@@ -20,7 +22,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -68,6 +70,12 @@ async function main() {
     const { initProject } = await import('./Init.js');
     for (const { file, written } of await initProject(process.cwd())) console.log(`${written ? 'wrote  ' : 'exists '} ${file}`);
     console.log('Edit worker-context.md; rename uat.example.json to uat.json once its commands are real.');
+    process.exit(0);
+  }
+
+  if (args.includes('--adopt')) {
+    await writePin(process.cwd(), SOFTFACTORY_VERSION);
+    console.log(`[SoftFactory] Accepted softfactory ${SOFTFACTORY_VERSION}: pinned .softfactory/config.json to ${SOFTFACTORY_VERSION}.`);
     process.exit(0);
   }
 
@@ -239,6 +247,15 @@ async function main() {
   if (planMode && !requirement) {
     console.error('Error: --plan requires a requirement description.');
     console.error('Example: softfactory --plan "Add user authentication with JWT"');
+    process.exit(1);
+  }
+
+  // A project pinned to a different major version must not silently move across
+  // it. A missing pin means no check; the operator accepts a new major with
+  // `softfactory --adopt`.
+  const pinResult = pinCheck(await readPin(process.cwd()), SOFTFACTORY_VERSION);
+  if (!pinResult.ok) {
+    console.error(pinResult.message);
     process.exit(1);
   }
 
