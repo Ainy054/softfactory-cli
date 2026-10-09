@@ -1,3 +1,7 @@
+/**
+ * Focused tests for Factory.notDoneViolation (Softhouse 5.5): a worker's own
+ * "not done" list is binding. See src/Factory.ts notDoneViolation.
+ */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { Factory } from './Factory.js';
