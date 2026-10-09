@@ -125,6 +125,12 @@ export const HandoffSchema = z.object({
   summary: z.string(),
   /** One answer per review question, each citing file:line. */
   review_answers: z.array(z.string()).optional(),
+  /**
+   * Material claims with where they can be checked: "path:line", "path:start-end",
+   * "command: <what ran>" or "UNVERIFIED". A path:line that does not exist is a
+   * fabricated source and rejects the task (Softhouse's honesty tags).
+   */
+  claims: z.array(z.object({ text: z.string(), source: z.string() })).optional(),
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;

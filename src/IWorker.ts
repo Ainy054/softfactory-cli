@@ -20,6 +20,12 @@ export interface WorkerOptions {
    * carried, and the worker went searching the repository for it.
    */
   requirement?: string;
+  /**
+   * From the second attempt: exact signatures of the task's files and what
+   * not to do again. Softhouse: a retry is a different prompt, not only a
+   * bigger model; one that differs only in feedback repeats the failure.
+   */
+  retryBrief?: string;
 }
 
 /**

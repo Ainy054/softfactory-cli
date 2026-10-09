@@ -953,6 +953,7 @@ export class Factory extends EventEmitter {
                     streamToTerminal: this.streamToTerminal,
                     projectContext,
                     requirement: this.state?.requirement,
+                    retryBrief: task.attempts > 0 ? await this.retryBrief(task, worktreePath) : undefined,
                     memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
                     model,
                     diagnosticsDir: path.join(this.baseDir, '.softfactory'),
@@ -964,12 +965,18 @@ export class Factory extends EventEmitter {
                     },
                 });
                 execution.catch(() => undefined);
-                handoff = await Promise.race([
-                    execution,
-                    new Promise<never>((_, reject) => attempt.signal.addEventListener('abort', () => {
-                        graceTimer = setTimeout(() => reject(new AttemptTimeoutError(attemptMinutes)), this.attemptGraceMs);
-                    }, { once: true })),
-                ]);
+                try {
+                    handoff = await Promise.race([
+                        execution,
+                        new Promise<never>((_, reject) => attempt.signal.addEventListener('abort', () => {
+                            graceTimer = setTimeout(() => reject(new AttemptTimeoutError(attemptMinutes)), this.attemptGraceMs);
+                        }, { once: true })),
+                    ]);
+                } catch (crash) {
+                    const recovered = await this.recoverCrashedWork(task, worktreePath, crash);
+                    if (!recovered) throw crash;
+                    handoff = recovered;
+                }
             } finally {
                 clearTimeout(attemptTimer);
                 if (graceTimer) clearTimeout(graceTimer);
@@ -990,6 +997,13 @@ export class Factory extends EventEmitter {
                 this.log(`EMPTY: ${task.id} — worker produced no file changes`);
                 processFailure('Worker completed but produced no file changes. Ensure you actually create/modify files, not just describe what to do.');
                 await this.recordAttempt(task, 'no_file_changes', task.last_feedback || 'no file changes');
+                return null;
+            }
+            const fabricated = await this.claimProblems(task, handoff, worktreePath);
+            if (fabricated) {
+                this.log(`REJECTED: ${task.id} — ${fabricated.split('\n')[0]}`);
+                processFailure(fabricated);
+                await this.recordAttempt(task, 'fabricated_claim', fabricated);
                 return null;
             }
             if (handoff.status === 'failure') {
@@ -1419,6 +1433,9 @@ export class Factory extends EventEmitter {
         return null;
     }
     async recordAttempt(task: Task, category: string, detail: string) {
+        const seen = this.failureCategories.get(task.id) || [];
+        seen.push(category);
+        this.failureCategories.set(task.id, seen);
         try {
             const journalPath = path.join(this.baseDir, '.softfactory', 'attempts.jsonl');
             await fs.appendFile(journalPath, JSON.stringify({
@@ -1918,6 +1935,8 @@ export class Factory extends EventEmitter {
         return `Project digest (.softfactory/worker-context.md):\n${lines.slice(0, Factory.WORKER_CONTEXT_MAX_LINES).join('\n')}`;
     }
     private warnedLongDigest = false;
+    /** Failure categories recorded per task this run, for the retry brief. */
+    private failureCategories = new Map<string, string[]>();
 
     /** Prior features plus, from the handoff index, the merged tasks most like this requirement. */
     async planningHistory(history: Array<{ feature: string; status: string; tasks_done: number; task_count: number }>, requirement: string): Promise<string> {
@@ -1959,15 +1978,146 @@ export class Factory extends EventEmitter {
             await git(['merge', '--abort'], worktreePath);
             return `This branch conflicts with work merged after it started (${conflicts.join(', ') || 'see git output'}). Redo the change on top of the current code: re-read those files first.`;
         }
-        if (!task.verification_command || task.agent_role === 'test_writer') return null;
+        if (!task.verification_command || task.agent_role === 'test_writer') return this.deltaReview(task, target, shared, worktreePath, git);
         const acceptance = await this.taskVerifier.runAcceptance(worktreePath, task, {
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
             note: `re-run after merging ${target} into ${branchName}`,
         });
         await this.journal()?.append('task:fork-recheck', { task_id: task.id, target, shared_files: shared, passed: acceptance.passed, exit_code: acceptance.exitCode }, acceptance.evidencePath ? [acceptance.evidencePath] : []).catch(() => undefined);
-        if (acceptance.passed) return null;
+        if (acceptance.passed) return this.deltaReview(task, target, shared, worktreePath, git);
         await git(['reset', '--hard', 'HEAD~1'], worktreePath);
         return `Combined with work merged after this task started, its acceptance command fails: ${task.verification_command} exited ${acceptance.exitCode ?? 'without running'}.${shared.length ? ` Both changed: ${shared.join(', ')}.` : ''} Re-read the current code and make the change work with it.\n${acceptance.output.slice(-1200)}`;
+    }
+
+    /**
+     * Delta review, borrowed from Softhouse: when a trial merge combined a
+     * protected task's branch with code that landed after it was reviewed,
+     * the result goes back to the blind reviewer before it merges. Both
+     * delta rounds Softhouse observed in the field found something.
+     */
+    async deltaReview(task: Task, target: string, shared: string[], worktreePath: string, git: (args: string[], cwd?: string) => Promise<{ stdout: string; exitCode?: number }>): Promise<string | null> {
+        const touched = this.protectedPaths.touched(shared);
+        if (!task.protected && touched.length === 0) return null;
+        const { stdout: diff } = await git(['diff', `${target}..HEAD`], worktreePath);
+        this.log(`DELTA REVIEW: ${task.id} — protected work was combined with ${target}; the blind reviewer checks the result before merge.`);
+        let verdict;
+        try {
+            verdict = await this.frontierInspector.inspectBlind(task, diff, `This branch was reviewed, then combined with ${target}, which changed ${shared.join(', ') || 'other files'} since. Review the combined change.`, []);
+        } catch (error: any) {
+            // A reviewer that cannot answer is not an approval.
+            await git(['reset', '--hard', 'HEAD~1'], worktreePath);
+            return `Delta review could not run (${error?.message || 'reviewer unavailable'}); the combined protected change was not merged.`;
+        }
+        await this.journal()?.append('task:delta-review', { task_id: task.id, target, shared_files: shared, verdict: verdict.verdict, provider: verdict.provider, model: verdict.model }).catch(() => undefined);
+        if (verdict.verdict === 'PASS') return null;
+        await git(['reset', '--hard', 'HEAD~1'], worktreePath);
+        return `Delta review failed after combining this protected change with work merged since it was reviewed: ${verdict.feedback}`;
+    }
+
+    /**
+     * From the second attempt the prompt itself changes: the exact exported
+     * signatures of the task's files and a "do not" for every way it failed
+     * before. Softhouse forbids retries whose only change is the model.
+     */
+    async retryBrief(task: Task, worktreePath: string): Promise<string> {
+        const signatures: string[] = [];
+        for (const file of [...new Set([...task.files_hint, ...task.creates_files])]) {
+            let text: string;
+            try { text = await fs.readFile(path.join(worktreePath, file), 'utf8'); } catch { continue; }
+            const lines = text.split('\n')
+                .filter(line => /^(?:export\s|func\s|def\s|class\s|pub\s+fn\s)/.test(line))
+                .map(line => line.replace(/\s*\{\s*$/, '').replace(/\s*=>.*$/, '').trim().slice(0, 200));
+            if (lines.length) signatures.push(`${file}:`, ...lines.slice(0, 15).map(line => `  ${line}`));
+        }
+        const categories = [...new Set(this.failureCategories.get(task.id) || [])];
+        const prohibitions = categories.map(c => Factory.PROHIBITIONS[c]).filter(Boolean) as string[];
+        if (!prohibitions.length) prohibitions.push('Do not repeat the previous approach; the feedback above says why it was rejected. Change the implementation, not only its wording.');
+        if (task.verification_command) prohibitions.push(`Do not finish until you have run the acceptance command yourself and it passes: ${task.verification_command}`);
+        return [
+            `RETRY BRIEF (attempt ${task.attempts + 1}; the previous attempt was rejected, so this prompt differs from it on purpose):`,
+            signatures.length ? `Exact signatures of the task's files as they are now (use them; do not guess):\n${signatures.slice(0, 60).join('\n')}` : 'None of the task\'s files exist yet: create them with the names the task gives.',
+            `Do not:\n${[...new Set(prohibitions)].map(p => `- ${p}`).join('\n')}`,
+        ].join('\n');
+    }
+
+    static readonly PROHIBITIONS: Record<string, string> = {
+        verification: 'Do not finish while the scoped tests fail. Run them, read the first failure, and fix that before anything else.',
+        regression: 'Do not submit a change that makes other tests fail; run the neighbouring test files too.',
+        duplicate_regression: 'Do not submit the same diff again; it was already rejected for making the suite worse.',
+        worker_reported_failure: 'Do not spend your calls exploring. Make the first edit within your first few tool calls.',
+        worker_reported_failure_with_changes: 'Do not report failure after editing: finish the change or say exactly what blocks it.',
+        no_file_changes: 'Do not describe the change: write it to the files.',
+        missing_declared_files: 'Do not skip the files the task says to create; create every one.',
+        missing_test_evidence: 'Do not leave placeholder tests; write executable assertions.',
+        tests_rewrote_source: 'Do not edit source files; this task may change test files only.',
+        verification_sabotage: 'Do not disable, delete or weaken tests or the test script.',
+        fabricated_claim: 'Do not cite a file line you have not read; cite real lines or mark the claim UNVERIFIED.',
+        stale_fork: 'Do not assume the files are as they were: re-read them, they changed after your last attempt.',
+        attempt_timeout: 'Do not run the whole suite or long commands; run the focused test only, and finish sooner.',
+        worker_error: 'Do not repeat the step that crashed the previous attempt.',
+    };
+
+    /**
+     * A worker that crashed or ran out of time may still have written the
+     * right change. When its worktree has uncommitted work and the task's
+     * acceptance command passes on it, hand it to the gates instead of
+     * charging an attempt (Softhouse's agent-failure recovery).
+     */
+    async recoverCrashedWork(task: Task, worktreePath: string, error: unknown): Promise<Handoff | null> {
+        if (isEnvironmentFailure(error)) return null;
+        if (!task.verification_command || task.agent_role === 'test_writer') return null;
+        const status = await execa('git', ['status', '--porcelain'], { cwd: worktreePath, reject: false });
+        const changed = status.stdout.split('\n').filter(Boolean).map(line => line.slice(3).trim()).filter(file => !file.startsWith('.softfactory'));
+        if (!changed.length) return null;
+        const acceptance = await this.taskVerifier.runAcceptance(worktreePath, task, {
+            evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
+            note: 'recovery: the worker stopped before finishing; this checks what it left',
+        });
+        if (!acceptance.passed) return null;
+        const reason = String((error as any)?.message || error).split('\n')[0].slice(0, 160);
+        this.log(`RECOVERED: ${task.id} — the worker stopped (${reason}) but left ${changed.length} changed file(s) whose acceptance command passes; the gates judge it.`);
+        await this.recordAttempt(task, 'recovered_worker', reason);
+        await this.journal()?.append('task:recovered', { task_id: task.id, reason, files: changed }, acceptance.evidencePath ? [acceptance.evidencePath] : []).catch(() => undefined);
+        return { task_id: task.id, status: 'success', files_changed: changed, summary: `Recovered after the worker stopped (${reason}); its acceptance command passes on the work it left.` };
+    }
+
+    /**
+     * Honesty tags, borrowed from Softhouse: every "path:line" a worker cites,
+     * in its claims or its review answers, must exist. A fabricated source
+     * rejects the task; claims marked UNVERIFIED are carried in the run notes.
+     */
+    async claimProblems(task: Task, handoff: Handoff, worktreePath: string): Promise<string | null> {
+        const problems: string[] = [];
+        const lineCount = new Map<string, number | null>();
+        const lines = async (file: string) => {
+            if (!lineCount.has(file)) {
+                const safe = !path.isAbsolute(file) && !file.split(/[\\/]/).includes('..');
+                lineCount.set(file, safe ? await fs.readFile(path.join(worktreePath, file), 'utf8').then(t => t.split('\n').length, () => null) : null);
+            }
+            return lineCount.get(file)!;
+        };
+        const check = async (where: string, ref: string, file: string, start: number, end: number) => {
+            const count = await lines(file);
+            if (count === null) problems.push(`${where} cites ${ref}, but ${file} does not exist`);
+            else if (start < 1 || end > count || end < start) problems.push(`${where} cites ${ref}, but ${file} has ${count} lines`);
+        };
+        const unverified: string[] = [];
+        for (const claim of handoff.claims || []) {
+            const source = claim.source.trim();
+            const ref = source.match(/^([\w./@+-]+\.[\w]+):(\d+)(?:-(\d+))?$/);
+            if (ref) await check(`Claim "${claim.text.slice(0, 80)}"`, source, ref[1], Number(ref[2]), Number(ref[3] || ref[2]));
+            else if (!/^command:/i.test(source)) unverified.push(claim.text.slice(0, 160));
+        }
+        for (const answer of handoff.review_answers || []) {
+            for (const m of answer.matchAll(/(?<![\w/])((?:[\w@+-]+\/)*[\w@+-]+\.(?:ts|tsx|js|jsx|mjs|cjs|go|py|rs|java|rb|sql|yaml|yml|json)):(\d+)(?:-(\d+))?/g)) {
+                await check('A review answer', m[0], m[1], Number(m[2]), Number(m[3] || m[2]));
+            }
+        }
+        if (unverified.length) {
+            this.log(`UNVERIFIED: ${task.id} — ${unverified.length} claim(s) the worker could not check; carried in the run notes.`);
+            for (const text of unverified) this.addRunNote(task.id, `unverified claim: ${text}`);
+        }
+        return problems.length ? `The handoff cites sources that do not exist (a fabricated source is a rejection):\n- ${problems.slice(0, 8).join('\n- ')}` : null;
     }
 
     /** A per-task note, never a failure: the export may be wired by a later task of this run. */

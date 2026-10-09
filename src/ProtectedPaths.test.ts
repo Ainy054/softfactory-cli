@@ -88,6 +88,8 @@ async function reviewHarness(options: Record<string, unknown>, handoff: Handoff,
     model: 'm', provider: 'p',
   });
   factory.worktreeManager.commitWorktree = async () => ({ committed: true, filesChanged: 1 });
+  // The worktree is imaginary; the cited lines are checked in Release55Core.test.ts.
+  factory.claimProblems = async () => null;
   return factory;
 }
 

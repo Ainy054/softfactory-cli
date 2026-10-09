@@ -1,0 +1,169 @@
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { execa } from 'execa';
+import { Factory } from './Factory.js';
+import { ToolLoopWorker } from './ToolLoopWorker.js';
+import { TaskSchema } from './types.js';
+import type { ChatTransport, ChatRequest, ToolCall } from './ChatTransport.js';
+
+/** Release 5.5, the four items built directly: issues #8 to #11. */
+
+async function repo(files: Record<string, string>) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-55-'));
+  const git = (...args: string[]) => execa('git', args, { cwd: dir });
+  await git('init', '-q', '-b', 'main');
+  await git('config', 'user.email', 'f@example.test');
+  await git('config', 'user.name', 'f');
+  for (const [file, content] of Object.entries(files)) {
+    await fs.mkdir(path.dirname(path.join(dir, file)), { recursive: true });
+    await fs.writeFile(path.join(dir, file), content);
+  }
+  await git('add', '.');
+  await git('commit', '-q', '-m', 'init');
+  return { dir, git };
+}
+
+const factoryOn = (dir: string): any => {
+  const f: any = new Factory(dir, '', { strategy: 'cloud', cloudProvider: 'deepseek', cloudModel: 'd', sandbox: 'none' });
+  f.state = { feature_id: 'f-55', status: 'active', tasks: [] };
+  f.logs = [];
+  f.on('log', (l: string) => f.logs.push(l));
+  return f;
+};
+
+const task = (over: Record<string, unknown> = {}) => TaskSchema.parse({
+  id: 'T1', title: 'Add farewell', description: 'Export farewell() from app.ts.', agent_role: 'coder', phase: 1,
+  files_hint: ['app.ts'], creates_files: [], acceptance_criteria: ['app.ts exports farewell'], verification: ['grep farewell app.ts'],
+  verification_command: 'grep farewell app.ts', status: 'pending', attempts: 0, ...over,
+});
+
+describe('#8 honesty tags: cited sources must exist', () => {
+  it('passes real file:line sources, rejects a fabricated one, and carries UNVERIFIED claims', async () => {
+    const { dir } = await repo({ 'app.ts': 'export const greet = () => 1;\nexport const farewell = () => 2;\n' });
+    const f = factoryOn(dir);
+    const ok = await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: ['app.ts'], summary: 's', claims: [{ text: 'farewell is exported', source: 'app.ts:2' }, { text: 'ran the grep', source: 'command: grep farewell app.ts' }, { text: 'callers are unaffected', source: 'UNVERIFIED' }] }, dir);
+    assert.equal(ok, null);
+    assert.ok(f.notesFor('T2').some((n: string) => /unverified claim: callers are unaffected/.test(n)), 'carried for later tasks');
+    const bad = await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', claims: [{ text: 'the guard is at line 40', source: 'app.ts:40' }, { text: 'helper exists', source: 'src/helper.ts:3' }] }, dir);
+    assert.match(bad, /cites app\.ts:40, but app\.ts has 3 lines/);
+    assert.match(bad, /cites src\/helper\.ts:3, but src\/helper\.ts does not exist/);
+  });
+
+  it('checks file:line references inside review answers too', async () => {
+    const { dir } = await repo({ 'auth.ts': 'line1\nline2\n' });
+    const f = factoryOn(dir);
+    assert.equal(await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', review_answers: ['The tenant is checked at auth.ts:2 before the query.'] }, dir), null);
+    assert.match(await f.claimProblems(task(), { task_id: 'T1', status: 'success', files_changed: [], summary: 's', review_answers: ['Checked at auth.ts:99.'] }, dir), /A review answer cites auth\.ts:99/);
+  });
+
+  it('the tool-loop worker keeps only well-formed claims', () => {
+    assert.deepEqual(ToolLoopWorker.claimsFrom([{ text: 'a', source: 'x.ts:1' }, { text: 'no source' }, 'junk']), [{ text: 'a', source: 'x.ts:1' }]);
+    assert.equal(ToolLoopWorker.claimsFrom('nope'), undefined);
+  });
+});
+
+describe('#9 delta review after a fork-freshness merge', () => {
+  async function stale(protectedTask: boolean, verdict: 'PASS' | 'FAIL') {
+    const { dir, git } = await repo({ 'auth.ts': 'a\nb\nc\nd\ne\n', 'other.ts': 'x\n' });
+    const worktree = path.join(dir, '.git', 'wt-T2');
+    await git('worktree', 'add', '-q', '-b', 'line/T2', worktree);
+    await fs.writeFile(path.join(worktree, 'auth.ts'), 'a\nb\nc\nd\nE-guard\n');
+    await execa('git', ['commit', '-qam', 'T2'], { cwd: worktree });
+    await fs.writeFile(path.join(dir, 'auth.ts'), 'A-from-T1\nb\nc\nd\ne\n');
+    await git('commit', '-qam', 'T1 merged first');
+    const f = factoryOn(dir);
+    f.mergeTarget = () => 'main';
+    const seen: string[] = [];
+    f.frontierInspector = { inspectBlind: async (_t: unknown, diff: string) => { seen.push(diff); return { verdict, feedback: verdict === 'FAIL' ? 'the guard no longer covers A-from-T1' : 'fine', provider: 'p', model: 'm' }; } };
+    const t = task({ id: 'T2', files_hint: ['auth.ts'], protected: protectedTask, verification_command: 'grep E-guard auth.ts' });
+    const before = (await execa('git', ['rev-parse', 'HEAD'], { cwd: worktree })).stdout;
+    const result = await f.forkFreshness(t, 'line/T2', worktree);
+    const after = (await execa('git', ['rev-parse', 'HEAD'], { cwd: worktree })).stdout;
+    return { result, seen, before, after, f };
+  }
+
+  it('sends a protected task back to the blind reviewer with the combined diff', async () => {
+    const { result, seen } = await stale(true, 'PASS');
+    assert.equal(result, null);
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /E-guard/);
+  });
+
+  it('refuses the merge and undoes the trial merge when the delta review fails', async () => {
+    const { result, before, after } = await stale(true, 'FAIL');
+    assert.match(result, /Delta review failed after combining this protected change.*the guard no longer covers A-from-T1/);
+    assert.equal(after, before);
+  });
+
+  it('leaves ordinary tasks to the acceptance re-check alone', async () => {
+    const { result, seen } = await stale(false, 'FAIL');
+    assert.equal(result, null);
+    assert.equal(seen.length, 0);
+  });
+});
+
+describe('#10 a retry must change the prompt', () => {
+  it('adds exact signatures and a prohibition per earlier failure', async () => {
+    const { dir } = await repo({ 'app.ts': 'export function greet(name: string): string {\n  return name;\n}\nconst hidden = 1;\n' });
+    const f = factoryOn(dir);
+    await f.recordAttempt(task(), 'verification', 'tests failed');
+    await f.recordAttempt(task(), 'stale_fork', 'moved');
+    const brief = await f.retryBrief(task({ attempts: 2 }), dir);
+    assert.match(brief, /RETRY BRIEF \(attempt 3/);
+    assert.match(brief, /app\.ts:\n  export function greet\(name: string\): string\n/);
+    assert.doesNotMatch(brief, /hidden/);
+    assert.match(brief, /Do not finish while the scoped tests fail/);
+    assert.match(brief, /re-read them, they changed/);
+    assert.match(brief, /run the acceptance command yourself and it passes: grep farewell app\.ts/);
+  });
+
+  it('reaches the worker: the second attempt\'s prompt differs from the first outside the feedback', async () => {
+    const dir = (await repo({ 'app.ts': 'export const greet = () => 1;\n' })).dir;
+    const prompts: string[] = [];
+    const call = (id: string, name: string, args: Record<string, unknown>): ToolCall => ({ id, type: 'function', function: { name, arguments: args } });
+    const transport: ChatTransport = {
+      id: 's', name: 's', label: 'S', limits: { toolOutput: 8000, fileRead: 32000 }, contextWindow: () => 32000, timeoutMs: () => 10000,
+      checkAvailability: async () => ({ reachable: true, modelPresent: true, installed: ['m'] }), unreachable: () => '', missingModel: () => '',
+      chat: async (request: ChatRequest) => {
+        if (request.messages.length === 1 && /probe\.txt/.test(request.messages[0].content)) return { content: '', toolCalls: [call('p', 'read_file', { filepath: 'probe.txt' })] };
+        if (request.messages[0].role === 'system' && request.messages.length === 2) prompts.push(request.messages[1].content);
+        return { content: '', toolCalls: [call('e', 'finish_task', { summary: 's', test_summary: 't', status: 'failure' })] };
+      },
+    };
+    const worker = new ToolLoopWorker(transport, 'm');
+    await worker.execute(task(), dir, {});
+    const brief = await factoryOn(dir).retryBrief(task({ attempts: 1 }), dir);
+    await worker.execute(task({ attempts: 1, last_feedback: 'tests failed' }), dir, { retryBrief: brief });
+    assert.equal(prompts.length, 2);
+    const strip = (p: string) => p.replace(/PREVIOUS ATTEMPT FAILED[\s\S]*?Ensure you fix this\.\n/, '');
+    assert.notEqual(strip(prompts[1]), strip(prompts[0]));
+    assert.match(prompts[1], /RETRY BRIEF/);
+  });
+});
+
+describe('#11 recover a crashed worker\'s correct work', () => {
+  it('hands uncommitted work whose acceptance passes to the gates', async () => {
+    const { dir } = await repo({ 'app.ts': 'export const greet = () => 1;\n' });
+    await fs.appendFile(path.join(dir, 'app.ts'), 'export const farewell = () => 2;\n');
+    const f = factoryOn(dir);
+    const handoff = await f.recoverCrashedWork(task(), dir, new Error('worker process killed'));
+    assert.equal(handoff.status, 'success');
+    assert.deepEqual(handoff.files_changed, ['app.ts']);
+    assert.ok(f.logs.some((l: string) => /RECOVERED: T1 — the worker stopped \(worker process killed\)/.test(l)));
+  });
+
+  it('does not recover when nothing changed, the acceptance fails, it is a test writer, or the backend was down', async () => {
+    const { dir } = await repo({ 'app.ts': 'export const greet = () => 1;\n' });
+    const f = factoryOn(dir);
+    assert.equal(await f.recoverCrashedWork(task(), dir, new Error('x')), null, 'nothing changed');
+    await fs.appendFile(path.join(dir, 'app.ts'), 'export const other = 3;\n');
+    assert.equal(await f.recoverCrashedWork(task(), dir, new Error('x')), null, 'acceptance fails');
+    await fs.appendFile(path.join(dir, 'app.ts'), 'export const farewell = 2;\n');
+    assert.equal(await f.recoverCrashedWork(task({ agent_role: 'test_writer' }), dir, new Error('x')), null);
+    const { WorkerEnvironmentError } = await import('./IWorker.js');
+    assert.equal(await f.recoverCrashedWork(task(), dir, new WorkerEnvironmentError('down')), null);
+  });
+});

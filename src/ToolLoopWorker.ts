@@ -23,6 +23,12 @@ export class ToolLoopWorker implements IWorker {
   static readonly REPEAT_TOTAL_ABORT = 8;    // identical calls anywhere in the attempt
   static readonly CYCLE_WINDOW = 6;          // rolling window for A/B/A/B oscillation
   static readonly CYCLE_DISTINCT = 2;
+  /** Claims as the model sent them, kept only when they have both a text and a source. */
+  static claimsFrom(raw: unknown): Array<{ text: string; source: string }> | undefined {
+    if (!Array.isArray(raw)) return undefined;
+    const claims = raw.filter((c: any) => c && typeof c.text === 'string' && typeof c.source === 'string').map((c: any) => ({ text: c.text.slice(0, 500), source: c.source.slice(0, 200) }));
+    return claims.length ? claims : undefined;
+  }
   static readonly NO_PROGRESS_WARN = 6;      // a nudge: enough reading, change a file
   static readonly NO_PROGRESS_ABORT = 12;    // allow initial inspection; cycle guards stop repetitive exploration sooner
   static readonly MAX_ITERATIONS = 30;
@@ -71,7 +77,7 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task, requirement?: string): string {
+  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
     if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
     if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
@@ -95,6 +101,7 @@ ${projectContext}
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
     }
     userPrompt += requirementSection(requirement);
+    if (retryBrief) userPrompt += `\n${retryBrief}\n`;
     return userPrompt;
   }
 
@@ -191,6 +198,11 @@ ${projectContext}
             test_summary: { type: 'string', description: 'Summary of the testing performed' },
             status: { type: 'string', enum: ['success', 'failure'] },
             review_answers: { type: 'array', items: { type: 'string' }, description: 'One answer per REVIEW QUESTION, each citing file:line' },
+            claims: {
+              type: 'array',
+              description: 'Material claims about your change, each with a checkable source: "path:line", "path:start-end", "command: <what you ran>", or "UNVERIFIED" when you could not check it. A cited line that does not exist rejects the task.',
+              items: { type: 'object', properties: { text: { type: 'string' }, source: { type: 'string' } }, required: ['text', 'source'] },
+            },
           },
           required: ['summary', 'test_summary', 'status'],
         },
@@ -207,7 +219,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
-      { role: 'user', content: this.buildUserPrompt(task, options?.requirement) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief) },
     ];
     const tools = ToolLoopWorker.TOOLS;
     const safeCtx = this.getSafeContextWindow(model);
@@ -411,7 +423,8 @@ ${projectContext}
               } else {
                 onOutput(`[${this.label}] ✅ Task finished: ${args.status}`);
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles),
-                  review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined };
+                  review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined,
+                  claims: ToolLoopWorker.claimsFrom(args.claims) };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {

@@ -90,6 +90,7 @@ The quality inspector or automated verifier rejected your previous work with thi
 You MUST address this feedback in your implementation.
 `;
     }
+    if (options.retryBrief) prompt += `\n${options.retryBrief}\n`;
 
     prompt += `
 CRITICAL: Before you exit, you MUST write a JSON handoff file to: ${handoffPath}
@@ -100,8 +101,10 @@ The JSON must follow this exact schema:
   "files_changed": ["path/1", "path/2"],
   "test_summary": "Summary of tests executed or added",
   "summary": "Concise summary of changes made",
-  "review_answers": ["one answer per review question, citing file:line"]
+  "review_answers": ["one answer per review question, citing file:line"],
+  "claims": [{"text": "a material claim", "source": "path:line | path:start-end | command: <what ran> | UNVERIFIED"}]
 }
+A claim whose cited line does not exist rejects the task.
 `;
 
     const args = [
