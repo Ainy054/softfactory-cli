@@ -193,3 +193,15 @@ describe('honesty tags read dotted file names whole', () => {
     assert.match(bad, /cites src\/PlanningRules\.test\.ts:500, but src\/PlanningRules\.test\.ts has 80 lines/);
   });
 });
+
+describe('a not-done item that belongs to another task', () => {
+  it('does not reject this task, while its own unfinished acceptance work still does', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local', sandbox: 'none' });
+    const impl = task({ id: 'T1', files_hint: ['src/Scout.ts'], acceptance_criteria: ['Scout finds the defining file and tests cover it'] });
+    factory.state = { tasks: [impl, task({ id: 'T2', agent_role: 'test_writer', files_hint: [], creates_files: ['src/Scout.test.ts'] })] };
+    const handoff = (item: string) => ({ task_id: 'T1', status: 'success', files_changed: [], summary: 's', not_done: [item] });
+    assert.equal(factory.notDoneViolation(impl, handoff('Could not create src/Scout.test.ts: outside my declared files; the tests belong to T2')), null);
+    assert.match(factory.notDoneViolation(impl, handoff('Scout does not yet report the defining file')), /reported acceptance work as not done/);
+    assert.match(factory.notDoneViolation(impl, handoff('src/Scout.ts still misses the defining file')), /reported acceptance work as not done/, 'a file of its own');
+  });
+});

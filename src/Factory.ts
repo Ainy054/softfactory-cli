@@ -2373,7 +2373,14 @@ export class Factory extends EventEmitter {
         const words = (text: string) => text.toLowerCase().match(/[a-z]{5,}/g) || [];
         const criteria = new Set(words(task.acceptance_criteria.join(' ')));
         const command = task.verification_command?.trim();
+        // Work that belongs to another task in the plan is not this task's to
+        // finish: two runs rejected a worker for honestly listing tests that a
+        // later test-writer task owned.
+        const mine = new Set([...task.files_hint, ...task.creates_files]);
+        const others = new Set((this.state?.tasks || []).filter(t => t.id !== task.id).flatMap(t => [...t.files_hint, ...t.creates_files]));
         for (const item of items) {
+            const named = [...item.matchAll(/(?:[\w@+.-]+\/)*[\w@+-][\w@+.-]*\.[A-Za-z]{1,5}(?![\w.])/g)].map(m => m[0]);
+            if (named.length && named.every(file => others.has(file) && !mine.has(file))) continue;
             const quotesCommand = command ? item.includes(command) : false;
             const sharesWord = words(item).some(word => criteria.has(word));
             if (quotesCommand || sharesWord) return `the worker reported acceptance work as not done: ${item}`;
