@@ -31,6 +31,7 @@ import { SandboxManager, type SandboxMode } from './Sandbox.js';
 import { parseCommand } from './commandPolicy.js';
 import type { PlanApprover } from './PlanApproval.js';
 import { loadRules, violations, RULES_FILE, type Rule } from './NonNegotiables.js';
+import { scout } from './Scout.js';
 
 /** An attempt that outlived its wall-clock budget and did not stop when asked. */
 class AttemptTimeoutError extends Error {
@@ -497,7 +498,7 @@ export class Factory extends EventEmitter {
         const repositoryFiles = new Set(await this.getRepositoryFiles());
         const memoryPatterns = await this.getMemoryPatterns();
         const history = await this.getHistory();
-        const featureHistory = await this.planningHistory(history, requirement);
+        const featureHistory = await this.planningHistory(history, requirement, [...repositoryFiles]);
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
         const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
@@ -571,7 +572,7 @@ export class Factory extends EventEmitter {
         const repositoryFiles = new Set(await this.getRepositoryFiles());
         const memoryPatterns = await this.getMemoryPatterns();
         const history = await this.getHistory();
-        const featureHistory = await this.planningHistory(history, requirement);
+        const featureHistory = await this.planningHistory(history, requirement, [...repositoryFiles]);
         const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
@@ -2174,11 +2175,20 @@ export class Factory extends EventEmitter {
     private failureCategories = new Map<string, string[]>();
 
     /** Prior features plus, from the handoff index, the merged tasks most like this requirement. */
-    async planningHistory(history: Array<{ feature: string; status: string; tasks_done: number; task_count: number }>, requirement: string): Promise<string> {
+    async planningHistory(history: Array<{ feature: string; status: string; tasks_done: number; task_count: number }>, requirement: string, files?: string[]): Promise<string> {
         const features = history.map(f => `- ${f.feature} (${f.status}, ${f.tasks_done}/${f.task_count} tasks)`).join('\n');
         const similar = await similarHandoffs(this.baseDir, requirement).catch(() => [] as string[]);
         if (similar.length) this.log(`Handoff index: ${similar.length} similar past task(s) given to the planner.`);
-        return [features, similar.length ? `Similar tasks already merged in this repository (reuse their split and their checks where they fit):\n${similar.join('\n')}` : ''].filter(Boolean).join('\n\n');
+        // Two Softhouse projects found the requested feature ~40% built already.
+        // Search the repository before planning so the plan targets the gap.
+        const repositoryFiles = files ?? await this.getRepositoryFiles().catch(() => [] as string[]);
+        const scoutLines = await scout(this.baseDir, requirement, repositoryFiles).catch(() => [] as string[]);
+        if (scoutLines.length) this.log(`Scout: ${scoutLines.length} file(s) already mention this requirement.`);
+        return [
+            features,
+            similar.length ? `Similar tasks already merged in this repository (reuse their split and their checks where they fit):\n${similar.join('\n')}` : '',
+            scoutLines.length ? `Already in the repository (reuse or extend these; plan only the gap):\n${scoutLines.join('\n')}` : '',
+        ].filter(Boolean).join('\n\n');
     }
 
     /**
