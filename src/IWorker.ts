@@ -26,6 +26,12 @@ export interface WorkerOptions {
    * bigger model; one that differs only in feedback repeats the failure.
    */
   retryBrief?: string;
+  /**
+   * Receives the full assembled worker prompt, called exactly once per execute
+   * attempt before the backend runs. Softhouse saves it so a retry can be
+   * compared with the attempt before it and a rerun is reproducible.
+   */
+  onPrompt?: (prompt: string) => void;
 }
 
 /**

@@ -35,6 +35,7 @@ ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryP
 ${requirementSection(options.requirement)}
 ${options.retryBrief || ''}
 Before finishing, write ${handoffPath} as JSON with task_id, status, files_changed, summary, claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;
+    options.onPrompt?.(prompt);
     options.onOutput?.(`[Codex Worker] Starting ${task.id}${model ? ` with ${model}` : ' with the configured Codex default model'}`);
     const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath, options.signal));
     if (options.onOutput) proc.all?.on('data', chunk => options.onOutput?.(chunk.toString().trim()));
