@@ -273,7 +273,7 @@ ${projectContext}
     let callsSinceProgress = 0;
     // The code a test writer must read counts too: issue #18's test task was
     // stopped at 12 calls while reading the 2,400-line file its tests exercise.
-    const limits = await ToolLoopWorker.progressLimits(worktreePath, [...new Set([...task.files_hint, ...task.creates_files, ...task.production_targets])]);
+    const limits = await ToolLoopWorker.progressLimits(worktreePath, [...new Set([...(task.files_hint || []), ...(task.creates_files || []), ...(task.production_targets || [])])]);
     let stalledWithoutProgress = false;
     let finishAborted = false;
     let lastFinishFailure = '';
