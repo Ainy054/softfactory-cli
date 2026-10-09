@@ -408,8 +408,18 @@ function isDependencyManifest(file: string): boolean {
   return DEPENDENCY_MANIFESTS.has(segments[segments.length - 1] ?? '');
 }
 
-const LOCALE_FILE = /(^|\/)(locales?|i18n|lang)\//;
+const LOCALE_DIRS = new Set(['locale', 'locales', 'i18n', 'lang']);
 const USER_FACING_TEXT = /(message|label|text shown|translation|copy)/i;
+
+/**
+ * A locale file lives under a locale/locales/i18n/lang directory segment.
+ * Matching path segments (rather than a bare substring regex) keeps names like
+ * "localization", "ci18n" or "mylang" from being treated as locale paths.
+ */
+function isLocaleFile(file: string): boolean {
+  const segments = fileSegments(file);
+  return segments.slice(0, -1).some(segment => LOCALE_DIRS.has(segment));
+}
 
 export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint {
   const blueprint = BlueprintSchema.parse(raw);
@@ -552,9 +562,9 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
   }
 
   // Rule 3: when the repository has locale files, user-facing text needs a locale task.
-  const localeFiles = [...input.repositoryFiles].filter(file => LOCALE_FILE.test(file)).sort();
+  const localeFiles = [...input.repositoryFiles].filter(isLocaleFile).sort();
   if (localeFiles.length > 0) {
-    const planUpdatesLocale = blueprint.tasks.some(task => taskFiles(task).some(file => LOCALE_FILE.test(file)));
+    const planUpdatesLocale = blueprint.tasks.some(task => taskFiles(task).some(isLocaleFile));
     if (!planUpdatesLocale) {
       for (const task of blueprint.tasks) {
         if (USER_FACING_TEXT.test(`${task.description} ${task.acceptance_criteria.join(' ')}`)) {
