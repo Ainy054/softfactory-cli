@@ -93,6 +93,10 @@ export const FactoryStateSchema = z.object({
   memory_patterns: z.array(z.string()).default([]),
   /** Tokens the run has consumed across every attempt, where backends report them. */
   usage: z.object({ input_tokens: z.number().default(0), output_tokens: z.number().default(0) }).default({ input_tokens: 0, output_tokens: 0 }),
+  /** The same tokens split by the model that spent them. */
+  usage_by_model: z.record(z.string(), z.object({ input: z.number().default(0), output: z.number().default(0) })).optional(),
+  /** The outcome of live UAT against the merged code, when the run reached that gate. */
+  uat_result: z.enum(['passed', 'failed', 'skipped', 'none']).optional(),
   /** Where the requirement came from, when it was not typed on the command line. */
   source: z.object({ kind: z.literal('issue'), number: z.number(), url: z.string(), title: z.string() }).optional(),
   /** PR mode: passing tasks merge here instead of the base branch, and the branch becomes a pull request. */
