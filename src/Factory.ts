@@ -488,7 +488,7 @@ export class Factory extends EventEmitter {
         const history = await this.getHistory();
         const featureHistory = await this.planningHistory(history, requirement);
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
+        const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -499,7 +499,7 @@ export class Factory extends EventEmitter {
             strategy: this.strategy,
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
-            tasks: await this.prepareTasks(blueprint.tasks),
+            tasks: plannedTasks,
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
             requirement,
@@ -561,7 +561,7 @@ export class Factory extends EventEmitter {
         const memoryPatterns = await this.getMemoryPatterns();
         const history = await this.getHistory();
         const featureHistory = await this.planningHistory(history, requirement);
-        const blueprint = await this.planner.generateBlueprint({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
+        const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
         this.state = {
             feature_id: featureId,
@@ -572,7 +572,7 @@ export class Factory extends EventEmitter {
             strategy: this.strategy,
             cloud_provider: this.workerRegistry.getCloudProvider(),
             planner_provider: this.planner.provider,
-            tasks: await this.prepareTasks(blueprint.tasks),
+            tasks: plannedTasks,
             memory_patterns: [],
             usage: { input_tokens: 0, output_tokens: 0 },
             requirement,
@@ -1627,6 +1627,28 @@ export class Factory extends EventEmitter {
      * that cannot run here at all could never gate a merge, so it rejects
      * the plan now rather than passing silently later.
      */
+    /**
+     * Plan, then probe every acceptance command. A plan the probe rejects
+     * (an unrunnable or too-slow command) goes back to the planner once with
+     * the reason, instead of ending the run: issue #4's second run died on
+     * a bare "npm test" that one repair would have replaced.
+     */
+    async planTasks(input: Parameters<IPlanner['generateBlueprint']>[0]): Promise<{ blueprint: Awaited<ReturnType<IPlanner['generateBlueprint']>>; tasks: Task[] }> {
+        let blueprint = await this.planner.generateBlueprint(input);
+        try {
+            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks) };
+        } catch (error: any) {
+            if (!/^Plan rejected:/.test(String(error?.message))) throw error;
+            this.log(`Planner draft rejected at the acceptance probe; re-planning once with the reason.`);
+            const feedback = String(error.message).split('\n').filter((line: string) => line.startsWith('- ')).join('\n');
+            blueprint = await this.planner.generateBlueprint({
+                ...input,
+                requirement: `${input.requirement}\n\nPLANNER FEEDBACK: the previous plan was rejected because these acceptance commands could not gate a merge here:\n${feedback}\nGive each task a focused verification_command that runs only its own test file or check and finishes in well under a minute.`,
+            });
+            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks) };
+        }
+    }
+
     async prepareTasks(blueprintTasks: Array<Record<string, unknown>>): Promise<Task[]> {
         const tasks = this.annotateTasks(blueprintTasks.map(t => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })));
         const unrunnable: string[] = [];

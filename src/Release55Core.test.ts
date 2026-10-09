@@ -264,3 +264,28 @@ describe('a new requirement never resumes a different feature', () => {
     assert.equal(archived.status, 'failed');
   });
 });
+
+describe('planning a ticket', () => {
+  it('does not treat ticket-structure headings as requirement areas', async () => {
+    const { validateBlueprint } = await import('./Planner.js');
+    const requirement = '## Change\nAdd X.\n## Acceptance\nTests pass.\n## Exporter\nThe CSV exporter.';
+    const input = { requirement, codebaseContext: '', memoryPatterns: '', featureHistory: '', repositoryFiles: new Set(['src/a.ts']) };
+    const plan = { feature: 'Exporter work', requirements_covered: ['Exporter'], tasks: [{ id: 'T1', title: 'Add the exporter', description: 'Add the CSV exporter module', agent_role: 'coder', phase: 1, dependencies: [], blockedBy: [], files_hint: ['src/a.ts'], creates_files: [], acceptance_criteria: ['exporter writes rows'], verification: ['npm test'] }] };
+    assert.equal(validateBlueprint(plan, input).tasks.length, 1, 'Change and Acceptance are not areas');
+    assert.throws(() => validateBlueprint({ ...plan, requirements_covered: [] }, input), /missing requirement coverage: Exporter/);
+  });
+
+  it('re-plans once with the reason when the acceptance probe rejects the plan', async () => {
+    const f = factoryOn('/tmp');
+    const requirements: string[] = [];
+    const blueprint = (cmd: string) => ({ feature: 'f', requirements_covered: [], tasks: [{ id: 'T1', title: 't', description: 'd', agent_role: 'coder', phase: 1, files_hint: ['a.ts'], verification_command: cmd }] });
+    f.planner = { provider: 'deepseek', generateBlueprint: async (input: any) => { requirements.push(input.requirement); return requirements.length === 1 ? blueprint('npm test') : blueprint('node --test a.test.js'); } };
+    f.taskVerifier.runAcceptance = async (_dir: string, t: any) => t.verification_command === 'npm test'
+      ? { ran: true, passed: false, exitCode: null, output: '', command: 'npm test', unrunnable: false, timedOut: true }
+      : { ran: true, passed: false, exitCode: 1, output: '', command: t.verification_command, unrunnable: false };
+    const { tasks } = await f.planTasks({ requirement: 'Add a thing', codebaseContext: '', memoryPatterns: '', featureHistory: '', repositoryFiles: new Set() });
+    assert.equal(tasks[0].verification_command, 'node --test a.test.js');
+    assert.equal(requirements.length, 2);
+    assert.match(requirements[1], /^Add a thing\n\nPLANNER FEEDBACK: the previous plan was rejected[\s\S]*T1: npm test/);
+  });
+});

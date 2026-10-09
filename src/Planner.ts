@@ -371,8 +371,15 @@ export class ApiPlanner extends TextModelPlanner {
   }
 }
 
+/**
+ * Headings that structure a ticket rather than name a requirement area. An
+ * issue written "## Change / ## Acceptance" cost a repair round on every run,
+ * the planner being told to cover sections that are not features.
+ */
+const STRUCTURAL_HEADINGS = /^(?:changes?|acceptance(?: criteria)?|done when|context|background|summary|problem|motivation|notes?|details|description|out of scope|why)$/i;
+
 function requirementHeadings(requirement: string): string[] {
-  return [...requirement.matchAll(/^#{2,3}\s+(.+?)\s*$/gm)].map(match => match[1].trim());
+  return [...requirement.matchAll(/^#{2,3}\s+(.+?)\s*$/gm)].map(match => match[1].trim()).filter(heading => !STRUCTURAL_HEADINGS.test(heading.replace(/[:.]$/, '')));
 }
 
 function isSafeRelativeFile(file: string): boolean {
