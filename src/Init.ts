@@ -1,5 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { SOFTFACTORY_VERSION } from './version.js';
+import { readPin, writePin } from './VersionPin.js';
 
 /**
  * `softfactory --init`: starter files for the project-owned inputs, as
@@ -54,6 +56,12 @@ export async function initProject(baseDir: string): Promise<Array<{ file: string
     } catch {
       results.push({ file: path.relative(baseDir, file), written: false });
     }
+  }
+  // A 6.0 release changes what "completed" means, so a project must not move
+  // across a major version silently: pin the version now, but never overwrite
+  // an existing pin.
+  if ((await readPin(baseDir)) === undefined) {
+    await writePin(baseDir, SOFTFACTORY_VERSION);
   }
   return results;
 }
