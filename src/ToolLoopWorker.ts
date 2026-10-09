@@ -9,6 +9,17 @@ import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type
 import type { SandboxManager } from './Sandbox.js';
 import { createChatTransport, OllamaChatTransport, type ChatMessage, type ChatTransport, type ToolCall, type ToolDefinition } from './ChatTransport.js';
 
+/** The shared brief, spec, out-of-scope and notes block every worker prompt carries, when present. */
+function briefSection(task: Task, brief?: string): string {
+  let section = '';
+  const shared = brief?.trim();
+  if (shared) section += `\nRUN BRIEF (shared by every task in this run):\n${shared}\n`;
+  if (task.spec) section += `\nSpec: ${task.spec}\n`;
+  if (task.out_of_scope?.length) section += `\nOut of scope (do not touch):\n${task.out_of_scope.map(o => `- ${o}`).join('\n')}\n`;
+  if (task.notes_to_executor?.length) section += `\nNotes from the planner:\n${task.notes_to_executor.map(n => `- ${n}`).join('\n')}\n`;
+  return section;
+}
+
 /**
  * The one tool-calling worker. It owns the loop, the tools, the edit checks and
  * the stall detection; which model answers is the transport's concern. Local
@@ -93,7 +104,7 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string): string {
+  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
     if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
     if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
@@ -119,9 +130,11 @@ ${projectContext}
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
     }
     userPrompt += requirementSection(requirement);
+    userPrompt += briefSection(task, brief);
     if (retryBrief) userPrompt += `\n${retryBrief}\n`;
     return userPrompt;
   }
+
 
   static readonly TOOLS: ToolDefinition[] = [
     {
@@ -238,7 +251,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
-      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief) },
     ];
     // Emit the exact prompt the model will receive, once per attempt, before
     // any transport work. The orchestrator saves it so a retry can be compared
