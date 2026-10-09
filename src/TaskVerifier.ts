@@ -406,6 +406,8 @@ export class TaskVerifier {
           }
           throw runError;
         }
+        const typeFailure = await this.typeRegression(worktreePath, nodeDir);
+        if (typeFailure) return typeFailure;
         return {
           executed: true,
           passed: true,
@@ -824,6 +826,64 @@ export class TaskVerifier {
     } catch { /* no config, or unreadable: use no overrides */ }
     this.configCache.set(worktreePath, config);
     return config;
+  }
+
+  /**
+   * Type errors present on the base when the run started, keyed without line
+   * numbers so an edit that shifts an old error does not make it new. Unset
+   * means no baseline was taken and the type gate stays off.
+   */
+  typeBaseline: Set<string> | undefined;
+
+  async captureTypeBaseline(projectPath: string): Promise<number | undefined> {
+    const nodeDir = await this.exists(path.join(projectPath, 'package.json')) ? projectPath : null;
+    const errors = nodeDir ? await this.typeErrors(projectPath, nodeDir) : undefined;
+    this.typeBaseline = errors ? new Set(errors) : undefined;
+    return errors?.length;
+  }
+
+  /**
+   * Tests run through tsx, which strips types without checking them, so a
+   * change that does not compile could pass every test and merge. Observed:
+   * a zod call with too few arguments merged, the build broke, and every
+   * later task of the run failed on a base it could not compile.
+   */
+  async typeErrors(worktreePath: string, nodeDir: string): Promise<string[] | undefined> {
+    if (!await this.exists(path.join(nodeDir, 'tsconfig.json'))) return undefined;
+    try {
+      const pkg = JSON.parse(await fs.readFile(path.join(nodeDir, 'package.json'), 'utf8'));
+      if (!({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }).typescript) return undefined;
+    } catch {
+      return undefined;
+    }
+    let output = '';
+    let exitCode = 0;
+    try {
+      const result: any = await this.run(worktreePath, 'node', ['node_modules/typescript/bin/tsc', '--noEmit', '-p', 'tsconfig.json'], { cwd: nodeDir, timeout: 300000 });
+      output = `${result.stdout || ''}\n${result.stderr || ''}`;
+    } catch (error: any) {
+      output = `${error.stdout || ''}\n${error.stderr || ''}`;
+      exitCode = typeof error.exitCode === 'number' ? error.exitCode : 1;
+    }
+    const errors = [...output.matchAll(/^(.+?)\(\d+,\d+\): error (TS\d+): (.*)$/gm)].map(m => `${m[1].trim()}: ${m[2]} ${m[3].trim()}`);
+    // A compiler that could not run (missing, timed out) reports nothing checkable.
+    if (exitCode !== 0 && errors.length === 0) return undefined;
+    return errors;
+  }
+
+  private async typeRegression(worktreePath: string, nodeDir: string): Promise<VerifierResult | null> {
+    if (!this.typeBaseline) return null;
+    const errors = await this.typeErrors(worktreePath, nodeDir);
+    if (!errors) return null;
+    const added = [...new Set(errors.filter(e => !this.typeBaseline!.has(e)))];
+    if (!added.length) return null;
+    return {
+      executed: true,
+      passed: false,
+      isCompileError: true,
+      testSummary: `Type check failed: ${added.length} new type error(s) (tsc --noEmit); tests alone do not check types`,
+      output: this.clip(added.join('\n')),
+    };
   }
 
   private async exists(p: string): Promise<boolean> {

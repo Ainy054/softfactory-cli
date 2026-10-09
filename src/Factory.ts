@@ -1581,6 +1581,10 @@ export class Factory extends EventEmitter {
             } catch { /* not a git checkout we can read: the ratchet stays off */ }
         }
         try {
+            const typeErrors = await this.taskVerifier.captureTypeBaseline(this.baseDir);
+            if (typeErrors !== undefined) this.log(`Type check on ${this.mergeTarget()}: ${typeErrors} existing error(s); a task may not add one.`);
+        } catch { /* no type baseline: the type gate stays off */ }
+        try {
             const results = await this.taskVerifier.verifyAll(this.baseDir);
             const counted = results.filter(r => r.counts);
             if (counted.length === 0) return;
