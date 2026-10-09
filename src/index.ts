@@ -2,7 +2,7 @@
 import process from 'node:process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Factory } from './Factory.js';
+import { Factory, type FactoryOptions } from './Factory.js';
 import { RunJournal } from './RunJournal.js';
 import { GitHub, requirementFromIssue } from './PullRequest.js';
 import { loadDotEnv } from './dotenv.js';
@@ -16,11 +16,11 @@ const KNOWN_FLAGS = [
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
-  '--queue', '--next'
+  '--queue', '--next', '--backlog'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -170,6 +170,9 @@ async function main() {
   const planMode = args.includes('--plan');
   const queueMode = args.includes('--queue');
   const nextMode = args.includes('--next');
+  // --backlog lists the follow-ups workers left behind, or triages one of them.
+  // It is dispatch-only and never becomes requirement text.
+  const backlogMode = args.some(a => a === '--backlog' || a.startsWith('--backlog='));
   // Queue/next are dispatch-only: they never need the plan-approval TUI, so
   // they always take the plain-stdout path.
   const noTui = args.includes('--no-tui') || queueMode || nextMode || !process.stdout.isTTY;
@@ -219,7 +222,7 @@ async function main() {
     issue = { number: loaded.number, url: loaded.url, title: loaded.title };
   }
 
-  if (!resumeMode && !nextMode && !markDoneId && !requirement) {
+  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !requirement) {
     console.error(USAGE);
     process.exit(1);
   }
@@ -242,7 +245,7 @@ async function main() {
     process.exit(1);
   }
 
-  const factory = new Factory(process.cwd(), apiKey, {
+  const factoryOptions: FactoryOptions = {
     streamToTerminal: noTui,
     useDocker: !noDocker,
     sandbox: sandboxArg,
@@ -261,9 +264,67 @@ async function main() {
     skipUat: args.includes('--no-uat'),
     abandon: args.includes('--abandon'),
     issue,
-  });
+  };
+
+  // --backlog is dispatch-only: it never becomes requirement text and, for the
+  // list and keep/drop cases, never needs a Factory (so it works from a bare
+  // checkout, including a git worktree where `.git` is a file).
+  if (backlogMode) {
+    const { openBacklog, triage } = await import('./Backlog.js');
+    // "softfactory --backlog <id> keep|drop|promote": the id is the flag's
+    // value, the decision the word after it. Without an id, list and exit.
+    const inline = args.find(a => a.startsWith('--backlog='));
+    const flagIndex = args.indexOf('--backlog');
+    const positional = flagIndex === -1 ? [] : args.slice(flagIndex + 1).filter(a => !a.startsWith('--'));
+    const backlogId = inline ? inline.slice('--backlog='.length) : positional[0];
+    const decision = inline ? positional[0] : positional[1];
+
+    if (!backlogId) {
+      const entries = await openBacklog(process.cwd());
+      if (entries.length === 0) {
+        console.log('Backlog is empty.');
+      } else {
+        console.log('Backlog (open and kept):');
+        console.log('-'.repeat(80));
+        for (const entry of entries) console.log(`  ${entry.id}  [${entry.status}]  ${entry.text}`);
+      }
+      process.exit(0);
+    }
+
+    if (decision !== 'keep' && decision !== 'drop' && decision !== 'promote') {
+      console.error(`Error: --backlog <id> needs keep, drop or promote.`);
+      console.error(USAGE);
+      process.exit(1);
+    }
+
+    const known = (await openBacklog(process.cwd())).some(e => e.id === backlogId);
+    if (!known) {
+      console.error(`Error: no open backlog entry with id "${backlogId}".`);
+      process.exit(1);
+    }
+
+    const text = await triage(process.cwd(), backlogId, decision);
+    if (decision === 'promote') {
+      if (!text) {
+        console.error(`Error: backlog entry "${backlogId}" has no text to queue.`);
+        process.exit(1);
+      }
+      // Same path --queue takes: plan the text and park it under .softfactory/queue/.
+      const promoFactory = new Factory(process.cwd(), apiKey, factoryOptions);
+      globalFactory = promoFactory;
+      await promoFactory.init();
+      await promoFactory.queue(text);
+      console.log(`[SoftFactory] Promoted ${backlogId} and queued it; run --next to start it.`);
+    } else {
+      console.log(`[SoftFactory] Marked ${backlogId} as ${decision === 'keep' ? 'kept' : 'dropped'}.`);
+    }
+    process.exit(0);
+  }
+
+  const factory = new Factory(process.cwd(), apiKey, factoryOptions);
   globalFactory = factory;
   await factory.init();
+
 
   if (markDoneId) {
     // The text after the flag is the operator's note, not a requirement.
