@@ -368,3 +368,13 @@ describe('an advisory plan field never costs a repair round', () => {
     assert.equal(validateBlueprint(plan, input).tasks[0].complexity, undefined);
   });
 });
+
+describe('a malformed rules file halts the run instead of failing a task', () => {
+  it('raises an environment fault that names the file', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-badrules-'));
+    await fs.mkdir(path.join(dir, '.softfactory'));
+    await fs.writeFile(path.join(dir, '.softfactory', 'non-negotiables.txt'), 'ok-rule :: fine\n([unclosed :: broken\n');
+    const f = factoryOn(dir);
+    await assert.rejects(f.loadProjectRules(), (error: any) => error.isEnvironmentFailure === true && /line 2.*Fix \.softfactory\/non-negotiables\.txt and run --resume; no task retry was consumed/.test(error.message));
+  });
+});

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
-import { isEnvironmentFailure } from './IWorker.js';
+import { isEnvironmentFailure, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
@@ -1012,15 +1012,6 @@ export class Factory extends EventEmitter {
             // the prompt files and their journal entries before the next step,
             // so a rerun or a reviewer finds the record the attempt produced.
             await this.flushSavedPrompts();
-            // A worker's own "not done" list is binding: a task that reports
-            // acceptance work as unfinished is rejected whatever the checks say.
-            const notDone = this.notDoneViolation(task, handoff);
-            if (notDone) {
-                this.log(`REJECTED: ${task.id} — ${notDone}`);
-                processFailure(notDone);
-                await this.recordAttempt(task, 'reported_not_done', notDone);
-                return null;
-            }
             // A worker's self-report is a hint, not a verdict. Local models
             // routinely finish the work and then forget to call finish_task, so
             // only treat a reported failure as fatal when the worktree is also
@@ -1037,6 +1028,17 @@ export class Factory extends EventEmitter {
                 this.log(`EMPTY: ${task.id} — worker produced no file changes`);
                 processFailure('Worker completed but produced no file changes. Ensure you actually create/modify files, not just describe what to do.');
                 await this.recordAttempt(task, 'no_file_changes', task.last_feedback || 'no file changes');
+                return null;
+            }
+            // A worker's own "not done" list is binding: a task that reports
+            // acceptance work as unfinished is rejected whatever the checks say.
+            // Checked after the commit, like the claims below, so the retry
+            // continues from this attempt's work instead of losing it.
+            const notDone = this.notDoneViolation(task, handoff);
+            if (notDone) {
+                this.log(`REJECTED: ${task.id} — ${notDone}`);
+                processFailure(notDone);
+                await this.recordAttempt(task, 'reported_not_done', notDone);
                 return null;
             }
             const fabricated = await this.claimProblems(task, handoff, worktreePath);
@@ -1546,7 +1548,15 @@ export class Factory extends EventEmitter {
     }
     /** Reads `.softfactory/non-negotiables.txt` once per run and reuses it for every task. */
     async loadProjectRules(): Promise<Rule[]> {
-        if (!this.projectRulesCache) this.projectRulesCache = await loadRules(this.baseDir);
+        if (!this.projectRulesCache) {
+            try {
+                this.projectRulesCache = await loadRules(this.baseDir);
+            } catch (error: any) {
+                // A broken rules file is the project's configuration, not the
+                // task's work: halt the run without charging an attempt.
+                throw new WorkerEnvironmentError(`${error?.message || error}. Fix ${RULES_FILE} and run --resume; no task retry was consumed.`);
+            }
+        }
         return this.projectRulesCache;
     }
     async recordAttempt(task: Task, category: string, detail: string) {
