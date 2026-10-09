@@ -46,6 +46,26 @@ export function backendRefusal(text: string): string | null {
   return line ? line.trim().slice(0, 200) : null;
 }
 
+/**
+ * Split acceptance (Softhouse): a check that needs the running stack is
+ * written "orchestrator: <command>". Workers cannot run it and the per-task
+ * gate skips it; the orchestrator runs it on the host after merge, with UAT.
+ */
+export function isDeferredAcceptance(command: string | undefined): boolean {
+  return /^\s*orchestrator:/i.test(command || '');
+}
+export function deferredCommand(command: string): string {
+  return command.replace(/^\s*orchestrator:\s*/i, '').trim();
+}
+
+/** The acceptance line every worker prompt carries. */
+export function acceptanceLine(command: string | undefined): string {
+  if (!command) return '';
+  return isDeferredAcceptance(command)
+    ? `Live check (the orchestrator runs this against the running system after merge; you cannot run it, so make sure your change satisfies it): ${deferredCommand(command)}`
+    : `Acceptance command (run verbatim by the orchestrator after you finish; make it pass): ${command}`;
+}
+
 /** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */
 export function requirementSection(requirement: string | undefined, limit = 6000): string {
   const text = requirement?.trim();

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { Task } from './types.js';
 import { commandPolicyViolation, runSafeCommand } from './commandPolicy.js';
 import { SandboxManager, type ExecOptions, type ExecResult } from './Sandbox.js';
+import { isDeferredAcceptance } from './IWorker.js';
 
 export interface AcceptanceResult {
   /** False when the task declares no command; nothing was checked. */
@@ -18,6 +19,8 @@ export interface AcceptanceResult {
   unrunnable: boolean;
   /** Killed at its time limit: neither a pass nor a meaningful red. */
   timedOut?: boolean;
+  /** An "orchestrator:" live check, not run here; it runs after merge. */
+  deferred?: boolean;
 }
 
 export interface ProjectTestConfig {
@@ -685,6 +688,8 @@ export class TaskVerifier {
   ): Promise<AcceptanceResult> {
     const command = (task.verification_command || '').trim();
     if (!command) return { ran: false, passed: true, exitCode: null, output: '', command: '', unrunnable: false };
+    // A live check needs the running stack; the orchestrator runs it after merge.
+    if (isDeferredAcceptance(command)) return { ran: false, passed: true, exitCode: null, output: 'deferred to the orchestrator after merge', command, unrunnable: false, deferred: true };
     const cwd = await this.acceptanceCwd(worktreePath, command);
     const violation = commandPolicyViolation(command, { root: worktreePath, cwd });
     let exitCode: number | null = null;

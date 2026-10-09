@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
-import { isEnvironmentFailure, WorkerEnvironmentError } from './IWorker.js';
+import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
@@ -16,7 +16,7 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
-import { loadUat, runUat, UAT_FILE, type UatResult } from './Uat.js';
+import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult } from './Uat.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
 import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
 import { RunJournal } from './RunJournal.js';
@@ -28,6 +28,8 @@ import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
 import { redactSecrets } from './redact.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
+import { parseCommand } from './commandPolicy.js';
+import type { PlanApprover } from './PlanApproval.js';
 import { loadRules, violations, RULES_FILE, type Rule } from './NonNegotiables.js';
 
 /** An attempt that outlived its wall-clock budget and did not stop when asked. */
@@ -63,6 +65,8 @@ export interface FactoryOptions {
     skipUat?: boolean;
     /** Archive an unfinished feature, unfinished, so a new requirement can start. */
     abandon?: boolean;
+    /** Asked once, between planning and the first worker; absent means unattended. */
+    approvePlan?: PlanApprover;
 }
 
 export class Factory extends EventEmitter {
@@ -91,6 +95,7 @@ export class Factory extends EventEmitter {
     prMode: boolean;
     skipUat = false;
     abandon = false;
+    approvePlan: PlanApprover | undefined;
     issue: { number: number; url: string; title: string } | undefined;
     /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
     github: GitHub;
@@ -130,7 +135,8 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false, approvePlan } = options;
+        this.approvePlan = approvePlan;
         this.skipUat = skipUat;
         this.abandon = abandon;
         this.prMode = prMode;
@@ -587,6 +593,20 @@ export class Factory extends EventEmitter {
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
+        if (this.approvePlan) {
+            this.emitEvent({ type: 'state:update', state: this.state });
+            const decision = await this.approvePlan(this.state);
+            if (decision !== 'approve') {
+                this.state.status = 'planned';
+                await this.saveState();
+                await this.updateHistory('planned');
+                await this.journal()?.append('plan:declined', { feature: this.state.feature, tasks: this.state.tasks.length }).catch(() => undefined);
+                this.log(`Plan saved, not started: ${this.state.feature} (${this.state.feature_id}). Change it with --refine "<what to change>", or start it with --resume.`);
+                this.emitEvent({ type: 'build:complete', status: 'planned', feature: this.state.feature });
+                return;
+            }
+            this.log('Plan approved.');
+        }
         await this.saveState();
         await this.journalPlan();
         await this.updateHistory('active');
@@ -937,7 +957,9 @@ export class Factory extends EventEmitter {
             const { worker, model, provider, escalated } = await this.workerRegistry.resolveWorker(task);
             task.model = model;
             task.provider = provider;
-            if (escalated) {
+            if (escalated && task.attempts === 0 && task.escalation_level === 0) {
+                this.log(`Worker: ${model || 'the provider\'s configured default'} (strongest tier from the start: protected or silent-failure work)`);
+            } else if (escalated) {
                 this.log(`ESCALATION: ${task.id} escalated to ${model || 'the provider\'s configured default'} (Iteration ${task.attempts + 1})`);
             } else {
                 this.log(`Worker: ${model || 'the provider\'s configured default'}`);
@@ -1160,6 +1182,7 @@ export class Factory extends EventEmitter {
                 evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
                 note: task.agent_role === 'test_writer' ? 'test_writer: a red acceptance is expected before implementation' : undefined,
             });
+            if (acceptance.deferred) this.log(`ACCEPTANCE deferred: ${task.id} — ${task.verification_command} runs against the live system after merge`);
             if (acceptance.ran) {
                 task.evidence = acceptance.evidencePath ? path.relative(this.baseDir, acceptance.evidencePath) : undefined;
                 await this.journal()?.append('task:acceptance', { task_id: task.id, attempt: task.attempts, command: acceptance.command, exit_code: acceptance.exitCode, passed: acceptance.passed, unrunnable: acceptance.unrunnable }, task.evidence ? [task.evidence] : []).catch(() => undefined);
@@ -1717,7 +1740,7 @@ export class Factory extends EventEmitter {
             const feedback = String(error.message).split('\n').filter((line: string) => line.startsWith('- ')).join('\n');
             blueprint = await this.planner.generateBlueprint({
                 ...input,
-                requirement: `${input.requirement}\n\nPLANNER FEEDBACK: the previous plan was rejected because these acceptance commands could not gate a merge here:\n${feedback}\nGive each task a focused verification_command that runs only its own test file or check and finishes in well under a minute.`,
+                requirement: `${input.requirement}\n\nPLANNER FEEDBACK: the previous plan was rejected for these reasons:\n${feedback}\nFix every one. Acceptance commands run only the task's own test file or check, name only files the task or its dependencies change, and finish in well under a minute; a task that renames or removes a symbol lists every file that uses it.`,
             });
             return { blueprint, tasks: await this.prepareTasks(blueprint.tasks) };
         }
@@ -1725,9 +1748,19 @@ export class Factory extends EventEmitter {
 
     async prepareTasks(blueprintTasks: Array<Record<string, unknown>>): Promise<Task[]> {
         const tasks = this.annotateTasks(blueprintTasks.map(t => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })));
+        const structural = [...await this.fileListProblems(tasks), ...await this.acceptanceScopeProblems(tasks)];
+        if (structural.length) {
+            for (const problem of structural) this.log(`Planning check: ${problem}`);
+            throw new Error(`Plan rejected: the plan's file lists do not match the repository:\n- ${structural.join('\n- ')}`);
+        }
         const unrunnable: string[] = [];
         for (const task of tasks) {
             if (!task.verification_command || task.executor !== 'agent') continue;
+            if (isDeferredAcceptance(task.verification_command)) {
+                task.acceptance_baseline = { exit_code: null, summary: 'live check: runs on the host after merge' };
+                this.log(`Planning-time acceptance ${task.id}: ${task.verification_command} → deferred to after merge`);
+                continue;
+            }
             const probe = await this.taskVerifier.runAcceptance(this.baseDir, task, { timeoutMs: 90000 });
             const summary = probe.timedOut
                 ? 'unrunnable: did not finish in 90s at planning, so it can neither be red now nor gate a merge in time; use the focused test for this task'
@@ -1742,6 +1775,57 @@ export class Factory extends EventEmitter {
             throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
         }
         return tasks;
+    }
+
+    /**
+     * Files derived by search, not memory (Softhouse 2.6): a task that
+     * renames, removes or consolidates a symbol must, together with the rest
+     * of the plan, list every tracked file that uses it. One Softhouse plan
+     * listed the definitions and missed seven adapters and the handler mocks.
+     */
+    async fileListProblems(tasks: Task[]): Promise<string[]> {
+        const claimed = new Set(tasks.flatMap(t => [...t.files_hint, ...t.creates_files, ...t.test_targets, ...t.production_targets]));
+        const problems: string[] = [];
+        for (const task of tasks) {
+            if (!/\b(?:renam\w*|remov\w*|delet\w*|drop\w*|consolidat\w*|deprecat\w*|replac\w*)\b/i.test(`${task.title} ${task.description}`)) continue;
+            const symbols = [...new Set([...`${task.title} ${task.description}`.matchAll(/`([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)(?:\(\))?`/g)].map(m => m[1].split('.').pop()!).filter(s => s.length >= 3))];
+            for (const symbol of symbols.slice(0, 6)) {
+                const { stdout } = await execa('git', ['grep', '-l', '-w', '-I', '--', symbol], { cwd: this.baseDir, reject: false });
+                const users = stdout.split('\n').filter(f => f && !/(?:^|\/)(?:node_modules|dist|vendor)\//.test(f));
+                const missing = users.filter(f => !claimed.has(f));
+                if (missing.length) problems.push(`${task.id} changes \`${symbol}\`, but these files use it and no task lists them: ${missing.slice(0, 12).join(', ')}${missing.length > 12 ? ` and ${missing.length - 12} more` : ''}`);
+            }
+        }
+        return problems;
+    }
+
+    /**
+     * Scope self-check (Softhouse 2.7): an acceptance command may only name
+     * files its task, or a task it depends on, changes. A check that reads an
+     * unrelated file either cannot be satisfied by the worker or does not
+     * test the worker's change.
+     */
+    async acceptanceScopeProblems(tasks: Task[]): Promise<string[]> {
+        const tracked = new Set(await this.getRepositoryFiles().catch(() => [] as string[]));
+        const byId = new Map(tasks.map(t => [t.id, t]));
+        const ownFiles = (task: Task, seen = new Set<string>()): Set<string> => {
+            const files = new Set([...task.files_hint, ...task.creates_files, ...task.test_targets, ...task.production_targets]);
+            for (const dep of [...task.dependencies, ...task.blockedBy]) {
+                const parent = byId.get(dep);
+                if (parent && !seen.has(dep)) { seen.add(dep); for (const f of ownFiles(parent, seen)) files.add(f); }
+            }
+            return files;
+        };
+        const problems: string[] = [];
+        for (const task of tasks) {
+            const command = task.verification_command?.replace(/^orchestrator:\s*/i, '').trim();
+            if (!command || task.executor !== 'agent') continue;
+            const allowed = ownFiles(task);
+            const named = parseCommand(command).filter(token => !token.startsWith('-')).map(token => token.replace(/^\.\//, ''));
+            const strangers = [...new Set(named.filter(token => (tracked.has(token) || /\.\w{1,5}$/.test(token) && token.includes('/')) && !allowed.has(token) && !(task.files_hint.some(h => h.endsWith('/') && token.startsWith(h)))))];
+            if (strangers.length) problems.push(`${task.id}'s acceptance command names ${strangers.join(', ')}, which neither the task nor its dependencies change; test a file the task changes, or add the file to files_hint`);
+        }
+        return problems;
     }
 
     /** Hands an orchestrator or user task to a person and records that nothing automated will run it. */
@@ -2183,7 +2267,7 @@ export class Factory extends EventEmitter {
         const categories = [...new Set(this.failureCategories.get(task.id) || [])];
         const prohibitions = categories.map(c => Factory.PROHIBITIONS[c]).filter(Boolean) as string[];
         if (!prohibitions.length) prohibitions.push('Do not repeat the previous approach; the feedback above says why it was rejected. Change the implementation, not only its wording.');
-        if (task.verification_command) prohibitions.push(`Do not finish until you have run the acceptance command yourself and it passes: ${task.verification_command}`);
+        if (task.verification_command && !isDeferredAcceptance(task.verification_command)) prohibitions.push(`Do not finish until you have run the acceptance command yourself and it passes: ${task.verification_command}`);
         return [
             `RETRY BRIEF (attempt ${task.attempts + 1}; the previous attempt was rejected, so this prompt differs from it on purpose):`,
             signatures.length ? `Exact signatures of the task's files as they are now (use them; do not guess):\n${signatures.slice(0, 60).join('\n')}` : 'None of the task\'s files exist yet: create them with the names the task gives.',
@@ -2217,7 +2301,7 @@ export class Factory extends EventEmitter {
      */
     async recoverCrashedWork(task: Task, worktreePath: string, error: unknown): Promise<Handoff | null> {
         if (isEnvironmentFailure(error)) return null;
-        if (!task.verification_command || task.agent_role === 'test_writer') return null;
+        if (!task.verification_command || task.agent_role === 'test_writer' || isDeferredAcceptance(task.verification_command)) return null;
         const status = await execa('git', ['status', '--porcelain'], { cwd: worktreePath, reject: false });
         const changed = status.stdout.split('\n').filter(Boolean).map(line => line.slice(3).trim()).filter(file => !file.startsWith('.softfactory'));
         if (!changed.length) return null;
@@ -2339,11 +2423,19 @@ export class Factory extends EventEmitter {
             await this.updateHistory('failed');
             return undefined;
         }
-        if (!config) {
+        // Each merged task's "orchestrator:" live check runs here, after the
+        // build and setup and before teardown, named after its task.
+        const liveChecks = this.state.tasks
+            .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
+            .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
+        if (!config && !liveChecks.length) {
             this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
             return undefined;
         }
-        this.log(`UAT: running ${UAT_FILE} on ${this.mergeTarget()} (host, network on: this is the orchestrator's check of the live stack).`);
+        config = config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks });
+        this.log(config.build || config.setup.length
+            ? `UAT: running ${UAT_FILE} on ${this.mergeTarget()}${liveChecks.length ? ` with ${liveChecks.length} task live check(s)` : ''} (host, network on: this is the orchestrator's check of the live stack).`
+            : `UAT: running ${liveChecks.length} task live check(s) on the host after merge.`);
         const result = await runUat(this.baseDir, config, {
             runId: `${this.state.feature_id}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
@@ -2351,6 +2443,8 @@ export class Factory extends EventEmitter {
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
         await this.journal()?.append('uat:result', { passed: result.passed, steps: result.steps.map(s => ({ name: s.name, passed: s.passed })) }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
         if (!result.passed) {
+            const blamed = result.steps.filter(step => !step.passed && / live check$/.test(step.name.replace(/^probe: /, ''))).map(step => step.name.replace(/^probe: /, '').replace(/ live check$/, ''));
+            if (blamed.length) this.log(`UAT: the live check of ${blamed.join(', ')} failed; ${blamed.length === 1 ? 'that task' : 'those tasks'} did not make the change reachable.`);
             this.log(`UAT FAILED: the merged code does not pass live verification (evidence: ${result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none'}).`);
             this.state.status = 'failed';
             await this.saveState();

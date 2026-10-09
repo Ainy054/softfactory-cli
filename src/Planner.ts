@@ -132,7 +132,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
 - executor routes WHO performs a task, and it is a safety boundary. "agent" (the default) is repository-contained work a worker can verify inside its worktree. "orchestrator" is anything that touches the host or a live system: secret values and .env contents, crontab, host config, deploys, container restarts, git push, migrations against a live database. "user" is a decision only the product owner can make. Workers never receive orchestrator or user tasks, so never fold such work into an agent task; split it out.
-- verification_command runs this task's own test file, never the whole suite (not bare "npm test"); the final gate runs the suite.
+- verification_command runs this task's own test file, never the whole suite; a check needing the running system is "orchestrator: <command>".
 - verification_command is ONE command the orchestrator executes verbatim in the task's worktree as the merge gate. No shell operators (no &&, ;, redirects, cd). The executable must be one of npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another read-only tool. npx is not allowed: write "npm test -- --run src/x.test.ts", not "npx vitest run src/x.test.ts". A preload flag may name an installed package ("node --import tsx --test src/x.test.ts" is fine) but never a file. Choose the narrowest command that proves the acceptance criteria.
 - review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
 
@@ -455,7 +455,7 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     // The acceptance command is executed verbatim under the command policy.
     // A command the policy refuses could never gate a merge, so it is a
     // planning error here rather than a silent pass later.
-    if (task.verification_command?.trim()) {
+    if (task.verification_command?.trim() && !/^\s*orchestrator:/i.test(task.verification_command)) {
       const violation = commandPolicyViolation(task.verification_command.trim());
       if (violation) errors.push(`${task.id} verification_command cannot run under the command policy (${violation}); use one allowlisted command with no shell operators`);
     }

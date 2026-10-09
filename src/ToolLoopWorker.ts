@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, WorkerEnvironmentError } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { AutoHeal } from './AutoHeal.js';
 import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
@@ -111,7 +111,9 @@ ${projectContext}
       }
     }
     if (task.verification_command) {
-      userPrompt += `\nACCEPTANCE COMMAND (the orchestrator runs this verbatim after you finish; make it pass): ${task.verification_command}\n`;
+      userPrompt += isDeferredAcceptance(task.verification_command)
+        ? `\n${acceptanceLine(task.verification_command)}\n`
+        : `\nACCEPTANCE COMMAND (the orchestrator runs this verbatim after you finish; make it pass): ${task.verification_command}\n`;
     }
     if (task.review_questions?.length) {
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
