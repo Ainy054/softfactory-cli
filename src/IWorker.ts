@@ -21,6 +21,11 @@ export interface WorkerOptions {
    */
   requirement?: string;
   /**
+   * A spec, value table or rename map shared by every task in this run,
+   * written once so each task's description carries only its delta.
+   */
+  brief?: string;
+  /**
    * From the second attempt: exact signatures of the task's files and what
    * not to do again. Softhouse: a retry is a different prompt, not only a
    * bigger model; one that differs only in feedback repeats the failure.

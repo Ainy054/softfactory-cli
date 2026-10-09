@@ -31,11 +31,19 @@ const BlueprintTaskSchema = z.object({
   allocation_reason: z.string().optional(),
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
   review_questions: z.array(z.string()).default([]),
+  /** A pointer into a shared spec, such as "docs/api.md §3". */
+  spec: z.string().optional(),
+  /** Things the worker must not touch, even if they seem related. */
+  out_of_scope: z.array(z.string()).default([]),
+  /** Invariants and hints the planner does not want to lose in the task description. */
+  notes_to_executor: z.array(z.string()).default([]),
 });
 
 export const BlueprintSchema = z.object({
   feature: z.string().min(4),
   requirements_covered: z.array(z.string()).default([]),
+  /** A spec, value table or rename map shared by several tasks, written once. */
+  brief: z.string().max(6000).optional(),
   tasks: z.array(BlueprintTaskSchema).min(1),
 });
 
@@ -77,6 +85,7 @@ export const OUTPUT_SCHEMA = {
   properties: {
     feature: { type: 'string' },
     requirements_covered: { type: 'array', items: { type: 'string' } },
+    brief: { type: 'string', maxLength: 6000 },
     tasks: {
       type: 'array',
       minItems: 1,
@@ -104,6 +113,9 @@ export const OUTPUT_SCHEMA = {
           verification_command: { type: 'string' },
           complexity: { type: 'string', enum: ['simple', 'moderate', 'complex'] },
           allocation_reason: { type: 'string' },
+          spec: { type: 'string' },
+          out_of_scope: { type: 'array', items: { type: 'string' } },
+          notes_to_executor: { type: 'array', items: { type: 'string' } },
         },
       },
     },
@@ -115,6 +127,7 @@ const PLANNING_RULES = (workerCapability?: 'local' | 'cloud') => `Planning rules
 - Never transfer behavior from one component or domain to another.
 - Reference an existing path only when it appears in Repository Context. Put justified new paths in both files_hint and creates_files.
 - Prefer cohesive tasks over many sequential tasks editing the same file. Keep each task under roughly 300 changed lines.
+- When three or more tasks share a spec, table or rename map, put it once in \`brief\` and keep each description to its delta.
 ${workerCapability === 'local' ? `
 LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not a frontier model:
 - At most 2 files in files_hint per task, counting creates_files. Split anything larger.
