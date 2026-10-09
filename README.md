@@ -99,6 +99,10 @@ softfactory --plan "implement transaction reversal endpoint"
 softfactory --resume
 softfactory --refine "also reverse the ledger entry"
 
+# Queue plans and start them oldest first once the current run finishes
+softfactory --queue "add rate limiting to the API"
+softfactory --next
+
 # A person finished an orchestrator/user task
 softfactory --mark-done T3 "rotated the key in the vault" --resume
 
@@ -125,6 +129,8 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--planner-provider` | `openai` (Codex CLI), `agy`, `claude-code`, `gemini-cli`, `muse`, `deepseek`, `qwen`, `anthropic`, `openai-api`, `openai-compat`, `local` | follows the cloud provider; `local` for a local run |
 | `--planner-model` | Planner model override | provider default |
 | `--plan` | Save the plan without executing | `false` |
+| `--queue <requirement>` | Plan the requirement and park it under `.softfactory/queue/` instead of running it; allowed while another feature is in progress. Start it later with `--next` | `false` |
+| `--next` | Start the oldest queued plan (by `created_at`) once nothing is active, `planned` or `paused`; archives the current state first. Takes no requirement | `false` |
 | `--resume [feature-id]` | Resume an active, planned or paused build (or restore an archived one) | `false` |
 | `--retry-blocked` | With `--resume`, retry blocked and rejected tasks too | `false` |
 | `--refine` | Modify an in-progress plan; done tasks are kept verbatim | `false` |
@@ -170,6 +176,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | Path | Contents |
 | :--- | :--- |
 | `factory.json` | The run state: feature, tasks, statuses, attempts, inspection results. Versioned. |
+| `queue/<feature_id>.json` | Plans parked by `--queue`, waiting for `--next` to move the oldest into `factory.json` |
 | `evidence/<feature>/<task>-attempt<N>.log` | The acceptance command, its output, and `RESULT: PASS` or `FAIL` |
 | `runs/<feature>/prompts/<task>-attempt<N>.md` | The exact prompt each worker attempt received, redacted; its hash is in the journal |
 | `non-negotiables.txt` | Yours to write: project rules no test catches, one `<regex> :: <reason>` per line; checked against every diff's added lines |
