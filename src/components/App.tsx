@@ -20,6 +20,8 @@ interface AppProps {
   planMode?: boolean;
   /** Show the plan and wait for y/n before any worker starts. */
   askForApproval?: boolean;
+  /** A person is at the terminal: the planned-budget question is asked here. */
+  interactive?: boolean;
 }
 
 interface AppState {
@@ -74,14 +76,17 @@ const initialState: AppState = {
   done: false,
 };
 
-export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, askForApproval }: AppProps) {
+export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, askForApproval, interactive }: AppProps) {
   const { exit } = useApp();
   const [state, dispatch] = useReducer(reducer, initialState);
   const hasStartedRef = useRef(false);
-  const [pendingPlan, setPendingPlan] = useState<{ lines: string[]; resolve: (decision: PlanDecision) => void } | null>(null);
+  const [pendingPlan, setPendingPlan] = useState<{ lines: string[]; prompt?: string; resolve: (decision: PlanDecision) => void } | null>(null);
 
   if (askForApproval && !factory.approvePlan) {
     factory.approvePlan = planState => new Promise(resolve => setPendingPlan({ lines: formatPlan(planState), resolve }));
+  }
+  if (interactive && !factory.confirmOverBudget) {
+    factory.confirmOverBudget = message => new Promise(resolve => setPendingPlan({ lines: [message], prompt: 'Continue past the planned budget? y = continue, n = halt (resume later with --resume)', resolve: decision => resolve(decision === 'approve') }));
   }
 
   useInput((input, key) => {
@@ -89,7 +94,7 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
     const answer = input.toLowerCase();
     if (answer === 'y') { pendingPlan.resolve('approve'); setPendingPlan(null); }
     else if (answer === 'n' || answer === 'q' || key.escape) { pendingPlan.resolve('abort'); setPendingPlan(null); }
-  }, { isActive: Boolean(askForApproval) });
+  }, { isActive: Boolean(askForApproval || interactive) });
 
   const handleEvent = useCallback((event: FactoryEvent) => {
     switch (event.type) {
@@ -163,7 +168,7 @@ export function App({ factory, requirement, resumeMode, resumeFeatureId, retryBl
       {pendingPlan && (
         <Box flexDirection="column" marginTop={1} borderStyle="round" paddingX={1}>
           {pendingPlan.lines.map((line, i) => <Text key={i}>{line}</Text>)}
-          <Text bold color="yellow">Start this plan? y = start, n = keep it unstarted (change it with --refine)</Text>
+          <Text bold color="yellow">{pendingPlan.prompt ?? 'Start this plan? y = start, n = keep it unstarted (change it with --refine)'}</Text>
         </Box>
       )}
 

@@ -139,7 +139,7 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 | `--second-reviewer <provider/model>` | A second reviewer on another vendor, any provider the inspector accepts (`qwen/qwen3-coder-plus`, `anthropic/claude-sonnet-4`, `openai-compat/<model>`, `claude-code/<model>`, …). Protected diffs need both verdicts; a split on an ordinary diff goes to the blind review | none |
 | `--attempt-timeout <minutes>` | Wall-clock budget per worker attempt; an overrun is a task failure that keeps its partial work and escalates | `45` |
 | `--run-budget <minutes>` | Wall-clock budget per invocation; the run halts between phases and `--resume` continues | none |
-| `--max-tokens <n>` | Token budget per feature across resumes, where backends report usage | none |
+| `--max-tokens <n>` | Token budget per feature across resumes, where backends report usage. Without it, a plan gets a budget estimated from the last five runs; past 80% of it an interactive run asks once and an unattended run halts for `--resume` | estimated |
 | `--verify-run [feature-id]` | Recompute the run journal's hash chain and the evidence files it cites; exit 1 on any mismatch | current build |
 | `--issue <n>` | Read the requirement from GitHub issue `n` through `gh`; words after the flags are appended as operator instructions | — |
 | `--pr` | Merge passing tasks into `softfactory/<feature>` instead of the base branch, push it, and open a pull request (draft until the run completes) | `false` |
@@ -176,6 +176,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | Path | Contents |
 | :--- | :--- |
 | `factory.json` | The run state: feature, tasks, statuses, attempts, inspection results. Versioned. |
+| `config.json` | Yours to write: project settings. `commitRecords: true` commits each run's evidence, journal, prompts, handoff rows and metrics, redacted, under `softfactory-records/<feature>/` on the branch the work merged into (off by default) |
 | `queue/<feature_id>.json` | Plans parked by `--queue`, waiting for `--next` to move the oldest into `factory.json` |
 | `evidence/<feature>/<task>-attempt<N>.log` | The acceptance command, its output, and `RESULT: PASS` or `FAIL` |
 | `runs/<feature>/prompts/<task>-attempt<N>.md` | The exact prompt each worker attempt received, redacted; its hash is in the journal |

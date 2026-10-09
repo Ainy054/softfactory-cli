@@ -276,10 +276,13 @@ async function main() {
   }
 
   // Interactive runs stop for plan approval; CI, pipes and --yes run unattended.
-  const { isInteractive, terminalApprover } = await import('./PlanApproval.js');
-  const askForApproval = isInteractive(args) && !resumeMode && !planMode;
+  const { isInteractive, terminalApprover, terminalBudgetConfirm } = await import('./PlanApproval.js');
+  const interactive = isInteractive(args);
+  const askForApproval = interactive && !resumeMode && !planMode;
   if (noTui) {
     if (askForApproval) factory.approvePlan = terminalApprover();
+    // Past 80% of the planned token budget a person is asked; unattended runs halt.
+    if (interactive) factory.confirmOverBudget = terminalBudgetConfirm();
     factory.on('worker:output', (event: { taskId: string; line: string }) => console.log(`[${event.taskId}] ${String(event.line).slice(0, 240)}`));
     await startFactoryRun(factory, requirement, { resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, queueMode, nextMode });
   } else {
@@ -288,7 +291,7 @@ async function main() {
     const { App } = await import('./components/App.js');
 
     const { waitUntilExit } = render(
-      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, askForApproval })
+      React.createElement(App, { factory, requirement, resumeMode, resumeFeatureId, retryBlocked, refineMode, planMode, askForApproval, interactive })
     );
     await waitUntilExit();
   }

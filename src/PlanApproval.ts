@@ -12,8 +12,9 @@ export type PlanDecision = 'approve' | 'abort';
 export type PlanApprover = (state: FactoryState) => Promise<PlanDecision>;
 
 /** The plan as a table a person can check in one read. */
-export function formatPlan(state: Pick<FactoryState, 'feature' | 'tasks'>): string[] {
+export function formatPlan(state: Pick<FactoryState, 'feature' | 'tasks'> & { token_estimate?: FactoryState['token_estimate'] }): string[] {
   const lines = [`Plan: ${state.feature} (${state.tasks.length} task${state.tasks.length === 1 ? '' : 's'})`, ''];
+  if (state.token_estimate) lines.splice(1, 0, `Planned budget: about ${state.token_estimate.tokens} tokens, from ${state.token_estimate.runs} past run(s)`);
   for (const task of state.tasks) lines.push(...formatTask(task), '');
   return lines;
 }
@@ -43,6 +44,19 @@ export function terminalApprover(input: NodeJS.ReadableStream = process.stdin, o
     try {
       const answer: string = await new Promise(resolve => rl.question('Start this plan? [y/N] ', resolve));
       return /^\s*y(es)?\s*$/i.test(answer) ? 'approve' : 'abort';
+    } finally {
+      rl.close();
+    }
+  };
+}
+
+/** Asks once on the terminal whether to run past the planned token budget. */
+export function terminalBudgetConfirm(input: NodeJS.ReadableStream = process.stdin, output: NodeJS.WritableStream = process.stdout): (message: string) => Promise<boolean> {
+  return async message => {
+    const rl = readline.createInterface({ input, output });
+    try {
+      const answer: string = await new Promise(resolve => rl.question(`\n${message}\nContinue past the planned budget? [y/N] `, resolve));
+      return /^\s*y(es)?\s*$/i.test(answer);
     } finally {
       rl.close();
     }

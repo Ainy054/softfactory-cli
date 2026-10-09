@@ -97,6 +97,10 @@ export const FactoryStateSchema = z.object({
   source: z.object({ kind: z.literal('issue'), number: z.number(), url: z.string(), title: z.string() }).optional(),
   /** PR mode: passing tasks merge here instead of the base branch, and the branch becomes a pull request. */
   integration_branch: z.string().optional(),
+  /** Planned token budget from past runs; past 80% of it the run asks or halts. */
+  token_estimate: z.object({ tokens: z.number(), runs: z.number() }).optional(),
+  /** Set once a person agreed to run past the estimate; it is not asked again. */
+  over_estimate_accepted: z.boolean().optional(),
   base_branch: z.string().optional(),
   pull_request: z.object({ number: z.number(), url: z.string(), branch: z.string() }).optional(),
 });

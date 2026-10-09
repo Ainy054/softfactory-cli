@@ -26,6 +26,8 @@ import type { Handoff } from './types.js';
 import type { RunMetrics } from './Metrics.js';
 import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
+import { estimateTokens, overEstimate } from './TokenEstimate.js';
+import { commitRecordsEnabled, writeRunRecords, RECORDS_DIR } from './RunRecords.js';
 import { redactSecrets } from './redact.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
 import { parseCommand } from './commandPolicy.js';
@@ -68,6 +70,8 @@ export interface FactoryOptions {
     abandon?: boolean;
     /** Asked once, between planning and the first worker; absent means unattended. */
     approvePlan?: PlanApprover;
+    /** Asks a person whether to run past the planned token budget; unset means unattended. */
+    confirmOverBudget?: (message: string) => Promise<boolean>;
 }
 
 export class Factory extends EventEmitter {
@@ -99,6 +103,7 @@ export class Factory extends EventEmitter {
     skipUat = false;
     abandon = false;
     approvePlan: PlanApprover | undefined;
+    confirmOverBudget: ((message: string) => Promise<boolean>) | undefined;
     issue: { number: number; url: string; title: string } | undefined;
     /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
     github: GitHub;
@@ -138,8 +143,9 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false, approvePlan } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false, approvePlan, confirmOverBudget } = options;
         this.approvePlan = approvePlan;
+        this.confirmOverBudget = confirmOverBudget;
         this.skipUat = skipUat;
         this.abandon = abandon;
         this.prMode = prMode;
@@ -666,6 +672,7 @@ export class Factory extends EventEmitter {
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
+        await this.planTokenBudget();
         if (this.approvePlan) {
             this.emitEvent({ type: 'state:update', state: this.state });
             const decision = await this.approvePlan(this.state);
@@ -712,6 +719,33 @@ export class Factory extends EventEmitter {
         this.state.usage = this.state.usage || { input_tokens: 0, output_tokens: 0 };
         this.state.usage.input_tokens += usage.inputTokens || 0;
         this.state.usage.output_tokens += usage.outputTokens || 0;
+    }
+    /** Estimates this plan's tokens from past runs. An explicit --max-tokens replaces the estimate. */
+    async planTokenBudget() {
+        if (this.maxTokens) return;
+        const agentTasks = this.state.tasks.filter(t => t.executor === 'agent').length;
+        const estimate = estimateTokens(await readRecentMetrics(this.baseDir).catch(() => []), agentTasks);
+        if (!estimate) return;
+        this.state.token_estimate = estimate;
+        this.log(`Planned budget: about ${estimate.tokens} tokens for ${agentTasks} agent task(s), from ${estimate.runs} past run(s); the run asks before passing ${Math.round(estimate.tokens * 0.8)}.`);
+    }
+    /**
+     * Past 80% of the planned budget a person is asked once; unattended, the
+     * run halts like an environment fault and --resume continues.
+     */
+    async overBudget(): Promise<string | null> {
+        const estimate = this.state?.token_estimate;
+        if (!estimate || this.maxTokens || this.state.over_estimate_accepted) return null;
+        const used = (this.state.usage?.input_tokens || 0) + (this.state.usage?.output_tokens || 0);
+        const message = overEstimate(used, estimate);
+        if (!message) return null;
+        if (this.confirmOverBudget && await this.confirmOverBudget(message)) {
+            this.state.over_estimate_accepted = true;
+            await this.saveState();
+            this.log(`${message} Continuing: confirmed.`);
+            return null;
+        }
+        return `${message} No task state was lost; run --resume interactively to confirm, or with --max-tokens <n> to set a cap.`;
     }
     /** Why the run may not start another phase, or null. Checked between phases, so a phase in flight may overshoot. */
     budgetExhausted(): string | null {
@@ -813,7 +847,7 @@ export class Factory extends EventEmitter {
         if (!this.baseline) await this.captureBaseline();
         this.runStartedAt = Date.now();
         while (this.hasUnfinishedTasks()) {
-            const exhausted = this.budgetExhausted();
+            const exhausted = this.budgetExhausted() ?? await this.overBudget();
             if (exhausted) {
                 // Like an environment fault: nothing is a task failure, and
                 // --resume continues exactly here.
@@ -972,6 +1006,7 @@ export class Factory extends EventEmitter {
             if (this.state.status === 'completed') await this.synthesizeMemory();
         }
         await this.writeRunMetrics();
+        await this.commitRunRecords();
         await this.endRun();
         this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
         if (failedTasks.length > 0) {
@@ -1945,6 +1980,37 @@ export class Factory extends EventEmitter {
         return recurring;
     }
 
+    /**
+     * Opt-in (`commitRecords` in .softfactory/config.json): commit the run's
+     * evidence onto the branch its work merged into, so a pull request carries
+     * it. Only after something merged, and only on that branch. Never fails the run.
+     */
+    async commitRunRecords(): Promise<void> {
+        try {
+            if (!await commitRecordsEnabled(this.baseDir)) return;
+            if (!this.state.tasks.some(t => t.status === 'done' && t.executor === 'agent')) return;
+            const target = this.mergeTarget();
+            const { stdout: current } = await execa('git', ['branch', '--show-current'], { cwd: this.baseDir });
+            if (current.trim() !== target) {
+                this.log(`Records: not committed; the checkout is on ${current.trim() || 'a detached HEAD'}, not ${target}.`);
+                return;
+            }
+            const written = await writeRunRecords(this.baseDir, this.state.feature_id, this.lastMetrics);
+            if (!written.length) return;
+            const dir = path.join(RECORDS_DIR, this.state.feature_id);
+            await execa('git', ['add', '-f', '--', dir], { cwd: this.baseDir });
+            const commit = await execa('git', ['commit', '-q', '-m', `softfactory: run records for ${this.state.feature_id}`, '--', dir], { cwd: this.baseDir, reject: false });
+            if (commit.exitCode !== 0) {
+                this.log(`Records: not committed: ${(commit.stderr || commit.stdout).trim().split('\n').slice(-1)[0]}`);
+                return;
+            }
+            await this.journal()?.append('run:records', { dir, files: written.length }).catch(() => undefined);
+            this.log(`Records: ${written.length} file(s) committed under ${dir} on ${target}.`);
+        } catch (e: any) {
+            this.log(`Records not committed (non-fatal): ${e?.message || e}`);
+        }
+    }
+
     private async writeRunMetrics() {
         try {
             const metrics = await computeRunMetrics(this.baseDir, this.state);
@@ -2161,7 +2227,8 @@ export class Factory extends EventEmitter {
     }
     async getRepositoryFiles(): Promise<string[]> {
         const { stdout } = await execa('git', ['ls-files'], { cwd: this.baseDir });
-        return stdout.split('\n').filter(Boolean);
+        // Committed run records are evidence, not code: planning and the scout skip them.
+        return stdout.split('\n').filter(file => file && !file.startsWith(`${RECORDS_DIR}/`));
     }
     async getRepoContext(requirement = '') {
         const trackedFiles = await this.getRepositoryFiles();
