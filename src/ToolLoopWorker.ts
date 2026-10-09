@@ -597,7 +597,7 @@ ${projectContext}
       return `ERROR: edit rejected and reverted — ${relativePath} would no longer be valid: ${invalid}. Re-read the file and make a corrected edit.`;
     }
     changedFiles.add(relativePath);
-    await AutoHeal.formatCode(worktreeRoot, relativePath);
+    await AutoHeal.formatCode(worktreeRoot, relativePath, previous);
     return healed ? `${successMessage} (JSON auto-healed and revalidated)` : successMessage;
   }
 

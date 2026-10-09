@@ -289,3 +289,39 @@ describe('planning a ticket', () => {
     assert.match(requirements[1], /^Add a thing\n\nPLANNER FEEDBACK: the previous plan was rejected[\s\S]*T1: npm test/);
   });
 });
+
+describe('the edit tool formats only in the project\'s own style', () => {
+  const ugly = "export const a = {x:1,y:2}\nexport function f(a:number,b:number){return a+b}\n";
+  async function project(config: boolean) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-fmt-'));
+    await fs.symlink(path.resolve('node_modules'), path.join(dir, 'node_modules'));
+    await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify(config ? { name: 'x', prettier: { singleQuote: true } } : { name: 'x' }));
+    await fs.writeFile(path.join(dir, 'a.ts'), ugly);
+    return dir;
+  }
+
+  it('leaves a file alone in a project with no Prettier config', async () => {
+    const { AutoHeal } = await import('./AutoHeal.js');
+    const dir = await project(false);
+    assert.equal(await AutoHeal.hasPrettierConfig(dir), false);
+    await AutoHeal.formatCode(dir, 'a.ts', ugly);
+    assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), ugly);
+  });
+
+  it('leaves an unformatted file alone even when the project uses Prettier, so untouched lines never change', async () => {
+    const { AutoHeal } = await import('./AutoHeal.js');
+    const dir = await project(true);
+    assert.equal(await AutoHeal.hasPrettierConfig(dir), true);
+    await AutoHeal.formatCode(dir, 'a.ts', ugly);
+    assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), ugly);
+  });
+
+  it('formats a file the project already keeps Prettier-clean', async () => {
+    const { AutoHeal } = await import('./AutoHeal.js');
+    const dir = await project(true);
+    const clean = 'export const a = { x: 1, y: 2 };\n';
+    await fs.writeFile(path.join(dir, 'a.ts'), 'export const a = {x:1,y:2}\n');
+    await AutoHeal.formatCode(dir, 'a.ts', clean);
+    assert.equal(await fs.readFile(path.join(dir, 'a.ts'), 'utf8'), clean);
+  });
+});
