@@ -28,6 +28,7 @@ import { ProtectedPaths } from './ProtectedPaths.js';
 import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
 import { redactSecrets } from './redact.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
+import { loadRules, violations, RULES_FILE, type Rule } from './NonNegotiables.js';
 
 /** An attempt that outlived its wall-clock budget and did not stop when asked. */
 class AttemptTimeoutError extends Error {
@@ -119,6 +120,8 @@ export class Factory extends EventEmitter {
     /** Last failure fingerprint per task, used to stop identical retries. */
     failureFingerprints = new Map<string, string>();
     autoReplanCounts = new Map<string, number>();
+    /** Non-negotiables from `.softfactory/non-negotiables.txt`, read once per run. */
+    private projectRulesCache: Rule[] | undefined;
     trainingData: TrainingDataManager;
     trainingCaptureEnabled: boolean;
     private runtimeConfig: { strategy: 'hybrid' | 'local' | 'cloud'; local_model?: string; cloud_provider?: string; cloud_model?: string; frontier_model?: string };
@@ -1167,6 +1170,24 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'missing_test_evidence', testEvidence);
                 return null;
             }
+            // Project rules no test catches: read once per run, then scanned
+            // against the diff's added lines before any reviewer sees it. The
+            // reviewer also gets the rules as evidence, so it judges against the
+            // project's declared conventions instead of re-deriving them.
+            const projectRules = await this.loadProjectRules();
+            if (projectRules.length > 0) {
+                reviewEvidence += `\n\nProject rules (${RULES_FILE}) this diff must not break:\n${projectRules.map(r => `- ${r.regex}${r.reason !== r.regex ? ` :: ${r.reason}` : ''}`).join('\n')}`;
+                const ruleViolations = violations(projectRules, diff);
+                if (ruleViolations.length > 0) {
+                    const listed = ruleViolations.map(v => `- ${v.file}: breaks "${v.reason}" (matched ${v.rule})${v.line ? `: ${v.line}` : ''}`);
+                    for (const violation of ruleViolations) {
+                        this.log(`REJECTED: ${task.id} — breaks project rule "${violation.reason}" in ${violation.file}`);
+                    }
+                    processFailure(`This change breaks the project's non-negotiable rules in ${RULES_FILE}:\n${listed.join('\n')}`);
+                    await this.recordAttempt(task, 'project_rule', listed.join('\n'));
+                    return null;
+                }
+            }
             // A task must not be able to pass by removing the thing that checks
             // it. godo's T1 renamed the `test` script to `test:unit`, which made
             // verification report "no test script configured -> pass", and it
@@ -1484,6 +1505,11 @@ export class Factory extends EventEmitter {
             return `test files were deleted: ${deletedTestFiles.slice(0, 5).join(', ')}`;
         }
         return null;
+    }
+    /** Reads `.softfactory/non-negotiables.txt` once per run and reuses it for every task. */
+    async loadProjectRules(): Promise<Rule[]> {
+        if (!this.projectRulesCache) this.projectRulesCache = await loadRules(this.baseDir);
+        return this.projectRulesCache;
     }
     async recordAttempt(task: Task, category: string, detail: string) {
         const seen = this.failureCategories.get(task.id) || [];
