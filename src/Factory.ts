@@ -1003,6 +1003,15 @@ export class Factory extends EventEmitter {
                 clearTimeout(attemptTimer);
                 if (graceTimer) clearTimeout(graceTimer);
             }
+            // A worker's own "not done" list is binding: a task that reports
+            // acceptance work as unfinished is rejected whatever the checks say.
+            const notDone = this.notDoneViolation(task, handoff);
+            if (notDone) {
+                this.log(`REJECTED: ${task.id} — ${notDone}`);
+                processFailure(notDone);
+                await this.recordAttempt(task, 'reported_not_done', notDone);
+                return null;
+            }
             // A worker's self-report is a hint, not a verdict. Local models
             // routinely finish the work and then forget to call finish_task, so
             // only treat a reported failure as fatal when the worktree is also
@@ -1170,6 +1179,17 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'missing_test_evidence', testEvidence);
                 return null;
             }
+            // A test writer that edits production code to make its own tests
+            // pass is not writing tests. Softhouse tags this
+            // `tests-rewrote-source`.
+            const scopeViolation = testWriterScopeViolation(task, diff);
+            if (scopeViolation) {
+                const scopeFiles = testWriterScopeFiles(task, diff).join(', ');
+                this.log(`REJECTED: ${task.id} — test writer changed source: ${scopeFiles}`);
+                processFailure(scopeViolation);
+                await this.recordAttempt(task, 'tests_rewrote_source', scopeFiles);
+                return null;
+            }
             // Project rules no test catches: read once per run, then scanned
             // against the diff's added lines before any reviewer sees it. The
             // reviewer also gets the rules as evidence, so it judges against the
@@ -1316,6 +1336,15 @@ export class Factory extends EventEmitter {
         const added = diff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).join('\n');
         const looksLikeTest = /(?:\b(?:describe|it|test|pytest|unittest)\s*\(|\bfunc\s+Test[A-Z]|\bTest\s*\()/m.test(added);
         return looksLikeTest ? null : 'Test-writer changes contain no test cases. Add executable assertions instead of a placeholder file.';
+    }
+
+    /**
+     * A test writer may only add or change test files. Editing production code
+     * so its own tests pass is not writing tests; Softhouse tags it
+     * `tests-rewrote-source`. See the exported helper of the same name.
+     */
+    testWriterScopeViolation(task: { agent_role?: string }, diff: string): string | null {
+        return testWriterScopeViolation(task, diff);
     }
 
     /**
@@ -2155,6 +2184,7 @@ export class Factory extends EventEmitter {
         tests_rewrote_source: 'Do not edit source files; this task may change test files only.',
         verification_sabotage: 'Do not disable, delete or weaken tests or the test script.',
         fabricated_claim: 'Do not cite a file line you have not read; cite real lines or mark the claim UNVERIFIED.',
+        reported_not_done: 'Do not report the acceptance work as unfinished; finish it before calling finish_task.',
         stale_fork: 'Do not assume the files are as they were: re-read them, they changed after your last attempt.',
         attempt_timeout: 'Do not run the whole suite or long commands; run the focused test only, and finish sooner.',
         worker_error: 'Do not repeat the step that crashed the previous attempt.',
@@ -2223,6 +2253,27 @@ export class Factory extends EventEmitter {
             for (const text of unverified) this.addRunNote(task.id, `unverified claim: ${text}`);
         }
         return problems.length ? `The handoff cites sources that do not exist (a fabricated source is a rejection):\n- ${problems.slice(0, 8).join('\n- ')}` : null;
+    }
+
+    /**
+     * A worker's own "not done" list is binding (Softhouse): a handoff that
+     * says part of the acceptance work is unfinished rejects the task whatever
+     * the checks say. An item counts when it shares a word of five or more
+     * letters with an acceptance criterion, or quotes the task's acceptance
+     * command. No `not_done` list, or one unrelated to the task, is fine.
+     */
+    notDoneViolation(task: Task, handoff: Handoff): string | null {
+        const items = handoff.not_done || [];
+        if (items.length === 0) return null;
+        const words = (text: string) => text.toLowerCase().match(/[a-z]{5,}/g) || [];
+        const criteria = new Set(words(task.acceptance_criteria.join(' ')));
+        const command = task.verification_command?.trim();
+        for (const item of items) {
+            const quotesCommand = command ? item.includes(command) : false;
+            const sharesWord = words(item).some(word => criteria.has(word));
+            if (quotesCommand || sharesWord) return `the worker reported acceptance work as not done: ${item}`;
+        }
+        return null;
     }
 
     /** A per-task note, never a failure: the export may be wired by a later task of this run. */
@@ -2378,4 +2429,39 @@ export class Factory extends EventEmitter {
             console.log(`[SoftFactory] ${msg}`);
         }
     }
+}
+
+/** The files a diff adds or changes, read from its `diff --git a/<path> b/<path>` headers. */
+export function diffHeaderFiles(diff: string): string[] {
+    const files: string[] = [];
+    for (const line of diff.split('\n')) {
+        const match = line.match(/^diff --git a\/(\S+) b\/(\S+)/);
+        if (match) files.push(match[2] || match[1]);
+    }
+    return [...new Set(files)];
+}
+
+/** True for a path that is a test file by language convention. */
+export function isTestFilePath(file: string): boolean {
+    return /\.(test|spec)\.[cm]?[jt]sx?$/.test(file)
+        || /_test\.go$/.test(file)
+        || /(^|\/)(__tests__|test|tests)\//.test(file)
+        || /(^|\/)test_[^/]+\.py$|_test\.py$/.test(file);
+}
+
+/** The non-test files a test-writer diff touches; empty for any other role. */
+export function testWriterScopeFiles(task: { agent_role?: string }, diff: string): string[] {
+    if (task.agent_role !== 'test_writer') return [];
+    return diffHeaderFiles(diff).filter(file => !isTestFilePath(file));
+}
+
+/**
+ * Reject a `test_writer` whose diff touches production code. Returns a message
+ * naming every non-test file, or null when the diff is test-only (or the task
+ * is not a test writer). Softhouse tags this `tests-rewrote-source`.
+ */
+export function testWriterScopeViolation(task: { agent_role?: string }, diff: string): string | null {
+    const offenders = testWriterScopeFiles(task, diff);
+    if (offenders.length === 0) return null;
+    return `A test_writer may only add or change test files, but this diff touches non-test files: ${offenders.join(', ')}. Revert the source changes and keep the task to tests.`;
 }
