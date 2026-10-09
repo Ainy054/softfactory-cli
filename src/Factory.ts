@@ -14,7 +14,7 @@ import { AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSee
 import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
-import { Inspector } from './Inspector.js';
+import { Inspector, normalizePostmortem } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult } from './Uat.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
@@ -2125,12 +2125,24 @@ export class Factory extends EventEmitter {
                 this.log('No diff available for memory synthesis — skipping.');
                 return;
             }
+            // The diff cannot show who got stuck or what escalated. Give the
+            // synthesizer the run's own task ledger so "What review caught" and
+            // "Escalations applied" describe this run instead of being invented.
+            const facts = this.state.tasks
+                .map(task => {
+                    const lastError = task.error_history.length ? task.error_history[task.error_history.length - 1] : 'none';
+                    return `- ${task.id}: status=${task.status}, attempts=${task.attempts}, last error: ${lastError}`;
+                })
+                .join('\n');
             this.log(`Synthesizing memory from completed build (${this.inspector.provider}/${this.inspector.model})...`);
-            const memory = await this.inspector.synthesizeMemory(this.state.feature, diff);
-            if (!memory.trim()) {
+            const raw = await this.inspector.synthesizeMemory(this.state.feature, diff, facts);
+            if (!raw.trim()) {
                 this.log('Memory synthesis skipped: the model returned nothing or was unreachable.');
                 return;
             }
+            // The model's free-form reply is forced into the fixed six-section
+            // shape before it can reach FACTORY_MEMORY.md.
+            const memory = normalizePostmortem(raw);
             if (memory.trim()) {
                 let existing = '';
                 try {

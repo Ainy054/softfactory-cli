@@ -23,6 +23,52 @@ export interface Epiphany {
 }
 
 /**
+ * The fixed shape of a release post-mortem, in the order the sections must
+ * appear. `synthesizeMemory` asks the model for exactly these headings and
+ * `normalizePostmortem` enforces them on whatever the model returns.
+ */
+export const POSTMORTEM_SECTIONS = [
+  'What worked',
+  'What review caught',
+  'Codebase facts',
+  'Planning advice',
+  'Escalations applied',
+  'Unverified claims',
+];
+
+/**
+ * Force a model's free-form post-mortem into the fixed six-section shape: the
+ * sections appear in POSTMORTEM_SECTIONS order, each known heading keeps the
+ * bullets written under it, a missing section becomes `- none`, and any
+ * heading not in the list (with everything under it) is dropped. Pure: the
+ * same input always yields the same output.
+ */
+export function normalizePostmortem(text: string): string {
+  const bullets = new Map<string, string[]>(POSTMORTEM_SECTIONS.map(section => [section, []]));
+  let current: string | undefined;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const heading = line.match(/^#{1,6}\s+(.*?)\s*:?\s*$/);
+    if (heading) {
+      const name = heading[1].trim().toLowerCase();
+      current = POSTMORTEM_SECTIONS.find(section => section.toLowerCase() === name);
+      continue;
+    }
+    if (!current) continue;
+    const bullet = line.match(/^[-*•]\s+(.*)$/);
+    const content = (bullet ? bullet[1] : line).trim();
+    if (content) bullets.get(current)!.push(`- ${content}`);
+  }
+  return POSTMORTEM_SECTIONS
+    .map(section => {
+      const items = bullets.get(section)!;
+      return `### ${section}\n${items.length ? items.join('\n') : '- none'}`;
+    })
+    .join('\n\n');
+}
+
+/**
  * The merge gate's reviewer, plus the two non-gating syntheses that use the
  * same model. It runs on exactly the model it was given: when that model is
  * unreachable it raises an environment fault that halts the run, rather than
@@ -175,25 +221,39 @@ CRITICAL: Return ONLY a valid JSON object:
     }
   }
 
-  /** Empty string when the model cannot be reached; the caller skips the write. */
-  async synthesizeMemory(feature: string, diff: string): Promise<string> {
+  /**
+   * The fixed-shape post-mortem for a finished build. Empty string when the
+   * model cannot be reached; the caller skips the write. `facts` carries the
+   * run state the diff cannot show — each task's id, status, attempts and last
+   * error — which the synthesizer must use for "What review caught" and
+   * "Escalations applied".
+   */
+  async synthesizeMemory(feature: string, diff: string, facts?: string): Promise<string> {
     const prompt = `
 You are the SoftFactory Memory Synthesizer.
-A feature has been successfully built. Extract the key architectural patterns and decisions worth remembering for future builds.
+A feature has been successfully built. Produce a post-mortem for future builds, in exactly this shape.
 
 Feature: ${feature}
+
+Run facts (each task's id, status, attempts and last error — the diff does not show these):
+${facts?.trim() || '(none provided)'}
 
 Changes:
 ${diff}
 
-Extract and return a concise markdown summary covering:
-- Key architectural decisions made (tech stack choices, patterns used)
-- Important file paths and their purposes
-- Conventions established (naming, structure, testing approach)
-- Integration points that future features should be aware of
+Return markdown with EXACTLY these six headings, in this order, and no other headings:
+### What worked
+### What review caught
+### Codebase facts
+### Planning advice
+### Escalations applied
+### Unverified claims
 
-Keep it under 20 lines. Focus on what would help a future Architect plan the NEXT feature.
-Do NOT include generic advice — only project-specific patterns. Describe only what the diff shows.
+Rules:
+- Under each heading write at most 4 bullets, each starting with "- ".
+- If a section has nothing to say, write the single word none under that heading.
+- "What review caught" and "Escalations applied" must come from the run facts above; do not invent reviews or escalations the facts do not show.
+- Describe only what the diff and facts show. No generic advice.
 `;
     try {
       return (await this.textModel.complete(prompt, { timeoutMs: 60000 })).trim();
