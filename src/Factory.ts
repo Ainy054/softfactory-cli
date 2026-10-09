@@ -714,11 +714,18 @@ export class Factory extends EventEmitter {
     notesFor(taskId: string): string[] {
         return this.runNotes.filter(n => n.taskId !== taskId).slice(-8).map(n => `From ${n.taskId} earlier in this run: ${n.note}`);
     }
-    recordUsage(usage: { inputTokens: number; outputTokens: number }) {
+    recordUsage(usage: { inputTokens: number; outputTokens: number }, model?: string) {
         if (!this.state) return;
         this.state.usage = this.state.usage || { input_tokens: 0, output_tokens: 0 };
         this.state.usage.input_tokens += usage.inputTokens || 0;
         this.state.usage.output_tokens += usage.outputTokens || 0;
+        if (model) {
+            this.state.usage_by_model = this.state.usage_by_model || {};
+            const forModel = this.state.usage_by_model[model] || { input: 0, output: 0 };
+            forModel.input += usage.inputTokens || 0;
+            forModel.output += usage.outputTokens || 0;
+            this.state.usage_by_model[model] = forModel;
+        }
     }
     /** Estimates this plan's tokens from past runs. An explicit --max-tokens replaces the estimate. */
     async planTokenBudget() {
@@ -1114,7 +1121,7 @@ export class Factory extends EventEmitter {
                     diagnosticsDir: path.join(this.baseDir, '.softfactory'),
                     sandbox: this.sandbox,
                     signal: attempt.signal,
-                    onUsage: usage => this.recordUsage(usage),
+                    onUsage: usage => this.recordUsage(usage, model),
                     onPrompt: (prompt: string) => {
                         this.pendingPromptSaves.push(this.savePrompt(task, prompt).catch(() => undefined));
                     },
@@ -2576,11 +2583,12 @@ export class Factory extends EventEmitter {
      * never a pass dressed up as one.
      */
     async uatGate(): Promise<UatResult | undefined> {
-        if (this.skipUat) { this.log('UAT: skipped (--no-uat).'); return undefined; }
+        if (this.skipUat) { this.state.uat_result = 'skipped'; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
         let config;
         try { config = await loadUat(this.baseDir); }
         catch (error: any) {
             this.log(`UAT FAILED: ${error.message}`);
+            this.state.uat_result = 'failed';
             this.state.status = 'failed';
             await this.saveState();
             await this.updateHistory('failed');
@@ -2592,7 +2600,9 @@ export class Factory extends EventEmitter {
             .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
             .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
         if (!config && !liveChecks.length) {
+            this.state.uat_result = 'none';
             this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
+            await this.saveState();
             return undefined;
         }
         config = config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks });
@@ -2604,6 +2614,8 @@ export class Factory extends EventEmitter {
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
         });
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
+        this.state.uat_result = result.passed ? 'passed' : 'failed';
+        await this.saveState();
         await this.journal()?.append('uat:result', { passed: result.passed, steps: result.steps.map(s => ({ name: s.name, passed: s.passed })) }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
         if (!result.passed) {
             const blamed = result.steps.filter(step => !step.passed && / live check$/.test(step.name.replace(/^probe: /, ''))).map(step => step.name.replace(/^probe: /, '').replace(/ live check$/, ''));
