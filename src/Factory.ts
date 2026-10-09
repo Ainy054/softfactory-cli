@@ -1052,6 +1052,13 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'verification_sabotage', sabotage);
                 return null;
             }
+            const reformatted = await Factory.reformatViolation(earlyDiff, worktreePath);
+            if (reformatted) {
+                this.log(`REJECTED: ${task.id} — ${reformatted.split('\n')[0]}`);
+                processFailure(reformatted);
+                await this.recordAttempt(task, 'unrelated_reformat', reformatted);
+                return null;
+            }
             const verifierResult = await this.taskVerifier.verify(worktreePath, task, task.agent_role === 'builder');
             // "Passing" is the wrong question for an already-red project. Ask
             // instead whether this change made it worse: three merges here took
@@ -1410,6 +1417,33 @@ export class Factory extends EventEmitter {
             inspection: 'blind-review',
         };
     }
+    /**
+     * A diff that reformats code it did not need to change. In dogfood issue
+     * #4 a worker rewrote all of Factory.ts in another style (2,126 lines
+     * became 3,552) to add a few dozen, and both reviewers passed it: nobody
+     * can review a change buried that deep. A file fails when at least 80 of
+     * its deleted lines still exist in the new version once whitespace,
+     * quote style and trailing commas are ignored, and they are most of what
+     * it deleted.
+     */
+    static async reformatViolation(diff: string, worktreePath: string, minLines = 80, share = 0.6): Promise<string | null> {
+        const normalize = (text: string) => text.replace(/\s+/g, '').replace(/["`]/g, "'").replace(/,(?=[)\]}])/g, '').replace(/;/g, '');
+        const offenders: string[] = [];
+        for (const section of diff.split(/^(?=diff --git )/m)) {
+            const header = section.match(/^diff --git a\/(\S+) b\/(\S+)/);
+            if (!header || /^new file mode/m.test(section) || /^deleted file mode/m.test(section)) continue;
+            const deleted = section.split('\n').filter(line => line.startsWith('-') && !line.startsWith('---')).map(line => normalize(line.slice(1))).filter(line => line.length >= 8);
+            if (deleted.length < minLines) continue;
+            let current: string;
+            try { current = normalize(await fs.readFile(path.join(worktreePath, header[2]), 'utf8')); } catch { continue; }
+            const survived = deleted.filter(line => current.includes(line)).length;
+            if (survived >= minLines && survived / deleted.length >= share) offenders.push(`${header[2]} (${survived} of ${deleted.length} deleted lines are unchanged code, only reformatted)`);
+        }
+        return offenders.length
+            ? `The diff reformats code it did not need to change: ${offenders.join('; ')}. Revert the formatting and change only the lines the task needs, in the file's existing style; a reviewer cannot check a change buried in a reformat.`
+            : null;
+    }
+
     detectVerificationSabotage(diff: string): string | null {
         // Only a package.json hunk can remove the test script. Matched against
         // the whole diff, any JSON fixture or config that dropped a "test" key

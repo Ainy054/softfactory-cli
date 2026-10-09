@@ -199,3 +199,28 @@ describe('an acceptance command that times out at planning rejects the plan', ()
     assert.equal(result.unrunnable, false);
   });
 });
+
+describe('a diff that reformats code it did not need to change is rejected', () => {
+  const original = Array.from({ length: 120 }, (_, i) => `export function f${i}(a: number, b: number) { return a + b + ${i}; }`).join('\n') + '\n';
+  const reformatted = Array.from({ length: 120 }, (_, i) => `export function f${i}(\n  a: number,\n  b: number,\n) {\n  return a + b + ${i};\n}`).join('\n') + '\n';
+
+  async function diffOf(after: string) {
+    const { dir, git } = await repo({ 'lib.ts': original });
+    await fs.writeFile(path.join(dir, 'lib.ts'), after);
+    const { stdout } = await git('diff', 'HEAD');
+    return { dir, diff: stdout };
+  }
+
+  it('flags a whole-file reformat with a small real change inside it', async () => {
+    const { dir, diff } = await diffOf(reformatted.replace('return a + b + 7;', 'return a * b + 7;'));
+    const message = await Factory.reformatViolation(diff, dir);
+    assert.match(message!, /reformats code it did not need to change: lib\.ts \(1(19|20) of 120 deleted lines are unchanged code/);
+  });
+
+  it('leaves a real rewrite and a small edit alone', async () => {
+    const rewrite = await diffOf(Array.from({ length: 120 }, (_, i) => `export const g${i} = (x: string) => x.repeat(${i});`).join('\n') + '\n');
+    assert.equal(await Factory.reformatViolation(rewrite.diff, rewrite.dir), null);
+    const small = await diffOf(original.replace('return a + b + 7;', 'return a * b + 7;'));
+    assert.equal(await Factory.reformatViolation(small.diff, small.dir), null);
+  });
+});
