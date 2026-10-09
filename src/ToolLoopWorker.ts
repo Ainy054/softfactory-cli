@@ -224,6 +224,7 @@ ${projectContext}
               items: { type: 'object', properties: { text: { type: 'string' }, source: { type: 'string' } }, required: ['text', 'source'] },
             },
             not_done: { type: 'array', items: { type: 'string' }, description: 'anything in the task you did not finish, one item each; leave empty when everything is done' },
+            follow_ups: { type: 'array', items: { type: 'string' }, description: 'gaps noticed outside this task, one per item' },
           },
           required: ['summary', 'test_summary', 'status'],
         },
@@ -453,7 +454,8 @@ ${projectContext}
                 handoffResult = { task_id: task.id, status: 'success', summary: args.summary, test_summary: verification.testSummary, files_changed: Array.from(changedFiles),
                   review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined,
                   claims: ToolLoopWorker.claimsFrom(args.claims),
-                  not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined };
+                  not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined,
+                  follow_ups: Array.isArray(args.follow_ups) ? args.follow_ups.map(String) : undefined };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {
