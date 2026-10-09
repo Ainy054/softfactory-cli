@@ -107,6 +107,8 @@ The JSON must follow this exact schema:
 A claim whose cited line does not exist rejects the task.
 `;
 
+    options.onPrompt?.(prompt);
+
     const args = [
       '--model', selectedModel,
       '--dangerously-skip-permissions',
