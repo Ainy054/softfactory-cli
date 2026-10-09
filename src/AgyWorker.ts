@@ -5,6 +5,17 @@ import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, requirementSection, acceptanceLine } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
+/** The shared brief, spec, out-of-scope and notes block every worker prompt carries, when present. */
+function briefSection(task: Task, brief?: string): string {
+  let section = '';
+  const shared = brief?.trim();
+  if (shared) section += `\nRUN BRIEF (shared by every task in this run):\n${shared}\n`;
+  if (task.spec) section += `\nSpec: ${task.spec}\n`;
+  if (task.out_of_scope?.length) section += `\nOut of scope (do not touch):\n${task.out_of_scope.map(o => `- ${o}`).join('\n')}\n`;
+  if (task.notes_to_executor?.length) section += `\nNotes from the planner:\n${task.notes_to_executor.map(n => `- ${n}`).join('\n')}\n`;
+  return section;
+}
+
 export class AgyWorker implements IWorker {
   id = 'agy-cloud';
   name = 'Antigravity Cloud Worker';
@@ -72,6 +83,7 @@ ${memoryPatterns.map(p => `- ${p}`).join('\n')}
     }
 
     prompt += requirementSection(requirement);
+    prompt += briefSection(task, options.brief);
 
     prompt += `
 ADVICE & INSTRUCTIONS:

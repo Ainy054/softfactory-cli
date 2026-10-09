@@ -8,6 +8,17 @@ import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
 export type CliAgentId = 'claude-code' | 'gemini-cli' | 'muse';
 
+/** The shared brief, spec, out-of-scope and notes block every worker prompt carries, when present. */
+function briefSection(task: Task, brief?: string): string {
+  let section = '';
+  const shared = brief?.trim();
+  if (shared) section += `\nRUN BRIEF (shared by every task in this run):\n${shared}\n`;
+  if (task.spec) section += `\nSpec: ${task.spec}\n`;
+  if (task.out_of_scope?.length) section += `\nOut of scope (do not touch):\n${task.out_of_scope.map(o => `- ${o}`).join('\n')}\n`;
+  if (task.notes_to_executor?.length) section += `\nNotes from the planner:\n${task.notes_to_executor.map(n => `- ${n}`).join('\n')}\n`;
+  return section;
+}
+
 /** Where the agent runs decides how much it may do on its own. */
 export type Placement = 'host' | 'container';
 
@@ -227,6 +238,7 @@ ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 ${options.projectContext ? `Project context:\n${options.projectContext}` : ''}
 ${requirementSection(options.requirement)}
+${briefSection(task, options.brief)}
 ${options.retryBrief || ''}
 Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status ("success" or "failure"), files_changed (relative paths), summary, claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;
   }
