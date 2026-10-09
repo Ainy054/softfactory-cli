@@ -25,7 +25,7 @@ import { SOFTFACTORY_VERSION } from './version.js';
 import type { Handoff } from './types.js';
 import type { RunMetrics } from './Metrics.js';
 import { ProtectedPaths } from './ProtectedPaths.js';
-import { appendRunMetrics, computeRunMetrics, readRecentMetrics, recurringFailures } from './Metrics.js';
+import { appendRunMetrics, computeRunMetrics, measureCoverage, readRecentMetrics, recurringFailures, type CoverageMetrics, type CoverageRunner } from './Metrics.js';
 import { estimateTokens, overEstimate } from './TokenEstimate.js';
 import { commitRecordsEnabled, writeRunRecords, RECORDS_DIR } from './RunRecords.js';
 import { redactSecrets } from './redact.js';
@@ -72,6 +72,11 @@ export interface FactoryOptions {
     approvePlan?: PlanApprover;
     /** Asks a person whether to run past the planned token budget; unset means unattended. */
     confirmOverBudget?: (message: string) => Promise<boolean>;
+    /**
+     * How the project's coverageCommand runs. Injectable so a run's coverage
+     * baseline/after can be measured without spawning a real shell.
+     */
+    coverageRunner?: CoverageRunner;
 }
 
 export class Factory extends EventEmitter {
@@ -108,6 +113,12 @@ export class Factory extends EventEmitter {
     /** The orchestrator's GitHub access for --issue and --pr; tests inject a fake. */
     github: GitHub;
     lastMetrics: RunMetrics | undefined;
+    /** The project's coverageCommand from .softfactory/config.json, when it names one. */
+    coverageCommand: string | undefined;
+    /** Coverage measured on the base before the build, paired with HEAD after it. */
+    coverageBefore: number | undefined;
+    /** Runs coverageCommand; the default shells out, tests inject a fake. */
+    coverageRunner: CoverageRunner;
     private prFinalized = false;
     private journals = new Map<string, RunJournal>();
     /** In-flight prompt-file writes, settled before a task moves on. */
@@ -151,6 +162,10 @@ export class Factory extends EventEmitter {
         this.prMode = prMode;
         this.issue = issue;
         this.github = new GitHub(baseDir);
+        this.coverageRunner = options.coverageRunner ?? (async (command, cwd) => {
+            const result = await execa(command, { shell: true, cwd, reject: false });
+            return { stdout: result.stdout, exitCode: result.exitCode };
+        });
         this.attemptTimeoutMs = Math.max(1, attemptTimeoutMinutes) * 60_000;
         this.runBudgetMs = runBudgetMinutes ? Math.max(1, runBudgetMinutes) * 60_000 : undefined;
         this.maxTokens = maxTokens && maxTokens > 0 ? Math.floor(maxTokens) : undefined;
@@ -324,6 +339,7 @@ export class Factory extends EventEmitter {
         this.state.tasks = newTasks;
         this.state.status = 'active';
         this.buildStartCommit = await this.getCurrentCommit();
+        await this.captureCoverageBaseline();
         await this.saveState();
         await this.updateHistory('active');
         this.emitEvent({ type: 'state:update', state: this.state });
@@ -349,6 +365,7 @@ export class Factory extends EventEmitter {
             return;
         }
         this.buildStartCommit = await this.getCurrentCommit();
+        await this.captureCoverageBaseline();
         await this.validateDoneTasks();
         if (this.state.status === 'planned') {
             this.log(`Executing planned feature: ${this.state.feature}`);
@@ -645,6 +662,7 @@ export class Factory extends EventEmitter {
         }
         this.log(`Starting build for: ${requirement}`);
         this.buildStartCommit = await this.getCurrentCommit();
+        await this.captureCoverageBaseline();
         const codebaseContext = await this.getRepoContext(requirement);
         const repositoryFiles = new Set(await this.getRepositoryFiles());
         const memoryPatterns = await this.getMemoryPatterns();
@@ -714,11 +732,18 @@ export class Factory extends EventEmitter {
     notesFor(taskId: string): string[] {
         return this.runNotes.filter(n => n.taskId !== taskId).slice(-8).map(n => `From ${n.taskId} earlier in this run: ${n.note}`);
     }
-    recordUsage(usage: { inputTokens: number; outputTokens: number }) {
+    recordUsage(usage: { inputTokens: number; outputTokens: number }, model?: string) {
         if (!this.state) return;
         this.state.usage = this.state.usage || { input_tokens: 0, output_tokens: 0 };
         this.state.usage.input_tokens += usage.inputTokens || 0;
         this.state.usage.output_tokens += usage.outputTokens || 0;
+        if (model) {
+            this.state.usage_by_model = this.state.usage_by_model || {};
+            const forModel = this.state.usage_by_model[model] || { input: 0, output: 0 };
+            forModel.input += usage.inputTokens || 0;
+            forModel.output += usage.outputTokens || 0;
+            this.state.usage_by_model[model] = forModel;
+        }
     }
     /** Estimates this plan's tokens from past runs. An explicit --max-tokens replaces the estimate. */
     async planTokenBudget() {
@@ -1114,7 +1139,7 @@ export class Factory extends EventEmitter {
                     diagnosticsDir: path.join(this.baseDir, '.softfactory'),
                     sandbox: this.sandbox,
                     signal: attempt.signal,
-                    onUsage: usage => this.recordUsage(usage),
+                    onUsage: usage => this.recordUsage(usage, model),
                     onPrompt: (prompt: string) => {
                         this.pendingPromptSaves.push(this.savePrompt(task, prompt).catch(() => undefined));
                     },
@@ -2015,9 +2040,42 @@ export class Factory extends EventEmitter {
         }
     }
 
+    /** The project's coverageCommand from .softfactory/config.json, when it names a non-empty one. */
+    async loadCoverageCommand(): Promise<string | undefined> {
+        try {
+            const config = JSON.parse(await fs.readFile(path.join(this.baseDir, '.softfactory', 'config.json'), 'utf8'));
+            const command = config?.coverageCommand;
+            return typeof command === 'string' && command.trim() ? command : undefined;
+        } catch { return undefined; }
+    }
+
+    /**
+     * Measures the configured coverage command on the base before any task
+     * runs, so the end of the run can pair it with the same measurement on
+     * HEAD. A command that fails, or whose output has no percentage, leaves
+     * the coverage field out rather than recording a made-up number.
+     */
+    async captureCoverageBaseline(): Promise<void> {
+        this.coverageCommand = await this.loadCoverageCommand();
+        if (!this.coverageCommand) return;
+        this.coverageBefore = await measureCoverage(this.baseDir, this.coverageCommand, this.coverageRunner);
+        if (this.coverageBefore === undefined) this.log(`Coverage: "${this.coverageCommand}" produced no percentage on the base.`);
+        else this.log(`Coverage before: ${this.coverageBefore}% (${this.coverageCommand}).`);
+    }
+
+    /** Coverage on HEAD after the build, only when a usable base measurement exists. */
+    private async measuredCoverage(): Promise<CoverageMetrics | undefined> {
+        if (!this.coverageCommand || this.coverageBefore === undefined) return undefined;
+        const after = await measureCoverage(this.baseDir, this.coverageCommand, this.coverageRunner);
+        if (after === undefined) return undefined;
+        this.log(`Coverage after: ${after}% (before ${this.coverageBefore}%).`);
+        return { before: this.coverageBefore, after };
+    }
+
     private async writeRunMetrics() {
         try {
-            const metrics = await computeRunMetrics(this.baseDir, this.state);
+            const coverage = await this.measuredCoverage();
+            const metrics = await computeRunMetrics(this.baseDir, this.state, coverage);
             this.lastMetrics = metrics;
             await appendRunMetrics(this.baseDir, metrics);
             await this.journal()?.append('run:complete', { status: this.state.status, metrics: metrics as unknown as Record<string, unknown> }).catch(() => undefined);
@@ -2588,11 +2646,12 @@ export class Factory extends EventEmitter {
      * never a pass dressed up as one.
      */
     async uatGate(): Promise<UatResult | undefined> {
-        if (this.skipUat) { this.log('UAT: skipped (--no-uat).'); return undefined; }
+        if (this.skipUat) { this.state.uat_result = 'skipped'; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
         let config;
         try { config = await loadUat(this.baseDir); }
         catch (error: any) {
             this.log(`UAT FAILED: ${error.message}`);
+            this.state.uat_result = 'failed';
             this.state.status = 'failed';
             await this.saveState();
             await this.updateHistory('failed');
@@ -2604,7 +2663,9 @@ export class Factory extends EventEmitter {
             .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
             .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
         if (!config && !liveChecks.length) {
+            this.state.uat_result = 'none';
             this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
+            await this.saveState();
             return undefined;
         }
         config = config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks });
@@ -2616,6 +2677,8 @@ export class Factory extends EventEmitter {
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
         });
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
+        this.state.uat_result = result.passed ? 'passed' : 'failed';
+        await this.saveState();
         await this.journal()?.append('uat:result', { passed: result.passed, steps: result.steps.map(s => ({ name: s.name, passed: s.passed })) }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
         if (!result.passed) {
             const blamed = result.steps.filter(step => !step.passed && / live check$/.test(step.name.replace(/^probe: /, ''))).map(step => step.name.replace(/^probe: /, '').replace(/ live check$/, ''));
