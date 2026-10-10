@@ -7,7 +7,7 @@ import { readPin, writePin } from './VersionPin.js';
  * `softfactory --init`: starter files for the project-owned inputs, as
  * Softhouse ships templates/. Nothing is overwritten. The UAT definition is
  * written as an example because a real uat.json is a gate: an unedited one
- * would fail every run.
+ * would fail every run. environment.json is an example for the same reason.
  */
 const TEMPLATES: Record<string, string> = {
   'worker-context.md': `# Worker context
@@ -35,6 +35,16 @@ conventions and traps a newcomer would get wrong, not documentation.
     ],
     teardown: ['docker compose down'],
     timeout_seconds: 600,
+  }, null, 2)}
+`,
+  'environment.example.json': `${JSON.stringify({
+    live: 'production runs at https://app.example.com from the docker compose project "app"; this host is dev',
+    test_stack: { up: 'docker compose -p sf-test up -d --build', down: 'docker compose -p sf-test down -v' },
+    test_env: { name: 'TEST', deploy: './scripts/deploy.sh test', url: 'https://test.example.com' },
+    production: { deploy: './scripts/deploy.sh prod' },
+    health: ['http://localhost:8080/health'],
+    routes: [{ files: ['src/routes/users/**'], url: 'http://localhost:8080/api/users' }],
+    orchestrator_files: ['docker-compose.yml', 'src/routes/index.ts'],
   }, null, 2)}
 `,
   'protected-paths.txt': `# Globs whose diffs get the blind frontier review and never the light tier.

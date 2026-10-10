@@ -190,6 +190,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | `lessons.json`, `FACTORY_MEMORY.md` | Lessons fed back into planning. A lesson is kept only with the check that enforces it, at most three per run and forty active (the least used retire). The memory file stays under 150 lines; older sections move to `FACTORY_MEMORY.archive.md` |
 | `handoff-index.tsv` | One row per merged task (title, files, acceptance command, summary); the planner gets the rows most like a new requirement |
 | `worker-context.md` | Yours to write, at most 200 lines: the conventions and traps every worker reads first |
+| `environment.json` | Yours to write: where the live system is, the isolated test stack, the TEST environment and its deploy, the production deploy, health URLs, which files serve which routes, and files only the orchestrator edits (see `--init`). The live-system safety of 6.0 reads it |
 | `uat.json` | Yours to write: build, artifacts with markers, setup, probes, teardown (see `--init`) |
 | `evidence/<feature>/uat.log` | The live verification transcript, ending `RESULT: PASS` or `FAIL` |
 | `training-*.jsonl` | Sanitized verified trajectories and failure lessons (opt out with the env var) |

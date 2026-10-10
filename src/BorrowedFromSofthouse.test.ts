@@ -1,4 +1,5 @@
 import { describe, it } from 'node:test';
+import { EnvironmentSchema } from './Environment.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -169,9 +170,10 @@ describe('3. the worker-context digest', () => {
     await fs.mkdir(path.join(dir, '.softfactory'));
     await fs.writeFile(path.join(dir, '.softfactory', 'worker-context.md'), 'mine');
     const results = await initProject(dir);
-    assert.deepEqual(results.map(r => [r.file, r.written]), [['.softfactory/worker-context.md', false], ['.softfactory/uat.example.json', true], ['.softfactory/protected-paths.txt', true]]);
+    assert.deepEqual(results.map(r => [r.file, r.written]), [['.softfactory/worker-context.md', false], ['.softfactory/uat.example.json', true], ['.softfactory/environment.example.json', true], ['.softfactory/protected-paths.txt', true]]);
     assert.equal(await fs.readFile(path.join(dir, '.softfactory', 'worker-context.md'), 'utf8'), 'mine');
     UatSchema.parse(JSON.parse(await fs.readFile(path.join(dir, '.softfactory', 'uat.example.json'), 'utf8')));
+    EnvironmentSchema.parse(JSON.parse(await fs.readFile(path.join(dir, '.softfactory', 'environment.example.json'), 'utf8')));
   });
 });
 
