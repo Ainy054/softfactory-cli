@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager, SharedCheckoutManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
-import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand, safetyPreamble, roleSection, MOCKUP_DIR } from './IWorker.js';
+import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand, safetyPreamble, roleSection, MOCKUP_DIR, CX_CHECKLIST } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
@@ -1288,6 +1288,20 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'reported_not_done', notDone);
                 return null;
             }
+            // A CX reviewer's verdict is a score that gates too: every one of
+            // the ten checklist items is scored or justified N/A and at least
+            // 70% of the applicable items pass. Checked after the commit so a
+            // retry continues from this attempt's work.
+            const cxProblem = cxScoreProblem(task, handoff);
+            if (cxProblem) {
+                this.log(`REJECTED: ${task.id} — cx_score`);
+                processFailure(cxProblem);
+                await this.recordAttempt(task, 'cx_score', cxProblem);
+                return null;
+            }
+            if (task.agent_role === 'cx_reviewer' && handoff.cx_score) {
+                task.cx_score = cxScorePercentage(handoff.cx_score);
+            }
             // Every worker affirms it left the live stack alone. The affirmation
             // is only required when the project declares a live system in
             // environment.json; a project without one owes no such promise.
@@ -2063,13 +2077,20 @@ export class Factory extends EventEmitter {
         return parsed;
     }
 
-    /** Marks protected tasks; every new or replaced task passes through here. */
+    /** Marks protected tasks and gives UI coders the CX checklist; every new or replaced task passes through here. */
     annotateTasks(tasks: Task[]): Task[] {
         for (const task of tasks) {
             const hits = this.protectedPaths.touched([...task.files_hint, ...task.creates_files]);
             if (hits.length > 0 && !task.protected) {
                 task.protected = true;
                 this.log(`PROTECTED: ${task.id} touches ${[...new Set(hits.map(h => h.file))].join(', ')}`);
+            }
+            // A UI coder builds the states and accessibility the CX reviewer
+            // later scores, so its note carries the checklist. Exactly once.
+            if (task.executor === 'agent' && task.agent_role === 'coder'
+                && !task.notes_to_executor?.some(note => note.startsWith(CX_CHECKLIST_NOTE_PREFIX))
+                && [...task.files_hint, ...task.creates_files].some(isUiFile)) {
+                task.notes_to_executor = [...(task.notes_to_executor || []), `${CX_CHECKLIST_NOTE_PREFIX}${CX_CHECKLIST.join('; ')}`];
             }
         }
         return tasks;
@@ -3427,4 +3448,57 @@ export function testWriterScopeViolation(task: { agent_role?: string }, diff: st
     const offenders = testWriterScopeFiles(task, diff);
     if (offenders.length === 0) return null;
     return `A test_writer may only add or change test files, but this diff touches non-test files: ${offenders.join(', ')}. Revert the source changes and keep the task to tests.`;
+}
+
+/** The note UI coders get so they build what the CX reviewer will later score. */
+export const CX_CHECKLIST_NOTE_PREFIX = 'CX checklist: applicable items must pass, N/A items must be justified: ';
+
+/**
+ * True for a UI file a coder task changes: a component or style sheet, not a
+ * test, and not one of the designer's mockups under softfactory-design/.
+ */
+export function isUiFile(file: string): boolean {
+    if (file.startsWith('softfactory-design/')) return false;
+    if (isTestFilePath(file)) return false;
+    return /\.(?:tsx|jsx|vue|svelte|html|css)$/i.test(file);
+}
+
+/** The rounded pass percentage for a CX score; nothing applicable counts as 100%. */
+export function cxScorePercentage(score: NonNullable<Handoff['cx_score']>): number {
+    return score.applicable === 0 ? 100 : Math.round((score.passed / score.applicable) * 100);
+}
+
+/**
+ * A CX reviewer's verdict is a score that gates (Softhouse). For a
+ * `cx_reviewer` task it fails when the score is missing, when `passed` exceeds
+ * `applicable`, when `applicable + na.length` is not the ten checklist items,
+ * when an N/A item has no reason, or when fewer than 70% of the applicable
+ * items pass (no applicable item is allowed only when all ten are justified
+ * N/A). Every message names the problem and the 70% bar. Null otherwise.
+ */
+export function cxScoreProblem(task: { id: string; agent_role?: string }, handoff: { cx_score?: Handoff['cx_score'] }): string | null {
+    if (task.agent_role !== 'cx_reviewer') return null;
+    const score = handoff.cx_score;
+    if (!score) {
+        return `CX review ${task.id} has no cx_score: score every one of the 10 checklist items (an applicable count or an N/A with its reason) and clear the 70% bar.`;
+    }
+    const { applicable, passed } = score;
+    const na = score.na || [];
+    if (passed > applicable) {
+        return `CX review ${task.id} reports ${passed} passes out of ${applicable} applicable items, more passes than items: fix the counts and clear the 70% bar.`;
+    }
+    if (applicable + na.length !== 10) {
+        return `CX review ${task.id} accounts for ${applicable + na.length} of the 10 checklist items (${applicable} applicable + ${na.length} N/A): score every item or mark it N/A, and clear the 70% bar.`;
+    }
+    const unjustified = na.find(item => !item.why?.trim());
+    if (unjustified) {
+        return `CX review ${task.id} marks "${unjustified.item}" N/A without a reason: justify every N/A item to clear the 70% bar.`;
+    }
+    // Zero applicable items is allowed only when all ten are justified N/A,
+    // which the count check above has already established.
+    if (applicable === 0) return null;
+    if (passed / applicable < 0.7) {
+        return `CX review ${task.id} passes ${passed} of ${applicable} applicable items (${Math.round((passed / applicable) * 100)}%), below the 70% bar: fix the failures or justify them N/A.`;
+    }
+    return null;
 }
