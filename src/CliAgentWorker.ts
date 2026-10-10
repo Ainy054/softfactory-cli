@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine, briefSection } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine, briefSection, wiringSection } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -228,8 +228,9 @@ ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryP
 ${options.projectContext ? `Project context:\n${options.projectContext}` : ''}
 ${requirementSection(options.requirement)}
 ${briefSection(task, options.brief)}
+${wiringSection(options.orchestratorFiles)}
 ${options.retryBrief || ''}
-Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status ("success" or "failure"), files_changed (relative paths), summary, claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;
+Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status ("success" or "failure"), files_changed (relative paths), summary, wiring_patch (only for orchestrator-owned files), claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;
   }
 
   async execute(task: Task, worktreePath: string, options: WorkerOptions = {}): Promise<Handoff> {

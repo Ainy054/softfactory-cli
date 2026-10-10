@@ -25,6 +25,8 @@ export interface WorkerOptions {
    * written once so each task's description carries only its delta.
    */
   brief?: string;
+  /** Globs of files only the orchestrator edits (environment.json); changes to them travel as the handoff's wiring_patch. */
+  orchestratorFiles?: string[];
   /**
    * From the second attempt: exact signatures of the task's files and what
    * not to do again. Softhouse: a retry is a different prompt, not only a
@@ -80,6 +82,17 @@ export function briefSection(task: Pick<Task, 'spec' | 'out_of_scope' | 'notes_t
   if (task.out_of_scope?.length) section += `\nOut of scope (do not touch):\n${task.out_of_scope.map(o => `- ${o}`).join('\n')}\n`;
   if (task.notes_to_executor?.length) section += `\nNotes from the planner:\n${task.notes_to_executor.map(n => `- ${n}`).join('\n')}\n`;
   return section;
+}
+
+/**
+ * Wire before review, borrowed from Softhouse: bootstrap, route registration
+ * and compose files belong to the orchestrator. A worker that needs a change
+ * there sends it as a unified diff, which is applied on its branch and built
+ * before review.
+ */
+export function wiringSection(files: string[] | undefined): string {
+  if (!files?.length) return '';
+  return `\nORCHESTRATOR-OWNED FILES (never edit these; put the exact change in the handoff's wiring_patch as one unified diff, paths relative to the repository root, --- a/<path> and +++ b/<path>; it is applied on your branch before review):\n${files.map(f => `- ${f}`).join('\n')}\n`;
 }
 
 /** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */

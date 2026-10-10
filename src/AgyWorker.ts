@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection, wiringSection } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
 export class AgyWorker implements IWorker {
@@ -73,6 +73,7 @@ ${memoryPatterns.map(p => `- ${p}`).join('\n')}
 
     prompt += requirementSection(requirement);
     prompt += briefSection(task, options.brief);
+    prompt += wiringSection(options.orchestratorFiles);
 
     prompt += `
 ADVICE & INSTRUCTIONS:

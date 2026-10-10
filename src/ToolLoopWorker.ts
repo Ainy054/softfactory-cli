@@ -2,8 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { Task, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError, briefSection, isEnvironmentFailure } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, isDeferredAcceptance, WorkerEnvironmentError, briefSection, isEnvironmentFailure, wiringSection } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
+import { ProtectedPaths } from './ProtectedPaths.js';
 import { AutoHeal } from './AutoHeal.js';
 import { assertAllowedCommand, parseCommand, runSafeCommand, splitPipeline, type CommandScope } from './commandPolicy.js';
 import type { SandboxManager } from './Sandbox.js';
@@ -93,7 +94,7 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string): string {
+  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string, orchestratorFiles?: string[]): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
     if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
     if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
@@ -120,6 +121,7 @@ ${projectContext}
     }
     userPrompt += requirementSection(requirement);
     userPrompt += briefSection(task, brief);
+    userPrompt += wiringSection(orchestratorFiles);
     if (retryBrief) userPrompt += `\n${retryBrief}\n`;
     return userPrompt;
   }
@@ -224,6 +226,7 @@ ${projectContext}
               items: { type: 'object', properties: { text: { type: 'string' }, source: { type: 'string' } }, required: ['text', 'source'] },
             },
             not_done: { type: 'array', items: { type: 'string' }, description: 'anything in the task you did not finish, one item each; leave empty when everything is done' },
+            wiring_patch: { type: 'string', description: 'changes to orchestrator-owned files only, as one unified diff with paths relative to the repository root; leave empty when there are none' },
             follow_ups: { type: 'array', items: { type: 'string' }, description: 'gaps noticed outside this task, one per item' },
           },
           required: ['summary', 'test_summary', 'status'],
@@ -241,7 +244,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
-      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief, options?.orchestratorFiles) },
     ];
     // Emit the exact prompt the model will receive, once per attempt, before
     // any transport work. The orchestrator saves it so a retry can be compared
@@ -383,7 +386,7 @@ ${projectContext}
               toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).map((line, i) => `${start + i} | ${line}`).join('\n')}`.slice(0, this.maxFileRead);
             } else if (name === 'replace_lines') {
               onOutput(`[${this.label}] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
-              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true, options?.orchestratorFiles);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
               const lines = content.split(/\r?\n/);
@@ -396,14 +399,14 @@ ${projectContext}
               toolResult = await this.writeChecked(fullPath, args.filepath, lines.join('\n'), content, changedFiles, 'Lines successfully replaced.', worktreePath);
             } else if (name === 'write_file') {
               onOutput(`[${this.label}] ✍️ Writing ${args.filepath}`);
-              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true, options?.orchestratorFiles);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               await fs.mkdir(path.dirname(fullPath), { recursive: true });
               const previous = await fs.readFile(fullPath, 'utf-8').catch(() => null);
               toolResult = await this.writeChecked(fullPath, args.filepath, String(args.content), previous, changedFiles, 'File successfully written.', worktreePath);
             } else if (name === 'replace_content') {
               onOutput(`[${this.label}] ✂️ Editing ${args.filepath}`);
-              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true);
+              const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true, options?.orchestratorFiles);
               await this.rejectSymlinkPath(worktreePath, fullPath);
               const content = await fs.readFile(fullPath, 'utf-8');
               const target = typeof args.target_content === 'string' ? args.target_content : '';
@@ -437,7 +440,7 @@ ${projectContext}
                 toolResult = this.truncateToolResult(`Command failed with exit code ${cmdErr.exitCode}.\nSTDOUT:\n${cmdErr.stdout}\nSTDERR:\n${cmdErr.stderr}`);
               }
             } else if (name === 'finish_task') {
-              const verification = await this.verifier.verify(worktreePath, task, false);
+              const verification = await this.withWiring(worktreePath, args.wiring_patch, () => this.verifier.verify(worktreePath, task, false));
               if (!verification.passed) {
                 finishRejections++;
                 lastFinishFailure = verification.testSummary;
@@ -455,7 +458,8 @@ ${projectContext}
                   review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined,
                   claims: ToolLoopWorker.claimsFrom(args.claims),
                   not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined,
-                  follow_ups: Array.isArray(args.follow_ups) ? args.follow_ups.map(String) : undefined };
+                  follow_ups: Array.isArray(args.follow_ups) ? args.follow_ups.map(String) : undefined,
+                  wiring_patch: typeof args.wiring_patch === 'string' && args.wiring_patch.trim() ? args.wiring_patch : undefined };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {
@@ -739,8 +743,26 @@ ${projectContext}
     }
   }
 
-  private resolveToolPath(worktreePath: string, rawPath: unknown, task: Task, write: boolean): string {
+  /**
+   * The orchestrator applies a wiring patch before review; the worker's own
+   * finish check must see the same wired tree, so apply it for the check and
+   * reverse it afterwards, leaving the owned files untouched in the commit.
+   */
+  private async withWiring<T>(worktreePath: string, patch: unknown, check: () => Promise<T>): Promise<T> {
+    const input = typeof patch === 'string' && patch.trim() ? `${patch.trim()}\n` : '';
+    const applied = input ? (await execa('git', ['apply', '-'], { cwd: worktreePath, input, reject: false })).exitCode === 0 : false;
+    try {
+      return await check();
+    } finally {
+      if (applied) await execa('git', ['apply', '-R', '-'], { cwd: worktreePath, input, reject: false });
+    }
+  }
+
+  private resolveToolPath(worktreePath: string, rawPath: unknown, task: Task, write: boolean, orchestratorFiles?: string[]): string {
     if (typeof rawPath !== 'string' || !rawPath || path.isAbsolute(rawPath)) throw new Error('Path must be a non-empty relative path.');
+    if (write && orchestratorFiles?.some(glob => ProtectedPaths.toRegex(glob).test(path.normalize(rawPath)))) {
+      throw new Error(`${rawPath} is orchestrator-owned: do not edit it. Put the exact change in finish_task's wiring_patch as a unified diff (--- a/${rawPath}, +++ b/${rawPath}); it is applied on your branch before review.`);
+    }
     const root = path.resolve(worktreePath);
     const target = path.resolve(root, rawPath);
     if (!target.startsWith(`${root}${path.sep}`)) throw new Error('Path escapes the task worktree.');

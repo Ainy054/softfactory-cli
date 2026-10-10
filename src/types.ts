@@ -170,6 +170,8 @@ export const HandoffSchema = z.object({
   claims: z.array(z.object({ text: z.string(), source: z.string() })).optional(),
   /** Parts of the task the worker itself reports as unfinished; a non-empty list of acceptance work rejects the task. */
   not_done: z.array(z.string()).optional(),
+  /** Changes to orchestrator-owned files, as one unified diff; applied on the branch before review. */
+  wiring_patch: z.string().optional(),
   /** gaps noticed outside this task, one per item */
   follow_ups: z.array(z.string()).optional(),
 });

@@ -17,7 +17,7 @@ import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
-import { loadEnvironment, type Environment } from './Environment.js';
+import { loadEnvironment, orchestratorOwned, type Environment } from './Environment.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
 import { appendFollowUps, openBacklog } from './Backlog.js';
 import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
@@ -873,6 +873,15 @@ export class Factory extends EventEmitter {
             this.log(`HALTED: ${branchFault}`);
             return;
         }
+        try {
+            this.environment = await loadEnvironment(this.baseDir);
+        } catch (error: any) {
+            // A malformed environment.json is a configuration fault: running
+            // without its rules would hand workers the files it protects.
+            this.environmentFault = `${error.message}. Fix it and run --resume; no task retry was consumed.`;
+            this.log(`HALTED: ${this.environmentFault}`);
+            return;
+        }
         if (!this.baseline) await this.captureBaseline();
         this.runStartedAt = Date.now();
         while (this.hasUnfinishedTasks()) {
@@ -1161,6 +1170,7 @@ export class Factory extends EventEmitter {
                     projectContext,
                     requirement: this.state?.requirement,
                     brief: this.state?.brief,
+                    orchestratorFiles: this.environment?.orchestrator_files,
                     retryBrief: task.attempts > 0 ? await this.retryBrief(task, worktreePath) : undefined,
                     memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
                     model,
@@ -1230,6 +1240,13 @@ export class Factory extends EventEmitter {
                 this.log(`REJECTED: ${task.id} — ${fabricated.split('\n')[0]}`);
                 processFailure(fabricated);
                 await this.recordAttempt(task, 'fabricated_claim', fabricated);
+                return null;
+            }
+            const wiringProblem = await this.applyWiring(task, handoff, worktreePath);
+            if (wiringProblem) {
+                this.log(`REJECTED: ${task.id} — ${wiringProblem.feedback.split('\n')[0]}`);
+                processFailure(wiringProblem.feedback);
+                await this.recordAttempt(task, wiringProblem.category, wiringProblem.feedback);
                 return null;
             }
             if (handoff.status === 'failure') {
@@ -2847,6 +2864,40 @@ export class Factory extends EventEmitter {
         await this.recordAttempt(task, 'uat_mid_wave', feedback);
         this.emitEvent({ type: 'task:fail', task, feedback });
         this.log(`Mid-wave UAT FAIL after ${task.id}: ${revert.exitCode === 0 ? 'its merge was reverted' : 'its merge could not be reverted cleanly'}; the rest of the phase merges without it.`);
+    }
+
+    /** environment.json, loaded once per invocation of the workshop loop. */
+    environment: Environment | undefined;
+
+    /**
+     * Wire before review, borrowed from Softhouse. Orchestrator-owned files
+     * (environment.json) are never edited by a worker; its handoff carries
+     * the change as wiring_patch, which is applied on the task's branch and
+     * committed there, so verification, acceptance and review all see the
+     * wired result. Null when the branch may continue to the gates.
+     */
+    async applyWiring(task: Task, handoff: Handoff, worktreePath: string): Promise<{ category: string; feedback: string } | null> {
+        if (!this.environment?.orchestrator_files.length) return null;
+        const { stdout } = await execa('git', ['diff', '--name-only', `${this.mergeTarget()}...HEAD`], { cwd: worktreePath });
+        const edited = orchestratorOwned(this.environment, stdout.split('\n').filter(Boolean));
+        if (edited.length) {
+            return { category: 'orchestrator_file_edited', feedback: `${edited.join(', ')} ${edited.length === 1 ? 'is' : 'are'} orchestrator-owned: undo your edits there and put the exact change in the handoff's wiring_patch as one unified diff.` };
+        }
+        const patch = handoff.wiring_patch?.trim();
+        if (!patch) return null;
+        const targets = [...new Set([...patch.matchAll(/^(?:\+\+\+|---) (?:[ab]\/)?(\S+)/gm)].map(m => m[1]).filter(f => f !== '/dev/null'))];
+        if (!targets.length) return { category: 'wiring_patch_invalid', feedback: 'wiring_patch is not a unified diff: it needs --- a/<path> and +++ b/<path> headers and @@ hunks.' };
+        const outside = targets.filter(file => !orchestratorOwned(this.environment, [file]).length);
+        if (outside.length) return { category: 'wiring_patch_invalid', feedback: `wiring_patch may change only orchestrator-owned files; it also changes ${outside.join(', ')}. Edit those directly.` };
+        const input = `${patch}\n`;
+        const check = await execa('git', ['apply', '--check', '-'], { cwd: worktreePath, input, reject: false });
+        if (check.exitCode !== 0) return { category: 'wiring_patch_failed', feedback: `The wiring patch does not apply: ${(check.stderr || check.stdout).trim().split('\n').slice(0, 4).join(' ')}` };
+        await execa('git', ['apply', '-'], { cwd: worktreePath, input });
+        await execa('git', ['add', '-A', '--', ...targets], { cwd: worktreePath });
+        await execa('git', ['commit', '-q', '-m', `softfactory: orchestrator wiring for ${task.id}`], { cwd: worktreePath });
+        await this.journal()?.append('task:wired', { task_id: task.id, files: targets }).catch(() => undefined);
+        this.log(`WIRED: ${task.id} — applied its wiring patch for ${targets.join(', ')} on the branch before review.`);
+        return null;
     }
 
     /** Tasks whose merge was reverted this phase; their branch is dropped, not reused. */
