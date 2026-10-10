@@ -54,6 +54,15 @@ export interface WorkerOptions {
  * deploy scripts, reach the live stack, or edit the orchestrator's files, and
  * each attempt must affirm that the live stack was left untouched.
  */
+/**
+ * The safety block ends by asking the worker to affirm "live stack untouched".
+ * Only a line that is exactly that phrase counts: an agent's output can echo
+ * its prompt, which contains the phrase inside the request itself.
+ */
+export function affirmsLiveStackUntouched(output: string | undefined): boolean {
+  return String(output ?? '').split('\n').some(line => /^["'`*\s]*live stack untouched[."'`*\s]*$/i.test(line));
+}
+
 export function safetyPreamble(env: Environment | undefined): string {
   const bullets: string[] = [];
   bullets.push(env
@@ -70,7 +79,7 @@ export function safetyPreamble(env: Environment | undefined): string {
   if (env?.orchestrator_files?.length) {
     bullets.push(`- Files only the orchestrator edits (never edit these; send the change as the handoff's wiring_patch): ${env.orchestrator_files.join(', ')}`);
   }
-  bullets.push(`- When you finish, affirm "live stack untouched".`);
+  bullets.push(`- When you finish, affirm "live stack untouched": set finish_task's live_stack_untouched, or end your final message with that phrase alone on its own line.`);
   return `CRITICAL SAFETY:\n${bullets.join('\n')}\n`;
 }
 

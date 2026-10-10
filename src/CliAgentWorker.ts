@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine, briefSection, wiringSection } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -311,16 +311,6 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
   }
 }
 
-/**
- * The safety block every worker prompt starts with ends by asking the worker to
- * affirm "live stack untouched"; that affirmation is the literal line, matched
- * case-insensitively after trimming each line of the final output.
- */
-export function affirmsLiveStackUntouched(output: string | undefined): boolean {
-  return String(output ?? '')
-    .split('\n')
-    .some(line => line.trim().toLowerCase().includes('live stack untouched'));
-}
 
 function summarizeInput(input: any): string {
   if (!input || typeof input !== 'object') return '';

@@ -30,7 +30,7 @@ function scriptedTransport(turns: Array<(request: ChatRequest) => ChatReply>): C
 
 const happyTurns = () => [
   () => ({ content: '', toolCalls: [call('c1', 'replace_content', { filepath: 'app.ts', target_content: "export const greet = () => 'hello';", replacement_content: "export const greet = () => 'hello';\nexport const farewell = () => 'bye';" })] }),
-  () => ({ content: '', toolCalls: [call('c2', 'finish_task', { summary: 'Added farewell()', test_summary: 'grep passes', status: 'success' })] }),
+  () => ({ content: '', toolCalls: [call('c2', 'finish_task', { summary: 'Added farewell()', test_summary: 'grep passes', status: 'success', live_stack_untouched: true })] }),
 ];
 
 const blueprint = {

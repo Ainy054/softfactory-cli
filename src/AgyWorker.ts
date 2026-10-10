@@ -2,19 +2,9 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection, wiringSection } from './IWorker.js';
+import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
-/**
- * The safety block ends by asking the worker to affirm "live stack untouched";
- * that affirmation is the literal line, matched case-insensitively after
- * trimming each line of the final output.
- */
-function affirmsLiveStackUntouched(output: string | undefined): boolean {
-  return String(output ?? '')
-    .split('\n')
-    .some(line => line.trim().toLowerCase().includes('live stack untouched'));
-}
 
 export class AgyWorker implements IWorker {
   id = 'agy-cloud';

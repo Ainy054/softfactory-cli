@@ -488,6 +488,9 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
       files_hint: [],
       creates_files: [],
       executor: 'orchestrator',
+      // Operator work, whatever the agent half was: a test writer's role or review questions do not carry over.
+      agent_role: 'coder',
+      review_questions: [],
       verification_command: undefined,
     });
     splits.set(task.id, applyId);
@@ -557,6 +560,18 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
       if (!ids.has(dependency)) errors.push(`${task.id} references missing dependency ${dependency}`);
       if (dependency === task.id) errors.push(`${task.id} depends on itself`);
     }
+  }
+
+  // A test writer reads the code it tests before its first edit, and its read
+  // allowance counts production_targets. Left empty, the allowance is the
+  // minimum and the writer is stopped mid-reading (#45's T5, three attempts).
+  // Default them to the source files of the tasks it depends on.
+  for (const task of blueprint.tasks.filter(t => t.agent_role === 'test_writer' && t.production_targets.length === 0)) {
+    const fromDeps = blueprint.tasks
+      .filter(other => [...task.dependencies, ...task.blockedBy].includes(other.id) && other.agent_role !== 'test_writer')
+      .flatMap(other => [...other.files_hint, ...other.creates_files])
+      .filter(file => !isTestFilePath(file));
+    task.production_targets = [...new Set(fromDeps)];
   }
 
   // The runtime rejects a test writer that changes source; a plan that gives

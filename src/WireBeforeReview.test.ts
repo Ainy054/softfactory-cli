@@ -55,7 +55,7 @@ async function run(finish: Record<string, unknown>, extraTurns: ToolCall[] = [])
   factory.planner = { provider: 'local', generateBlueprint: async () => blueprint, refineBlueprint: async () => blueprint };
   await factory.init();
   const toolResults: string[] = [];
-  const turns = () => [...extraTurns, call('w', 'write_file', { filepath: 'users.ts', content: 'export const users = () => [];\n' }), call('f', 'finish_task', { summary: 'users handler', test_summary: 'grep', status: 'success', ...finish })];
+  const turns = () => [...extraTurns, call('w', 'write_file', { filepath: 'users.ts', content: 'export const users = () => [];\n' }), call('f', 'finish_task', { summary: 'users handler', test_summary: 'grep', status: 'success', live_stack_untouched: true, ...finish })];
   factory.workerRegistry.preflight = async () => ({ local: true, cloud: false, localModel: 'fake', cloudModel: '' });
   factory.workerRegistry.resolveWorker = async () => ({ worker: new ToolLoopWorker(scripted(turns(), toolResults), 'fake'), model: 'fake', provider: 'scripted' });
   factory.inspector.synthesizeMemory = async () => '';

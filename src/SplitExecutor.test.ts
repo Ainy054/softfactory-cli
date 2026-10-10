@@ -98,3 +98,19 @@ describe('Split executor: downstream rewiring', () => {
     assert.ok(result.tasks.some(task => task.id === 'T1'));
   });
 });
+
+describe('review fixes for the split executor and test writers', () => {
+  it('makes the apply half plain operator work even when the agent half carried review questions', () => {
+    const result = validateBlueprint(blueprint([{ ...baseTask, review_questions: ['Where is the old token revoked?'] }]), input);
+    const apply = result.tasks.find(task => task.id === 'T1-apply')!;
+    assert.equal(apply.agent_role, 'coder');
+    assert.deepEqual(apply.review_questions, []);
+  });
+
+  it('gives a test writer without production_targets the source files of the tasks it depends on', () => {
+    const coder = { ...baseTask, executor: 'agent' as const, apply_steps: undefined, files_hint: ['src/App.tsx'] };
+    const writer = { ...coder, id: 'T2', title: 'Test the token rotation', agent_role: 'test_writer' as const, dependencies: ['T1'], phase: 2, files_hint: ['src/App.test.tsx'], creates_files: ['src/App.test.tsx'], production_targets: [], test_targets: ['src/App.test.tsx'] };
+    const result = validateBlueprint(blueprint([coder, writer]), input);
+    assert.deepEqual(result.tasks.find(task => task.id === 'T2')!.production_targets, ['src/App.tsx']);
+  });
+});
