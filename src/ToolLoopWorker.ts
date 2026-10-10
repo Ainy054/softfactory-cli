@@ -73,8 +73,9 @@ export class ToolLoopWorker implements IWorker {
     return this.transport.contextWindow(modelName);
   }
 
-  private buildSystemPrompt(task: Task, projectContext: string, projectRoots: string[] = []): string {
-    return `You are a precision autonomous software engineer working in an isolated Git worktree.
+  private buildSystemPrompt(task: Task, projectContext: string, projectRoots: string[] = [], preamble = ''): string {
+    const safety = preamble ? `${preamble}\n` : '';
+    return `${safety}You are a precision autonomous software engineer working in an isolated Git worktree.
 Your goal is to implement the requested feature or fix the bug.
 
 CRITICAL INSTRUCTIONS:
@@ -228,6 +229,7 @@ ${projectContext}
             not_done: { type: 'array', items: { type: 'string' }, description: 'anything in the task you did not finish, one item each; leave empty when everything is done' },
             wiring_patch: { type: 'string', description: 'changes to orchestrator-owned files only, as one unified diff with paths relative to the repository root; leave empty when there are none' },
             follow_ups: { type: 'array', items: { type: 'string' }, description: 'gaps noticed outside this task, one per item' },
+            live_stack_untouched: { type: 'boolean', description: 'Affirm that you left the live stack untouched: set true when you finish.' },
           },
           required: ['summary', 'test_summary', 'status'],
         },
@@ -243,7 +245,7 @@ ${projectContext}
     if (!availability.modelPresent) throw new Error(this.transport.missingModel(model, availability.installed));
 
     let messages: ChatMessage[] = [
-      { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath)) },
+      { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath), options?.preamble) },
       { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief, options?.orchestratorFiles) },
     ];
     // Emit the exact prompt the model will receive, once per attempt, before
@@ -459,7 +461,8 @@ ${projectContext}
                   claims: ToolLoopWorker.claimsFrom(args.claims),
                   not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined,
                   follow_ups: Array.isArray(args.follow_ups) ? args.follow_ups.map(String) : undefined,
-                  wiring_patch: typeof args.wiring_patch === 'string' && args.wiring_patch.trim() ? args.wiring_patch : undefined };
+                  wiring_patch: typeof args.wiring_patch === 'string' && args.wiring_patch.trim() ? args.wiring_patch : undefined,
+                  live_stack_untouched: typeof args.live_stack_untouched === 'boolean' ? args.live_stack_untouched : undefined };
                 toolResult = 'Task completed and verification passed.';
               }
             } else {
