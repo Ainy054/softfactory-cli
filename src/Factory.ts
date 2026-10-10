@@ -839,7 +839,8 @@ export class Factory extends EventEmitter {
             await this.github.pushBranch(branch);
             const base = this.state.base_branch || this.defaultBranch;
             const journal = await RunJournal.verify(this.baseDir, this.state.feature_id);
-            const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, generator: `softfactory ${SOFTFACTORY_VERSION}` });
+            const mockups = await this.changedMockups(base, branch);
+            const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, mockups, generator: `softfactory ${SOFTFACTORY_VERSION}` });
             const title = this.state.source?.kind === 'issue' ? `${this.state.feature} (#${this.state.source.number})` : this.state.feature;
             // Work held at TEST is not done until a person decides on production.
             const completed = this.state.status === 'completed' && this.state.promotion?.status !== 'pending';
@@ -860,6 +861,24 @@ export class Factory extends EventEmitter {
         } finally {
             await this.leaveIntegrationBranch();
         }
+    }
+    /**
+     * Mockups the integration branch added or changed since the base, each
+     * paired with the GitHub blob URL a person can open. Only consulted when
+     * there is at least one, so the common PR asks gh nothing extra.
+     */
+    private async changedMockups(base: string, branch: string): Promise<Array<{ file: string; url: string }>> {
+        const diff = await execa('git', ['diff', '--name-only', `${base}...${branch}`, '--', MOCKUP_DIR], { cwd: this.baseDir, reject: false });
+        if (diff.exitCode !== 0) return [];
+        const prefix = `${MOCKUP_DIR}/`;
+        const files = diff.stdout.split('\n').map(line => line.trim()).filter(line => line.startsWith(prefix) && line.endsWith('.html'));
+        if (files.length === 0) return [];
+        const repo = await this.github.repoUrl();
+        const parts = repo.replace(/\.git$/, '').replace(/[/\s]+$/, '').split('/');
+        const owner = parts[parts.length - 2];
+        const name = parts[parts.length - 1];
+        if (!owner || !name) return [];
+        return files.map(file => ({ file, url: `https://github.com/${owner}/${name}/blob/${branch}/${file}` }));
     }
     async runWorkshopLoop() {
         await this.logBackendPreflight();
