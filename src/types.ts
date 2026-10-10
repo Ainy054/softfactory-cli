@@ -174,6 +174,8 @@ export const HandoffSchema = z.object({
   wiring_patch: z.string().optional(),
   /** gaps noticed outside this task, one per item */
   follow_ups: z.array(z.string()).optional(),
+  /** The worker's affirmation that it left the live stack untouched. */
+  live_stack_untouched: z.boolean().optional(),
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;
