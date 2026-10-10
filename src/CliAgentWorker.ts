@@ -214,7 +214,9 @@ export class CliAgentWorker implements IWorker {
 
   buildPrompt(task: Task, handoffPath: string, options: WorkerOptions): string {
     const previousFeedback = task.last_feedback ? task.last_feedback.slice(0, 4000) : '';
-    return `You are a SoftFactory worker in an isolated git worktree. Implement the task directly, run the relevant tests, and do not modify files outside this worktree. Do not commit, push or change git configuration; the orchestrator commits.
+    // The safety preamble is the very first text of the prompt, before the role line.
+    const preamble = options.preamble?.trim() ? `${options.preamble.endsWith('\n') ? options.preamble : `${options.preamble}\n`}` : '';
+    return `${preamble}You are a SoftFactory worker in an isolated git worktree. Implement the task directly, run the relevant tests, and do not modify files outside this worktree. Do not commit, push or change git configuration; the orchestrator commits.
 Task ${task.id}: ${task.title}
 Role: ${task.agent_role}
 Description: ${task.description}
@@ -269,10 +271,11 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
     }
     if (parsed.denials.length) onOutput(`[${this.definition.label}] Refused by the agent's permission rules: ${parsed.denials.slice(0, 5).join('; ')}`);
 
+    const affirmed = affirmsLiveStackUntouched(parsed.text);
     try {
       const handoff = HandoffSchema.parse(JSON.parse(await fs.readFile(handoffPath, 'utf8')));
       await fs.rm(handoffPath, { force: true });
-      return { ...handoff, task_id: task.id };
+      return { ...handoff, task_id: task.id, ...(affirmed ? { live_stack_untouched: true } : {}) };
     } catch {
       const failed = parsed.isError || result.exitCode !== 0;
       return {
@@ -282,6 +285,7 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
         summary: failed
           ? `${this.definition.name} ended with an error (exit ${result.exitCode}): ${(parsed.text || result.stderr).trim().slice(0, 500)}`
           : `${this.definition.name} finished without writing a handoff. Its last message: ${parsed.text.trim().slice(0, 500)}`,
+        ...(affirmed ? { live_stack_untouched: true } : {}),
       };
     }
   }
@@ -305,6 +309,17 @@ Before finishing, write ${handoffPath} as JSON with task_id "${task.id}", status
       onOutput(`[${this.definition.label}] ${event.is_error ? '✗' : '✓'} ${String(event.result || '').trim().slice(0, 300)}`);
     }
   }
+}
+
+/**
+ * The safety block every worker prompt starts with ends by asking the worker to
+ * affirm "live stack untouched"; that affirmation is the literal line, matched
+ * case-insensitively after trimming each line of the final output.
+ */
+export function affirmsLiveStackUntouched(output: string | undefined): boolean {
+  return String(output ?? '')
+    .split('\n')
+    .some(line => line.trim().toLowerCase().includes('live stack untouched'));
 }
 
 function summarizeInput(input: any): string {
