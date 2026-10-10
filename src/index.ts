@@ -18,11 +18,11 @@ const KNOWN_FLAGS = [
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
-  '--queue', '--next', '--backlog'
+  '--queue', '--next', '--backlog', '--promote'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -191,6 +191,7 @@ async function main() {
   const noTui = args.includes('--no-tui') || queueMode || nextMode || !process.stdout.isTTY;
   const noDocker = args.includes('--no-docker');
   const markDoneId = getFlagValue(args, '--mark-done');
+  const promoteId = getFlagValue(args, '--promote');
 
   let resumeFeatureId: string | undefined;
   if (resumeMode) {
@@ -235,7 +236,7 @@ async function main() {
     issue = { number: loaded.number, url: loaded.url, title: loaded.title };
   }
 
-  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !requirement) {
+  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !promoteId && !requirement) {
     console.error(USAGE);
     process.exit(1);
   }
@@ -345,6 +346,22 @@ async function main() {
   globalFactory = factory;
   await factory.init();
 
+
+  if (promoteId) {
+    // Production for work held at TEST is a person's decision, made here.
+    const [decision, ...note] = requirement.trim().split(/\s+/);
+    if (decision !== 'now' && decision !== 'later' && decision !== 'no') {
+      console.error('Error: --promote <feature-id> needs now, later or no.');
+      process.exit(1);
+    }
+    try {
+      await factory.promote(promoteId, decision, note.join(' ') || undefined);
+    } catch (error: any) {
+      console.error(`[SoftFactory] ${error.message}`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
 
   if (markDoneId) {
     // The text after the flag is the operator's note, not a requirement.

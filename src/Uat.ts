@@ -57,11 +57,11 @@ const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
 export async function runUat(
   baseDir: string,
   config: UatConfig,
-  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner },
+  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner; env?: Record<string, string> },
 ): Promise<UatResult> {
   const shell = options.shell ?? hostShell;
   const log = options.log ?? (() => {});
-  const env = { SOFTFACTORY_RUN_ID: options.runId, SOFTFACTORY_FEATURE_ID: options.featureId };
+  const env = { ...options.env, SOFTFACTORY_RUN_ID: options.runId, SOFTFACTORY_FEATURE_ID: options.featureId };
   const timeoutMs = config.timeout_seconds * 1000;
   const steps: UatStep[] = [];
   const transcript: string[] = [];

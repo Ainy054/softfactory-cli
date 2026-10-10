@@ -18,6 +18,8 @@ export const TaskSchema = z.object({
    * "user" is a decision; both pause the run until --mark-done.
    */
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  /** "test": user-facing, money-moving or outward-facing work stops at the TEST environment until a person promotes it. */
+  promotion: z.enum(['prod', 'test']).default('prod'),
   /** Touches a path in .softfactory/protected-paths.txt: never the light tier, always the blind review. */
   protected: z.boolean().default(false),
   /** Questions the blind reviewer will verify; the worker answers each with file:line. */
@@ -97,6 +99,17 @@ export const FactoryStateSchema = z.object({
   usage_by_model: z.record(z.string(), z.object({ input: z.number().default(0), output: z.number().default(0) })).optional(),
   /** The outcome of live UAT against the merged code, when the run reached that gate. */
   uat_result: z.enum(['passed', 'failed', 'skipped', 'none']).optional(),
+  /**
+   * Work marked promotion "test" that reached TEST and passed UAT there.
+   * Production is a person's decision (--promote); no run deploys it.
+   */
+  promotion: z.object({
+    status: z.enum(['pending', 'promoted', 'later', 'declined']),
+    tasks: z.array(z.string()),
+    test_env: z.string(),
+    decided_at: z.string().optional(),
+    note: z.string().optional(),
+  }).optional(),
   /** Coverage measured on the base when the build started; a resume reuses it rather than re-measuring a half-built branch. */
   coverage_before: z.number().optional(),
   /** Where the requirement came from, when it was not typed on the command line. */

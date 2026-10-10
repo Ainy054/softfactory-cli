@@ -16,7 +16,8 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
-import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult } from './Uat.js';
+import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult, type ShellRunner } from './Uat.js';
+import { loadEnvironment, type Environment } from './Environment.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
 import { appendFollowUps, openBacklog } from './Backlog.js';
 import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
@@ -722,7 +723,7 @@ export class Factory extends EventEmitter {
         return journal;
     }
     private async journalPlan() {
-        const tasks = this.state.tasks.map(t => ({ id: t.id, title: t.title, executor: t.executor, protected: t.protected, files_hint: t.files_hint, creates_files: t.creates_files, verification_command: t.verification_command, dependencies: t.dependencies, phase: t.phase }));
+        const tasks = this.state.tasks.map(t => ({ id: t.id, title: t.title, executor: t.executor, promotion: t.promotion, protected: t.protected, files_hint: t.files_hint, creates_files: t.creates_files, verification_command: t.verification_command, dependencies: t.dependencies, phase: t.phase }));
         await this.journal()?.append('plan:accepted', { feature: this.state.feature, planner: this.planner.provider, strategy: this.strategy, blueprint_hash: createHash('sha256').update(JSON.stringify(tasks)).digest('hex'), tasks }).catch(() => undefined);
     }
     /** A fact the rest of this run should know, kept short and handed to later tasks. */
@@ -838,7 +839,8 @@ export class Factory extends EventEmitter {
             const journal = await RunJournal.verify(this.baseDir, this.state.feature_id);
             const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, generator: `softfactory ${SOFTFACTORY_VERSION}` });
             const title = this.state.source?.kind === 'issue' ? `${this.state.feature} (#${this.state.source.number})` : this.state.feature;
-            const completed = this.state.status === 'completed';
+            // Work held at TEST is not done until a person decides on production.
+            const completed = this.state.status === 'completed' && this.state.promotion?.status !== 'pending';
             const existing = await this.github.findOpenPullRequest(branch);
             let pr = existing;
             if (existing) {
@@ -850,7 +852,7 @@ export class Factory extends EventEmitter {
             this.state.pull_request = { number: pr!.number, url: pr!.url, branch };
             await this.saveState();
             await this.journal()?.append('run:pull-request', { number: pr!.number, url: pr!.url, branch, base, status: this.state.status, merged: merged.map(t => t.id) }).catch(() => undefined);
-            this.log(`PR: ${pr!.url}${completed ? '' : ' (draft until the run completes)'}`);
+            this.log(`PR: ${pr!.url}${completed ? '' : this.state.promotion?.status === 'pending' ? ' (draft until production promotion is decided)' : ' (draft until the run completes)'}`);
         } catch (error: any) {
             this.log(`PR: could not open the pull request: ${error?.message || error}. The work is on branch ${branch}.`);
         } finally {
@@ -1548,7 +1550,107 @@ export class Factory extends EventEmitter {
                 this.log('Final gate: pre-existing failures only, not attributed to this build.');
             }
             if (this.state.status === 'completed') await this.wiringGate();
-            if (this.state.status === 'completed') await this.uatGate();
+            const target = this.state.status === 'completed' ? await this.deployToTest() : undefined;
+            if (this.state.status === 'completed') await this.uatGate(target?.uatEnv);
+            if (this.state.status === 'completed' && target) await this.holdForPromotion(target.name);
+    }
+
+    /** Done agent tasks marked promotion "test". */
+    promotionTasks(): Task[] {
+        return this.state.tasks.filter(t => t.status === 'done' && t.executor === 'agent' && t.promotion === 'test');
+    }
+
+    /** Host commands the promotion gate runs (the TEST and production deploys); injectable for tests. */
+    deployShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
+        const result = await execa('sh', ['-c', command], { cwd, env: { ...process.env, ...env }, timeout: timeoutMs, reject: false, all: true });
+        return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: String(result.all ?? '') };
+    };
+
+    private async runDeploy(kind: 'test' | 'production', command: string): Promise<{ ok: boolean; evidence: string; output: string }> {
+        const dir = path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id);
+        await fs.mkdir(dir, { recursive: true });
+        const evidence = path.join(dir, `${kind}-deploy.log`);
+        const { exitCode, output } = await this.deployShell(command, { cwd: this.baseDir, env: { SOFTFACTORY_FEATURE_ID: this.state.feature_id }, timeoutMs: 20 * 60_000 });
+        const head = await this.getCurrentCommit().catch(() => 'unknown');
+        await fs.writeFile(evidence, [`# softfactory ${kind} deploy`, `feature: ${this.state.feature_id}`, `commit: ${head}`, `timestamp: ${new Date().toISOString()}`, `$ ${command}`, redactSecrets(output.trimEnd()), `exit_code: ${exitCode}`, `RESULT: ${exitCode === 0 ? 'PASS' : 'FAIL'}`, ''].join('\n'));
+        await this.journal()?.append(`deploy:${kind}`, { command, exit_code: exitCode, commit: head }, [evidence]).catch(() => undefined);
+        return { ok: exitCode === 0, evidence: path.relative(this.baseDir, evidence), output };
+    }
+
+    /**
+     * Promotion gate, borrowed from Softhouse: work marked promotion "test"
+     * is deployed to the TEST environment from environment.json, and UAT runs
+     * there (SOFTFACTORY_TARGET=test, SOFTFACTORY_BASE_URL). Without a TEST
+     * environment the field is ignored and said so.
+     */
+    async deployToTest(): Promise<{ name: string; uatEnv: Record<string, string> } | undefined> {
+        const marked = this.promotionTasks();
+        if (!marked.length) return undefined;
+        let env: Environment | undefined;
+        try { env = await loadEnvironment(this.baseDir); }
+        catch (error: any) {
+            this.log(`PROMOTION: ${error.message}`);
+            this.state.status = 'failed';
+            await this.saveState();
+            await this.updateHistory('failed');
+            return undefined;
+        }
+        if (!env?.test_env) {
+            this.log(`Promotion: ${marked.map(t => t.id).join(', ')} marked "test", but ${env ? 'environment.json defines no test_env' : 'there is no .softfactory/environment.json'}; the field is ignored.`);
+            return undefined;
+        }
+        this.log(`Promotion: deploying ${marked.map(t => t.id).join(', ')} to ${env.test_env.name}: ${env.test_env.deploy}`);
+        const deployed = await this.runDeploy('test', env.test_env.deploy);
+        if (!deployed.ok) {
+            this.log(`PROMOTION FAILED: the ${env.test_env.name} deploy exited non-zero (evidence: ${deployed.evidence}).`);
+            this.state.status = 'failed';
+            await this.saveState();
+            await this.updateHistory('failed');
+            return undefined;
+        }
+        return { name: env.test_env.name, uatEnv: { SOFTFACTORY_TARGET: 'test', ...(env.test_env.url ? { SOFTFACTORY_BASE_URL: env.test_env.url } : {}) } };
+    }
+
+    /** The run completes at TEST; production waits for a person. */
+    private async holdForPromotion(testEnv: string) {
+        const tasks = this.promotionTasks().map(t => t.id);
+        this.state.promotion = { status: 'pending', tasks, test_env: testEnv };
+        await this.saveState();
+        await this.journal()?.append('promotion:pending', { tasks, test_env: testEnv }).catch(() => undefined);
+        this.log(`PROMOTION PENDING: ${tasks.join(', ')} passed at ${testEnv} and stop there. Production is your decision: softfactory --promote ${this.state.feature_id} now|later|no ["note"]`);
+    }
+
+    /**
+     * A person's production decision for work held at TEST. "now" runs the
+     * production deploy from environment.json; nothing else ever does.
+     */
+    async promote(featureId: string, decision: 'now' | 'later' | 'no', note?: string): Promise<void> {
+        const archived = path.join(this.archiveDir, `${featureId}.json`);
+        const fromArchive = this.state?.feature_id !== featureId;
+        if (fromArchive) {
+            try { this.state = JSON.parse(await fs.readFile(archived, 'utf8')); }
+            catch { throw new Error(`No build ${featureId} in factory.json or the archive.`); }
+        }
+        const promotion = this.state.promotion;
+        if (!promotion) throw new Error(`${featureId} has no work held for promotion.`);
+        if (promotion.status === 'promoted') throw new Error(`${featureId} is already promoted (${promotion.decided_at}).`);
+        if (decision === 'now') {
+            const env = await loadEnvironment(this.baseDir);
+            if (!env?.production) throw new Error('environment.json defines no production deploy; promote by hand and record it with --promote <feature> later|no.');
+            this.log(`Promoting ${promotion.tasks.join(', ')} to production: ${env.production.deploy}`);
+            const deployed = await this.runDeploy('production', env.production.deploy);
+            if (!deployed.ok) throw new Error(`The production deploy exited non-zero; nothing is marked promoted (evidence: ${deployed.evidence}).`);
+        }
+        promotion.status = decision === 'now' ? 'promoted' : decision === 'later' ? 'later' : 'declined';
+        promotion.decided_at = new Date().toISOString();
+        if (note) promotion.note = note;
+        if (fromArchive) await fs.writeFile(archived, JSON.stringify(this.state, null, 2));
+        else await this.saveState();
+        await this.journal()?.append('promotion:decided', { decision, note: note || '', tasks: promotion.tasks }).catch(() => undefined);
+        if (decision === 'now' && this.state.pull_request) {
+            await this.github.markReady(this.state.pull_request.number).catch(() => undefined);
+        }
+        this.log(`PROMOTION: ${featureId} ${promotion.status}${note ? ` (${note})` : ''}.`);
     }
 
     /** Tallies say this run is no worse than the base branch was: pre-existing red, not this build's. */
@@ -2669,7 +2771,7 @@ export class Factory extends EventEmitter {
      * build, binary proof, setup, reachability probes. Absent file: logged,
      * never a pass dressed up as one.
      */
-    async uatGate(): Promise<UatResult | undefined> {
+    async uatGate(targetEnv?: Record<string, string>): Promise<UatResult | undefined> {
         if (this.skipUat) { this.state.uat_result = 'skipped'; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
         let config;
         try { config = await loadUat(this.baseDir); }
@@ -2699,6 +2801,7 @@ export class Factory extends EventEmitter {
         const result = await runUat(this.baseDir, config, {
             runId: `${this.state.feature_id}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
+            env: targetEnv,
         });
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
         this.state.uat_result = result.passed ? 'passed' : 'failed';
