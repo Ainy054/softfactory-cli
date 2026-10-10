@@ -57,6 +57,12 @@ export const TaskSchema = z.object({
   inspector_model: z.string().optional(),
   /** One mechanical review fix per task is allowed without charging an attempt; this records that it was used. */
   micro_fix_used: z.boolean().default(false),
+  /** Designer tasks: the design gate. Dependent tasks wait while it is "awaiting" (or being revised). */
+  design_status: z.enum(['awaiting', 'approved', 'skipped']).optional(),
+  /** Set once a person asked for a revision; a design gets one. */
+  design_revision_used: z.boolean().optional(),
+  /** Designer tasks: the mockup files its merge added or changed. */
+  mockups: z.array(z.string()).optional(),
   /** Set once UAT blame reverted this task's merge and gave it its one retry. */
   uat_retry_used: z.boolean().optional(),
   /** The worker's own summary of the attempt that passed, for the handoff index. */

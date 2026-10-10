@@ -18,11 +18,11 @@ const KNOWN_FLAGS = [
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
-  '--queue', '--next', '--backlog', '--promote', '--isolation'
+  '--queue', '--next', '--backlog', '--promote', '--isolation', '--approve-design'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -197,6 +197,7 @@ async function main() {
   const noDocker = args.includes('--no-docker');
   const markDoneId = getFlagValue(args, '--mark-done');
   const promoteId = getFlagValue(args, '--promote');
+  const approveDesignId = getFlagValue(args, '--approve-design');
 
   let resumeFeatureId: string | undefined;
   if (resumeMode) {
@@ -241,7 +242,7 @@ async function main() {
     issue = { number: loaded.number, url: loaded.url, title: loaded.title };
   }
 
-  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !promoteId && !requirement) {
+  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !promoteId && !approveDesignId && !requirement) {
     console.error(USAGE);
     process.exit(1);
   }
@@ -367,6 +368,26 @@ async function main() {
       process.exit(1);
     }
     process.exit(0);
+  }
+
+  if (approveDesignId) {
+    // A person's decision on a design; the words after the flag are the decision and notes.
+    const [decision, ...notes] = requirement.trim().split(/\s+/);
+    if (decision !== 'approve' && decision !== 'revise' && decision !== 'skip') {
+      console.error('Error: --approve-design <task-id> needs approve, revise "notes" or skip.');
+      process.exit(1);
+    }
+    try {
+      await factory.approveDesign(approveDesignId, decision, notes.join(' ') || undefined);
+    } catch (error: any) {
+      console.error(`[SoftFactory] ${error.message}`);
+      process.exit(1);
+    }
+    requirement = '';
+    if (!resumeMode) {
+      console.log(`[SoftFactory] Recorded. Run --resume to continue the build.`);
+      process.exit(0);
+    }
   }
 
   if (markDoneId) {

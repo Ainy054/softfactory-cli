@@ -913,7 +913,7 @@ export class Factory extends EventEmitter {
             for (const task of allReady.filter(t => t.executor !== 'agent')) await this.parkManualTask(task);
             const readyCandidates = allReady.filter(t => t.executor === 'agent');
             if (readyCandidates.length === 0) {
-                if (this.state.tasks.some(t => t.status === 'manual')) break;
+                if (this.state.tasks.some(t => t.status === 'manual') || this.designsAwaiting().length) break;
                 this.log('No ready tasks — possible deadlock or all retries exhausted.');
                 break;
             }
@@ -986,6 +986,7 @@ export class Factory extends EventEmitter {
                         await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
+                        if (task.agent_role === 'designer') await this.openDesignGate(task);
                         // Mid-wave UAT: the first protected merge of a phase is checked
                         // live before the rest of the phase lands on top of it.
                         const moreToMerge = results.slice(index + 1).some(r => r.status === 'fulfilled' && r.value);
@@ -1051,13 +1052,19 @@ export class Factory extends EventEmitter {
             return;
         }
         const awaitingHuman = this.state.tasks.filter(t => t.status === 'manual');
-        if (awaitingHuman.length > 0) {
+        const awaitingDesign = this.designsAwaiting();
+        if (awaitingHuman.length > 0 || awaitingDesign.length > 0) {
             // Not a failure: the plan reached work only a person may do.
             this.state.status = 'paused';
             await this.saveState();
             await this.updateHistory('paused');
-            this.log(`PAUSED: ${awaitingHuman.length} task(s) need a person: ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}`);
-            this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
+            if (awaitingHuman.length) {
+                this.log(`PAUSED: ${awaitingHuman.length} task(s) need a person: ${awaitingHuman.map(t => `${t.id} (${t.executor})`).join(', ')}`);
+                this.log(`Finish each one, then: softfactory --mark-done <task-id> "<what was done>" --resume`);
+            }
+            if (awaitingDesign.length) {
+                this.log(`PAUSED: design approval needed for ${awaitingDesign.map(t => t.id).join(', ')}. Review: softfactory --design-review ${this.state.feature_id}; then softfactory --approve-design <task> approve|revise "notes"|skip --resume`);
+            }
             if (failedTasks.length > 0) this.log(`Also unresolved: ${failedTasks.map(t => `${t.id}:${t.status}`).join(', ')}`);
             await this.endRun();
             this.emitEvent({ type: 'build:complete', status: 'paused', feature: this.state.feature });
@@ -1393,7 +1400,7 @@ export class Factory extends EventEmitter {
             // The task's own acceptance command, executed and logged. Without
             // this the planner's verification_command was emitted on every
             // task and never run by anything.
-            let reviewEvidence = verifierResult.output || '';
+            let reviewEvidence = (verifierResult.output || '') + await this.mockupEvidence(task, worktreePath);
             const acceptance = await this.taskVerifier.runAcceptance(worktreePath, task, {
                 evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id),
                 note: task.agent_role === 'test_writer' ? 'test_writer: a red acceptance is expected before implementation' : undefined,
@@ -2455,7 +2462,9 @@ export class Factory extends EventEmitter {
         }
     }
     getReadyTasks() {
-        const doneTasks = new Set(this.state.tasks.filter(t => t.status === 'done').map(t => t.id));
+        // A merged design awaiting approval counts as done for unrelated work
+        // (the phase rule below) but not for the tasks that depend on it.
+        const doneTasks = new Set(this.state.tasks.filter(t => t.status === 'done' && !this.designPending(t)).map(t => t.id));
         const terminallyFailed = new Set(this.state.tasks
             .filter(t => t.status === 'rejected' || t.status === 'blocked' || (t.status === 'failed' && t.attempts >= Factory.MAX_TASK_ATTEMPTS))
             .map(t => t.id));
@@ -2985,6 +2994,90 @@ export class Factory extends EventEmitter {
         await this.recordAttempt(task, 'uat_mid_wave', feedback);
         this.emitEvent({ type: 'task:fail', task, feedback });
         this.log(`Mid-wave UAT FAIL after ${task.id}: ${revert.exitCode === 0 ? 'its merge was reverted' : 'its merge could not be reverted cleanly'}; the rest of the phase merges without it.`);
+    }
+
+    /** A designer whose merged mockups still wait for a person's decision. */
+    designPending(task: Task): boolean {
+        return task.agent_role === 'designer' && task.status === 'done' && task.design_status === 'awaiting';
+    }
+
+    designsAwaiting(): Task[] {
+        return this.state.tasks.filter(t => this.designPending(t) && this.state.tasks.some(other => other.status !== 'done' && [...other.dependencies, ...other.blockedBy].includes(t.id)));
+    }
+
+    /**
+     * The design gate, borrowed from Softhouse: a merged designer task's
+     * mockups wait for a person. Only the tasks that depend on it wait;
+     * unrelated tasks keep merging.
+     */
+    async openDesignGate(task: Task) {
+        const { stdout } = await execa('git', ['diff', '--name-only', 'HEAD^1', 'HEAD', '--', MOCKUP_DIR], { cwd: this.baseDir, reject: false });
+        task.mockups = stdout.split('\n').filter(file => file.endsWith('.html'));
+        task.design_status = 'awaiting';
+        const waiting = this.state.tasks.filter(t => [...t.dependencies, ...t.blockedBy].includes(task.id)).map(t => t.id);
+        await this.journal()?.append('design:awaiting', { task_id: task.id, mockups: task.mockups, waiting }).catch(() => undefined);
+        this.log(`DESIGN GATE: ${task.id}'s mockups wait for approval (${task.mockups.join(', ') || 'no files'}); ${waiting.length ? `${waiting.join(', ')} wait` : 'nothing waits'}, other work continues.`);
+        this.log(`  review: softfactory --design-review ${this.state.feature_id}; decide: softfactory --approve-design ${task.id} approve|revise "notes"|skip`);
+    }
+
+    /** Tasks downstream of a task, through dependencies, in plan order. */
+    private downstreamOf(id: string): Task[] {
+        const found = new Set<string>([id]);
+        for (let grew = true; grew;) {
+            grew = false;
+            for (const t of this.state.tasks) {
+                if (!found.has(t.id) && [...t.dependencies, ...t.blockedBy].some(dep => found.has(dep))) { found.add(t.id); grew = true; }
+            }
+        }
+        return this.state.tasks.filter(t => t.id !== id && found.has(t.id));
+    }
+
+    /** A person's decision on a design: approve, one revision, or skip. */
+    async approveDesign(taskId: string, decision: 'approve' | 'revise' | 'skip', notes?: string) {
+        if (!this.state) throw new Error('No build state to update.');
+        const task = this.state.tasks.find(t => t.id === taskId);
+        if (!task) throw new Error(`No task ${taskId} in the current build.`);
+        if (task.agent_role !== 'designer') throw new Error(`${taskId} is not a designer task.`);
+        if (!this.designPending(task)) throw new Error(`${taskId} has no design waiting for a decision.`);
+        const downstream = this.downstreamOf(task.id);
+        if (decision === 'revise') {
+            if (task.design_revision_used) throw new Error(`${taskId} has had its one revision; approve it or skip the design.`);
+            if (!notes?.trim()) throw new Error('A revision needs notes: --approve-design <task> revise "what to change".');
+            task.design_revision_used = true;
+            task.design_status = undefined;
+            task.status = 'pending';
+            task.last_feedback = `Revise the mockups (they are already in ${MOCKUP_DIR}/; edit them): ${notes.trim()}`;
+            task.error_history = [...(task.error_history || []), task.last_feedback.slice(0, 500)];
+        } else if (decision === 'approve') {
+            task.design_status = 'approved';
+            const note = `Implement to match the approved mockup(s): ${(task.mockups || []).join(', ')}. Every state they show (default, empty, error, loading) must exist; justify any deviation in your summary.`;
+            for (const t of downstream) if (!t.notes_to_executor.includes(note)) t.notes_to_executor.push(note);
+        } else {
+            task.design_status = 'skipped';
+            const note = `Design skipped for ${task.id}${notes?.trim() ? ` (${notes.trim()})` : ''}: there is no binding mockup.`;
+            for (const t of downstream) if (!t.notes_to_executor.includes(note)) t.notes_to_executor.push(note);
+        }
+        if (this.state.status === 'paused') this.state.status = 'active';
+        await this.saveState();
+        await this.journal()?.append('design:decided', { task_id: task.id, decision, notes: notes || '' }).catch(() => undefined);
+        this.log(`DESIGN ${decision === 'approve' ? 'APPROVED' : decision === 'skip' ? 'SKIPPED' : 'REVISION REQUESTED'}: ${task.id}${notes?.trim() ? ` — ${notes.trim()}` : ''}`);
+    }
+
+    /**
+     * Mockup as acceptance: reviewers of work downstream of an approved
+     * design get the mockups with the diff, and must fail a dropped state or
+     * an undocumented deviation.
+     */
+    async mockupEvidence(task: Task, worktreePath: string): Promise<string> {
+        const approved = this.state.tasks.filter(t => t.design_status === 'approved' && this.downstreamOf(t.id).some(d => d.id === task.id));
+        const parts: string[] = [];
+        for (const designer of approved) {
+            for (const file of designer.mockups || []) {
+                const html = await fs.readFile(path.join(worktreePath, file), 'utf8').catch(() => '');
+                if (html) parts.push(`APPROVED MOCKUP ${file} (from ${designer.id}). The change must match it: FAIL a state it shows (default, empty, error, loading) that the change does not render, or a deviation the summary does not justify.\n${html.slice(0, 6000)}${html.length > 6000 ? '\n[mockup truncated]' : ''}`);
+            }
+        }
+        return parts.length ? `\n\n${parts.join('\n\n')}` : '';
     }
 
     /** .softfactory/design/design.md, capped like the worker context; read once per workshop loop. */
