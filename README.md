@@ -191,7 +191,7 @@ All under `.softfactory/` in the repository (git-ignored):
 | `handoff-index.tsv` | One row per merged task (title, files, acceptance command, summary); the planner gets the rows most like a new requirement |
 | `worker-context.md` | Yours to write, at most 200 lines: the conventions and traps every worker reads first |
 | `environment.json` | Yours to write: where the live system is, the isolated test stack, the TEST environment and its deploy, the production deploy, health URLs, which files serve which routes, and files only the orchestrator edits (see `--init`). The live-system safety of 6.0 reads it |
-| `uat.json` | Yours to write: build, artifacts with markers, setup, probes, teardown (see `--init`) |
+| `uat.json` | Yours to write: build, artifacts with markers, setup, probes, ordered `suites` (each with `commands` and a `gating` flag, non-gating first) and `rebuild_between` to re-run `build` before every suite after the first, then teardown (see `--init`) |
 | `evidence/<feature>/uat.log` | The live verification transcript, ending `RESULT: PASS` or `FAIL` |
 | `training-*.jsonl` | Sanitized verified trajectories and failure lessons (opt out with the env var) |
 | `history.json`, `archive/` | Finished features |
