@@ -81,7 +81,9 @@ export interface IPlanner {
 export const OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['feature', 'requirements_covered', 'tasks'],
+  // OpenAI strict structured output (Codex --output-schema) requires every
+  // property to be listed in `required`; the model returns '' / [] when unused.
+  required: ['feature', 'requirements_covered', 'brief', 'tasks'],
   properties: {
     feature: { type: 'string' },
     requirements_covered: { type: 'array', items: { type: 'string' } },
@@ -92,7 +94,7 @@ export const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'review_questions'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
         properties: {
           executor: { type: 'string', enum: ['agent', 'orchestrator', 'user'] },
           review_questions: { type: 'array', items: { type: 'string' } },

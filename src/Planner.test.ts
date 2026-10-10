@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateBlueprint, type PlanningInput } from './Planner.js';
+import { validateBlueprint, OUTPUT_SCHEMA, type PlanningInput } from './Planner.js';
 
 const input: PlanningInput = {
   requirement: '## Command Palette\nFix it.\n## Quality gates\nRun tests.',
@@ -97,5 +97,15 @@ describe('a task that changes no files is not worker work', () => {
     assert.throws(() => validateBlueprint(runOnly, input), /T002 changes no files.*verification_command/);
     const manual = { ...runOnly, tasks: [runOnly.tasks[0], { ...runOnly.tasks[1], executor: 'orchestrator' }] };
     assert.doesNotThrow(() => validateBlueprint(manual, input), 'operator work legitimately changes no repository files');
+  });
+});
+
+describe('OUTPUT_SCHEMA', () => {
+  // Codex --output-schema uses OpenAI strict mode, which rejects a schema whose
+  // `required` omits any property ("Missing 'brief'", 2026-10-10).
+  it('lists every property as required, at the top level and per task', () => {
+    const task = OUTPUT_SCHEMA.properties.tasks.items;
+    assert.deepEqual([...OUTPUT_SCHEMA.required].sort(), Object.keys(OUTPUT_SCHEMA.properties).sort());
+    assert.deepEqual([...task.required].sort(), Object.keys(task.properties).sort());
   });
 });
