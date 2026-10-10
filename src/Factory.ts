@@ -2137,6 +2137,11 @@ export class Factory extends EventEmitter {
         return problems;
     }
 
+    /** Every task id that shares a live window, in task order. */
+    windowTaskIds(window: string): string[] {
+        return this.state.tasks.filter(t => t.window === window).map(t => t.id);
+    }
+
     /** Hands an orchestrator or user task to a person and records that nothing automated will run it. */
     async parkManualTask(task: Task) {
         task.status = 'manual';
@@ -2146,28 +2151,56 @@ export class Factory extends EventEmitter {
         if (task.files_hint.length) this.log(`  files: ${task.files_hint.join(', ')}`);
         if (task.acceptance_criteria.length) this.log(`  done when: ${task.acceptance_criteria.join('; ')}`);
         if (task.verification.length) this.log(`  verify with: ${task.verification.join('; ')}`);
-        this.log(`  then: softfactory --mark-done ${task.id} "<what was done>" --resume`);
+        // A live window lands on the host as one step; mark every sibling done at once.
+        const windowIds = task.window ? this.windowTaskIds(task.window) : [task.id];
+        if (task.window) {
+            const others = windowIds.filter(id => id !== task.id);
+            if (others.length) this.log(`  window "${task.window}": same live step as ${others.join(', ')}; mark them together`);
+        }
+        this.log(`  then: softfactory --mark-done ${windowIds.join(',')} "<what was done>" --resume`);
         this.emitEvent({ type: 'task:manual', task });
-        this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Waiting on ${task.executor}: ${task.title}. Finish it, then --mark-done ${task.id} --resume` });
+        this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Waiting on ${task.executor}: ${task.title}. Finish it, then --mark-done ${windowIds.join(',')} --resume` });
         await this.recordTaskEvent({ event: 'task:manual', task_id: task.id, executor: task.executor });
     }
 
-    /** Records that a person completed an orchestrator or user task. */
+    /** Records that a person completed one or more orchestrator or user tasks. */
     async markManualDone(taskId: string, note?: string) {
         if (!this.state) throw new Error('No build state to update.');
-        const task = this.state.tasks.find(t => t.id === taskId);
-        if (!task) throw new Error(`No task ${taskId} in the current build.`);
-        if (task.executor === 'agent') throw new Error(`${taskId} is an agent task; a worker completes it, not --mark-done.`);
-        if (task.status === 'done') {
-            this.log(`${taskId} is already done.`);
+        const ids = taskId.split(',').map(id => id.trim()).filter(Boolean);
+        if (ids.length === 0) throw new Error('--mark-done needs at least one task id.');
+        const tasks = ids.map(id => {
+            const task = this.state!.tasks.find(t => t.id === id);
+            if (!task) throw new Error(`No task ${id} in the current build.`);
+            return task;
+        });
+        for (const task of tasks) {
+            if (task.executor === 'agent') throw new Error(`${task.id} is an agent task; a worker completes it, not --mark-done.`);
+        }
+        // A live window is all-or-nothing: naming one task must name every sibling.
+        const named = new Set(ids);
+        for (const task of tasks) {
+            if (!task.window) continue;
+            const windowIds = this.windowTaskIds(task.window);
+            const missing = windowIds.filter(id => !named.has(id));
+            if (missing.length > 0) {
+                throw new Error(`Window ${task.window} must be closed as one step: --mark-done ${windowIds.join(',')}`);
+            }
+        }
+        const changed = tasks.filter(task => task.status !== 'done');
+        if (changed.length === 0) {
+            for (const task of tasks) this.log(`${task.id} is already done.`);
             return;
         }
-        task.status = 'done';
-        task.last_feedback = note ? `Completed manually: ${note}` : 'Completed manually.';
+        for (const task of changed) {
+            task.status = 'done';
+            task.last_feedback = note ? `Completed manually: ${note}` : 'Completed manually.';
+        }
         if (this.state.status === 'paused') this.state.status = 'active';
         await this.saveState();
-        await this.recordTaskEvent({ event: 'task:manual-done', task_id: taskId, executor: task.executor, note: note || '' });
-        this.log(`DONE (manual): ${taskId} — ${task.title}`);
+        for (const task of changed) {
+            await this.recordTaskEvent({ event: 'task:manual-done', task_id: task.id, executor: task.executor, note: note || '' });
+            this.log(`DONE (manual): ${task.id} — ${task.title}`);
+        }
     }
 
     filesInDiff(diff: string): string[] {
