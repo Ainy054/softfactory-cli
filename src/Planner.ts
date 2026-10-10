@@ -29,7 +29,9 @@ const BlueprintTaskSchema = z.object({
   // Advisory only; an unknown value is dropped rather than costing a repair round (issue #7's plan said "medium").
   complexity: z.preprocess(v => (['simple', 'moderate', 'complex'].includes(v as string) ? v : undefined), z.enum(['simple', 'moderate', 'complex']).optional()),
   allocation_reason: z.string().optional(),
-  executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  executor: z.enum(['agent', 'orchestrator', 'user', 'agent+orchestrator']).default('agent'),
+  /** What the operator does on the live system once an agent+orchestrator change is merged. */
+  apply_steps: z.string().optional(),
   promotion: z.enum(['prod', 'test']).default('prod'),
   review_questions: z.array(z.string()).default([]),
   /** A pointer into a shared spec, such as "docs/api.md §3". */
@@ -95,9 +97,10 @@ export const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'promotion', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'apply_steps', 'promotion', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
         properties: {
-          executor: { type: 'string', enum: ['agent', 'orchestrator', 'user'] },
+          executor: { type: 'string', enum: ['agent', 'orchestrator', 'user', 'agent+orchestrator'] },
+          apply_steps: { type: 'string' },
           promotion: { type: 'string', enum: ['prod', 'test'] },
           review_questions: { type: 'array', items: { type: 'string' } },
           id: { type: 'string' },
@@ -144,6 +147,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - Every agent task changes files; "run the tests" is the verification_command of the task it checks, never a task.
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria are observable outcomes; verification lists concrete commands or checks.
+- Use agent+orchestrator with apply_steps for a change that is tested in the repository and then applied on a live system.
 - A test_writer declares test_targets and production_targets, and depends on the implementation task when the behaviour does not exist yet.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
@@ -453,6 +457,45 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
   const blueprint = BlueprintSchema.parse(raw);
   const errors: string[] = [];
   const ids = new Set<string>();
+
+  // Release 6.0 "Split executor": an "agent+orchestrator" task is repository
+  // work an agent edits and tests plus live work an operator applies. Expand it
+  // before the other checks so both halves are validated as ordinary tasks.
+  const splits = new Map<string, string>();
+  const applyIds = new Set<string>();
+  const expandedTasks: Blueprint['tasks'] = [];
+  for (const task of blueprint.tasks) {
+    if (task.executor !== 'agent+orchestrator') { expandedTasks.push(task); continue; }
+    const applySteps = task.apply_steps?.trim();
+    if (!applySteps) {
+      errors.push(`${task.id} uses executor "agent+orchestrator" but has no apply_steps; state what the operator does on the live system once the change is merged, or route the whole task to the orchestrator`);
+      expandedTasks.push(task);
+      continue;
+    }
+    const applyId = `${task.id}-apply`;
+    task.executor = 'agent';
+    expandedTasks.push(task, {
+      ...task,
+      id: applyId,
+      title: `Apply: ${task.title}`,
+      description: applySteps,
+      phase: task.phase + 1,
+      dependencies: [task.id],
+      files_hint: [],
+      creates_files: [],
+      executor: 'orchestrator',
+      verification_command: undefined,
+    });
+    splits.set(task.id, applyId);
+    applyIds.add(applyId);
+  }
+  // Any task that depended on Tn now waits for the live apply instead.
+  for (const task of expandedTasks) {
+    if (applyIds.has(task.id)) continue;
+    task.dependencies = task.dependencies.map(dependency => splits.get(dependency) ?? dependency);
+    task.blockedBy = task.blockedBy.map(dependency => splits.get(dependency) ?? dependency);
+  }
+  blueprint.tasks = expandedTasks;
 
   // `dependencies` and `blockedBy` have the same scheduling effect. Avoid
   // redundant edges when a model emits the same prerequisite in both arrays.
