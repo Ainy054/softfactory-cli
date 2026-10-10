@@ -56,6 +56,8 @@ export interface RunMetrics {
   uat?: 'passed' | 'failed' | 'skipped' | 'none';
   /** Coverage before and after the build, when the project configures a coverageCommand. */
   coverage?: CoverageMetrics;
+  /** CX review percentage per task that got one, keyed by task id. */
+  cx_scores?: Record<string, number>;
 }
 
 const METRICS_FILE = path.join('.softfactory', 'metrics.jsonl');
@@ -99,6 +101,10 @@ export async function computeRunMetrics(
     if (task.model) models[task.model] = (models[task.model] || 0) + 1;
     if (task.inspection) inspections[task.inspection] = (inspections[task.inspection] || 0) + 1;
   }
+  const cxScores: Record<string, number> = {};
+  for (const task of state.tasks) {
+    if (typeof task.cx_score === 'number') cxScores[task.id] = task.cx_score;
+  }
   const agentTasks = state.tasks.filter(t => t.executor === 'agent');
   const done = state.tasks.filter(t => t.status === 'done');
   const doneAgentTasks = agentTasks.filter(t => t.status === 'done').length;
@@ -135,6 +141,7 @@ export async function computeRunMetrics(
     );
   }
   if (state.uat_result) metrics.uat = state.uat_result;
+  if (Object.keys(cxScores).length) metrics.cx_scores = cxScores;
   const measured = resolveCoverage(coverage);
   if (measured) metrics.coverage = measured;
   return metrics;
