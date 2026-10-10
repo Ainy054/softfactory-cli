@@ -67,6 +67,8 @@ export const TaskSchema = z.object({
   uat_retry_used: z.boolean().optional(),
   /** The worker's own summary of the attempt that passed, for the handoff index. */
   handoff_summary: z.string().optional(),
+  /** CX review percentage (0-100), set when a CX review passes. */
+  cx_score: z.number().optional(),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -184,6 +186,15 @@ export const HandoffSchema = z.object({
   follow_ups: z.array(z.string()).optional(),
   /** The worker's affirmation that it left the live stack untouched. */
   live_stack_untouched: z.boolean().optional(),
+  /**
+   * CX reviewers only: applicable checklist items, how many pass, and each
+   * N/A item with its reason.
+   */
+  cx_score: z.object({
+    applicable: z.number().int().min(0),
+    passed: z.number().int().min(0),
+    na: z.array(z.object({ item: z.string(), why: z.string() })).default([]),
+  }).optional(),
 });
 
 export type Handoff = z.infer<typeof HandoffSchema>;
