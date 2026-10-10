@@ -16,8 +16,8 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
-import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
-import { loadEnvironment, orchestratorOwned, type Environment } from './Environment.js';
+import { loadUat, runUat, fallbackUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
+import { loadEnvironment, changedRoutes, orchestratorOwned, type Environment } from './Environment.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
 import { appendFollowUps, openBacklog } from './Backlog.js';
 import { wiringCensus, newlyUnwired, censusKey } from './WiringCensus.js';
@@ -2834,16 +2834,46 @@ export class Factory extends EventEmitter {
      */
     /**
      * This run's UAT: uat.json plus each merged task's "orchestrator:" live
-     * check, run after build and setup and before teardown. Undefined when
-     * nothing is defined; throws on a malformed uat.json.
+     * check, run after build and setup and before teardown. Without a uat.json
+     * it falls back to the environment.json's health URLs and changed routes.
+     * Undefined when nothing is defined; throws on a malformed uat.json or
+     * environment.json.
      */
     async uatDefinition(): Promise<{ config: UatConfig; liveChecks: number } | undefined> {
         const config = await loadUat(this.baseDir);
         const liveChecks = this.state.tasks
             .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
             .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
-        if (!config && !liveChecks.length) return undefined;
-        return { config: config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks }), liveChecks: liveChecks.length };
+        // No uat.json: a project with an environment.json still gets a live check built from it.
+        const fallback = config ? undefined : await this.fallbackFromEnvironment();
+        if (!config && !fallback && !liveChecks.length) return undefined;
+        const base = config ?? fallback ?? UatSchema.parse({});
+        return { config: { ...base, probes: [...base.probes, ...liveChecks] }, liveChecks: liveChecks.length };
+    }
+
+    /**
+     * The UAT a project gets from its environment.json when it has no uat.json:
+     * health URLs plus the routes whose serving files this run changed. Logs the
+     * count it checked. A malformed environment.json throws here, which fails
+     * UAT the same way a malformed uat.json does.
+     */
+    private async fallbackFromEnvironment(): Promise<UatConfig | undefined> {
+        const env = await loadEnvironment(this.baseDir);
+        if (!env) return undefined;
+        const changedFiles = await this.uatChangedFiles();
+        const fallback = fallbackUat(env, changedFiles);
+        if (!fallback) return undefined;
+        this.log(`UAT: no uat.json; checking the environment's health URLs and ${changedRoutes(env, changedFiles).length} changed route(s).`);
+        return fallback;
+    }
+
+    /** The files this run changed since its base commit, or none when there is no base commit. */
+    private async uatChangedFiles(): Promise<string[]> {
+        if (!this.buildStartCommit) return [];
+        try {
+            const { stdout } = await execa('git', ['diff', '--name-only', this.buildStartCommit, 'HEAD'], { cwd: this.baseDir });
+            return stdout.split('\n').map(line => line.trim()).filter(Boolean);
+        } catch { return []; }
     }
 
     /** Runs UAT in a directory (the checkout, or a bisection worktree) with evidence under this run. */
