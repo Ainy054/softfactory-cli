@@ -18,6 +18,8 @@ export const TaskSchema = z.object({
    * "user" is a decision; both pause the run until --mark-done.
    */
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  /** Orchestrator or user tasks with the same window are applied together in one step. */
+  window: z.string().optional(),
   /** "test": user-facing, money-moving or outward-facing work stops at the TEST environment until a person promotes it. */
   promotion: z.enum(['prod', 'test']).default('prod'),
   /** Touches a path in .softfactory/protected-paths.txt: never the light tier, always the blind review. */
