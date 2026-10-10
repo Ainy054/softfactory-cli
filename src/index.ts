@@ -12,17 +12,18 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
+import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
   '--no-tui', '--resume', '--retry-blocked', '--history', '--refine', '--no-docker', '--plan', '--no-uat', '--init', '--abandon', '--yes', '--adopt',
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
-  '--queue', '--next', '--backlog', '--promote', '--isolation'
+  '--queue', '--next', '--backlog', '--promote', '--isolation', '--design-review'
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--design-review [feature-id]] <requirement>';
 
 let globalFactory: Factory | null = null;
 
@@ -53,6 +54,35 @@ function getFlagValue(args: string[], flag: string): string | undefined {
     return args[idx + 1];
   }
   return undefined;
+}
+
+/** The branch `--design-review` reads mockups from: the feature's integration
+ * branch when the current or archived state has one, else the current branch. */
+async function designReviewRef(root: string, featureId?: string): Promise<string> {
+  const integrationBranch = (state: any): string | undefined =>
+    state && typeof state.integration_branch === 'string' ? state.integration_branch : undefined;
+  if (featureId) {
+    try {
+      const current = JSON.parse(await fs.readFile(path.join(root, '.softfactory', 'factory.json'), 'utf8'));
+      if (current.feature_id === featureId) {
+        const branch = integrationBranch(current);
+        if (branch) return branch;
+      }
+    } catch { /* no current state */ }
+    try {
+      const archived = JSON.parse(await fs.readFile(path.join(root, '.softfactory', 'archive', `${featureId}.json`), 'utf8'));
+      const branch = integrationBranch(archived);
+      if (branch) return branch;
+    } catch { /* not archived */ }
+  } else {
+    try {
+      const current = JSON.parse(await fs.readFile(path.join(root, '.softfactory', 'factory.json'), 'utf8'));
+      const branch = integrationBranch(current);
+      if (branch) return branch;
+    } catch { /* no current state */ }
+  }
+  const result = await execa('git', ['branch', '--show-current'], { cwd: root, reject: false });
+  return result.stdout.trim() || 'HEAD';
 }
 
 async function main() {
@@ -99,6 +129,29 @@ async function main() {
       : `FAILED ${runId}: ${result.problems.length} problem(s)`);
     for (const problem of result.problems) console.log(`  - ${problem}`);
     process.exit(result.ok ? 0 : 1);
+  }
+
+  if (args.includes('--design-review')) {
+    const { listMockups, serveMockups } = await import('./DesignReview.js');
+    // Like --resume, a following `f-...` word is the optional feature id.
+    const designReviewIdx = args.indexOf('--design-review');
+    const designNextArg = args[designReviewIdx + 1];
+    const designFeatureId = designNextArg && /^f-\d+$/.test(designNextArg) ? designNextArg : undefined;
+    const ref = await designReviewRef(process.cwd(), designFeatureId);
+    const mockups = await listMockups(process.cwd(), ref);
+    if (mockups.length === 0) {
+      console.log(`No design mockups on ${ref}.`);
+      process.exit(0);
+    }
+    const { url, close } = await serveMockups(process.cwd(), ref);
+    console.log(`Design review for ${ref}: ${url}`);
+    for (const mockup of mockups) {
+      console.log(`  ${mockup.task}  ${mockup.screen}  ${url}m/${encodeURIComponent(mockup.file)}`);
+    }
+    // Keep the index and mockups served until Ctrl-C.
+    await new Promise<void>(resolve => process.on('SIGINT', () => resolve()));
+    await close();
+    process.exit(0);
   }
 
   const strategyArg = (getFlagValue(args, '--strategy') || 'hybrid') as WorkerStrategy;
