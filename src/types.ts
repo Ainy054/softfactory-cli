@@ -55,6 +55,8 @@ export const TaskSchema = z.object({
   inspector_model: z.string().optional(),
   /** One mechanical review fix per task is allowed without charging an attempt; this records that it was used. */
   micro_fix_used: z.boolean().default(false),
+  /** Set once UAT blame reverted this task's merge and gave it its one retry. */
+  uat_retry_used: z.boolean().optional(),
   /** The worker's own summary of the attempt that passed, for the handoff index. */
   handoff_summary: z.string().optional(),
 });

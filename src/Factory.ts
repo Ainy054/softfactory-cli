@@ -16,7 +16,7 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
-import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult, type ShellRunner } from './Uat.js';
+import { loadUat, runUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
 import { loadEnvironment, type Environment } from './Environment.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
 import { appendFollowUps, openBacklog } from './Backlog.js';
@@ -935,7 +935,8 @@ export class Factory extends EventEmitter {
             const environmentFault = results.find(r => r.status === 'rejected' && isEnvironmentFailure(r.reason));
             let mergeFault: string | undefined;
             // Merge passed tasks sequentially (git isn't concurrent-safe)
-            for (const result of results) {
+            let midWaveChecked = false;
+            for (const [index, result] of results.entries()) {
                 if (result.status === 'fulfilled' && result.value) {
                     const { task, branchName, followUps } = result.value;
                     const stale = await this.forkFreshness(task, branchName, worktreeMap.get(task.id));
@@ -963,6 +964,13 @@ export class Factory extends EventEmitter {
                         await this.journal()?.append('task:merged', { task_id: task.id, attempt: task.attempts, commit: await this.getCurrentCommit(), inspection: task.inspection, inspector_model: task.inspector_model }, task.evidence ? [task.evidence] : []).catch(() => undefined);
                         this.emitEvent({ type: 'task:done', task });
                         this.log(`MERGED: ${task.id} - ${task.title}`);
+                        // Mid-wave UAT: the first protected merge of a phase is checked
+                        // live before the rest of the phase lands on top of it.
+                        const moreToMerge = results.slice(index + 1).some(r => r.status === 'fulfilled' && r.value);
+                        if (task.protected && moreToMerge && !midWaveChecked) {
+                            midWaveChecked = true;
+                            await this.midWaveUat(task);
+                        }
                     }
                     catch (e: any) {
                         const blocked = WorktreeManager.mergeBlockedByWorkingTree(`${e?.stderr || ''}\n${e?.stdout || ''}`);
@@ -987,8 +995,11 @@ export class Factory extends EventEmitter {
                 const branchName = `line/${task.id}`;
                 // Keep the branch while the task still has retries left, so the
                 // next attempt continues from this one instead of from HEAD.
+                // A reverted merge is not a base to continue from: its branch conflicts
+                // with the revert, so the retry starts fresh from the merge target.
                 const willRetry = (task.status === 'failed' || task.status === 'pending')
-                    && task.attempts < Factory.MAX_TASK_ATTEMPTS;
+                    && task.attempts < Factory.MAX_TASK_ATTEMPTS && !this.revertedMerges.has(task.id);
+                this.revertedMerges.delete(task.id);
                 await this.worktreeManager.cleanup(task.id, branchName, willRetry);
             }
             await this.saveState();
@@ -1034,6 +1045,15 @@ export class Factory extends EventEmitter {
         await this.saveState();
         await this.updateHistory(this.state.status);
         if (this.state.status === 'completed') await this.finalGate();
+        if (this.uatRetry) {
+            // UAT blamed one task and reverted its merge: retry just that task.
+            this.uatRetry = false;
+            this.state.status = 'active';
+            await this.saveState();
+            await this.updateHistory('active');
+            await this.runWorkshopLoop();
+            return;
+        }
         if (this.state.status === 'completed') {
             await this.runDockerVerification();
             if (this.state.status === 'completed') await this.synthesizeMemory();
@@ -2771,10 +2791,138 @@ export class Factory extends EventEmitter {
      * build, binary proof, setup, reachability probes. Absent file: logged,
      * never a pass dressed up as one.
      */
+    /**
+     * This run's UAT: uat.json plus each merged task's "orchestrator:" live
+     * check, run after build and setup and before teardown. Undefined when
+     * nothing is defined; throws on a malformed uat.json.
+     */
+    async uatDefinition(): Promise<{ config: UatConfig; liveChecks: number } | undefined> {
+        const config = await loadUat(this.baseDir);
+        const liveChecks = this.state.tasks
+            .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
+            .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
+        if (!config && !liveChecks.length) return undefined;
+        return { config: config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks }), liveChecks: liveChecks.length };
+    }
+
+    /** Runs UAT in a directory (the checkout, or a bisection worktree) with evidence under this run. */
+    async runUatAt(cwd: string, config: UatConfig, label: string, targetEnv?: Record<string, string>): Promise<UatResult> {
+        return runUat(cwd, config, {
+            runId: `${this.state.feature_id}-${label}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
+            evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
+            env: targetEnv, shell: this.uatShell,
+        });
+    }
+
+    /** UAT's shell; injectable for tests. Undefined means the host shell. */
+    uatShell: ShellRunner | undefined;
+
+    /**
+     * After the first protected merge of a phase, while more of the phase is
+     * waiting: run UAT on the merge target. A failure reverts that merge and
+     * fails the task before anything else is merged on top of it.
+     */
+    async midWaveUat(task: Task): Promise<void> {
+        let defined: { config: UatConfig } | undefined;
+        try { defined = await this.uatDefinition(); }
+        catch { return; /* a malformed uat.json fails the final UAT, with its message */ }
+        if (!defined || this.skipUat) return;
+        this.log(`Mid-wave UAT: ${task.id} touched a protected path; checking live before merging the rest of phase ${task.phase}.`);
+        const result = await this.runUatAt(this.baseDir, defined.config, `after-${task.id}`);
+        await this.journal()?.append('uat:mid-wave', { task_id: task.id, passed: result.passed }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
+        if (result.passed) {
+            this.log(`Mid-wave UAT PASS after ${task.id}.`);
+            return;
+        }
+        const evidence = result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none';
+        const failing = result.steps.filter(step => !step.passed).map(step => `${step.name}: ${step.detail}`).join('; ');
+        const revert = await execa('git', ['revert', '-m', '1', '--no-edit', 'HEAD'], { cwd: this.baseDir, reject: false });
+        if (revert.exitCode !== 0) await execa('git', ['revert', '--abort'], { cwd: this.baseDir, reject: false });
+        else this.revertedMerges.add(task.id);
+        const feedback = `Live verification failed right after your merge: ${failing.slice(0, 400)} (evidence: ${evidence})`;
+        task.status = 'failed';
+        task.attempts++;
+        task.last_feedback = feedback;
+        task.error_history = [...(task.error_history || []), feedback.slice(0, 500)];
+        await this.recordAttempt(task, 'uat_mid_wave', feedback);
+        this.emitEvent({ type: 'task:fail', task, feedback });
+        this.log(`Mid-wave UAT FAIL after ${task.id}: ${revert.exitCode === 0 ? 'its merge was reverted' : 'its merge could not be reverted cleanly'}; the rest of the phase merges without it.`);
+    }
+
+    /** Tasks whose merge was reverted this phase; their branch is dropped, not reused. */
+    private revertedMerges = new Set<string>();
+
+    /** Set when UAT blame reverted a task's merge and the run should give it its one retry. */
+    private uatRetry = false;
+
+    /**
+     * UAT blame, borrowed from Softhouse: on a UAT failure, bisect the run's
+     * merge commits in a scratch worktree (one UAT on the base, then about
+     * log2(merges) more) to find the merge that broke it. 'base' when UAT
+     * fails before any of this run's merges; null when nothing can be blamed.
+     */
+    async blameUat(config: UatConfig, targetEnv?: Record<string, string>): Promise<{ task: Task; merge: string; runs: number } | 'base' | null> {
+        if (!this.buildStartCommit) return null;
+        const { stdout } = await execa('git', ['log', '--first-parent', '--reverse', '--format=%H%x09%s', `${this.buildStartCommit}..HEAD`], { cwd: this.baseDir });
+        const merges = stdout.split('\n').map(line => line.split('\t')).map(([hash, subject]) => ({ hash, id: /^softfactory: merge (\S+)$/.exec(subject || '')?.[1] }))
+            .filter((m): m is { hash: string; id: string } => Boolean(m.id) && this.state.tasks.some(t => t.id === m.id));
+        if (!merges.length) return null;
+        const scratch = path.join(this.baseDir, '.softfactory', 'bisect', this.state.feature_id);
+        await fs.rm(scratch, { recursive: true, force: true });
+        await execa('git', ['worktree', 'prune'], { cwd: this.baseDir, reject: false });
+        await execa('git', ['worktree', 'add', '-q', '--detach', scratch, this.buildStartCommit], { cwd: this.baseDir });
+        let runs = 0;
+        const passesAt = async (commit: string, label: string) => {
+            await execa('git', ['checkout', '-q', '--detach', commit], { cwd: scratch });
+            runs++;
+            const result = await this.runUatAt(scratch, config, label, targetEnv);
+            this.log(`UAT bisect: ${label} ${result.passed ? 'passes' : 'fails'}`);
+            return result.passed;
+        };
+        try {
+            if (!await passesAt(this.buildStartCommit, 'base')) return 'base';
+            let good = 0;
+            let bad = merges.length;
+            while (bad - good > 1) {
+                const mid = Math.floor((good + bad) / 2);
+                if (await passesAt(merges[mid - 1].hash, `after ${merges[mid - 1].id}`)) good = mid;
+                else bad = mid;
+            }
+            const culprit = merges[bad - 1];
+            return { task: this.state.tasks.find(t => t.id === culprit.id)!, merge: culprit.hash, runs };
+        } finally {
+            await execa('git', ['worktree', 'remove', '--force', scratch], { cwd: this.baseDir, reject: false });
+        }
+    }
+
+    /**
+     * The blamed task fails with the evidence. Its first blame reverts its
+     * merge and gives it one retry; a second blame, or a revert that does not
+     * apply cleanly, leaves it failed.
+     */
+    private async applyUatBlame(task: Task, merge: string, detail: string): Promise<boolean> {
+        const feedback = `Live verification failed after your merge: ${detail}`;
+        task.status = 'failed';
+        task.last_feedback = feedback;
+        task.error_history = [...(task.error_history || []), feedback.slice(0, 500)];
+        await this.recordAttempt(task, 'uat_blamed', feedback);
+        if (task.uat_retry_used) return false;
+        const revert = await execa('git', ['revert', '-m', '1', '--no-edit', merge], { cwd: this.baseDir, reject: false });
+        if (revert.exitCode !== 0) {
+            await execa('git', ['revert', '--abort'], { cwd: this.baseDir, reject: false });
+            this.log(`UAT blame: the merge of ${task.id} does not revert cleanly; no retry.`);
+            return false;
+        }
+        task.uat_retry_used = true;
+        task.status = 'pending';
+        task.attempts++;
+        return true;
+    }
+
     async uatGate(targetEnv?: Record<string, string>): Promise<UatResult | undefined> {
         if (this.skipUat) { this.state.uat_result = 'skipped'; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
-        let config;
-        try { config = await loadUat(this.baseDir); }
+        let defined: { config: UatConfig; liveChecks: number } | undefined;
+        try { defined = await this.uatDefinition(); }
         catch (error: any) {
             this.log(`UAT FAILED: ${error.message}`);
             this.state.uat_result = 'failed';
@@ -2783,26 +2931,17 @@ export class Factory extends EventEmitter {
             await this.updateHistory('failed');
             return undefined;
         }
-        // Each merged task's "orchestrator:" live check runs here, after the
-        // build and setup and before teardown, named after its task.
-        const liveChecks = this.state.tasks
-            .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
-            .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
-        if (!config && !liveChecks.length) {
+        if (!defined) {
             this.state.uat_result = 'none';
             this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
             await this.saveState();
             return undefined;
         }
-        config = config ? { ...config, probes: [...config.probes, ...liveChecks] } : UatSchema.parse({ probes: liveChecks });
+        const { config, liveChecks } = defined;
         this.log(config.build || config.setup.length
-            ? `UAT: running ${UAT_FILE} on ${this.mergeTarget()}${liveChecks.length ? ` with ${liveChecks.length} task live check(s)` : ''} (host, network on: this is the orchestrator's check of the live stack).`
-            : `UAT: running ${liveChecks.length} task live check(s) on the host after merge.`);
-        const result = await runUat(this.baseDir, config, {
-            runId: `${this.state.feature_id}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
-            evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
-            env: targetEnv,
-        });
+            ? `UAT: running ${UAT_FILE} on ${this.mergeTarget()}${liveChecks ? ` with ${liveChecks} task live check(s)` : ''} (host, network on: this is the orchestrator's check of the live stack).`
+            : `UAT: running ${liveChecks} task live check(s) on the host after merge.`);
+        const result = await this.runUatAt(this.baseDir, config, 'final', targetEnv);
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
         this.state.uat_result = result.passed ? 'passed' : 'failed';
         await this.saveState();
@@ -2810,8 +2949,21 @@ export class Factory extends EventEmitter {
         if (!result.passed) {
             const blamed = result.steps.filter(step => !step.passed && / live check$/.test(step.name.replace(/^probe: /, ''))).map(step => step.name.replace(/^probe: /, '').replace(/ live check$/, ''));
             if (blamed.length) this.log(`UAT: the live check of ${blamed.join(', ')} failed; ${blamed.length === 1 ? 'that task' : 'those tasks'} did not make the change reachable.`);
-            this.log(`UAT FAILED: the merged code does not pass live verification (evidence: ${result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none'}).`);
+            const evidence = result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none';
+            this.log(`UAT FAILED: the merged code does not pass live verification (evidence: ${evidence}).`);
             this.state.status = 'failed';
+            const blame = await this.blameUat(config, targetEnv).catch((error: any) => { this.log(`UAT blame skipped: ${error?.message || error}`); return null; });
+            if (blame === 'base') {
+                this.log('UAT blame: live verification fails on the base too; no task of this run is blamed.');
+            } else if (blame) {
+                const failing = result.steps.filter(step => !step.passed).map(step => `${step.name}: ${step.detail}`).join('; ');
+                this.log(`UAT BLAME: ${blame.task.id} — its merge (${blame.merge.slice(0, 8)}) breaks live verification; found in ${blame.runs} bisection UAT run(s).`);
+                await this.journal()?.append('uat:blame', { task_id: blame.task.id, merge: blame.merge, runs: blame.runs }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
+                if (await this.applyUatBlame(blame.task, blame.merge, `${failing.slice(0, 400)} (evidence: ${evidence})`)) {
+                    this.uatRetry = true;
+                    this.log(`UAT blame: reverted the merge of ${blame.task.id}; it gets one retry.`);
+                }
+            }
             await this.saveState();
             await this.updateHistory('failed');
         }
