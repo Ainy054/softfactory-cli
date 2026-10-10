@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 import { z } from 'zod';
+import { changedRoutes, type Environment } from './Environment.js';
 
 /**
  * Live verification, borrowed from Softhouse's STEP 5.5 and its 2.8 "binary
@@ -45,6 +46,38 @@ export async function loadUat(baseDir: string): Promise<UatConfig | undefined> {
   const parsed = UatSchema.safeParse(JSON.parse(raw));
   if (!parsed.success) throw new Error(`${UAT_FILE} is invalid: ${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   return parsed.data;
+}
+
+/** A URL single-quoted for `sh`, or undefined when it contains a quote and cannot be quoted safely. */
+function quoteUrl(url: string): string | undefined {
+  return url.includes("'") ? undefined : `'${url}'`;
+}
+
+/**
+ * The live check a project gets from its environment.json when it has no
+ * uat.json: bring up and tear down the isolated test stack, then curl every
+ * health URL and every route whose serving files this run changed. Undefined
+ * when there is nothing to reach, never an empty pass.
+ */
+export function fallbackUat(env: Environment, changedFiles: string[]): UatConfig | undefined {
+  const probes: UatConfig['probes'] = [];
+  for (const url of env.health) {
+    const quoted = quoteUrl(url);
+    if (quoted) probes.push({ name: `health ${url}`, run: `curl -fsS --max-time 20 ${quoted}` });
+  }
+  for (const route of changedRoutes(env, changedFiles)) {
+    const quoted = quoteUrl(route.url);
+    if (!quoted) continue;
+    const probe: UatConfig['probes'][number] = { name: `route ${route.url}`, run: `curl -fsS --max-time 20 ${quoted}` };
+    if (route.expect !== undefined) probe.expect = route.expect;
+    probes.push(probe);
+  }
+  if (!probes.length) return undefined;
+  const config = UatSchema.parse({});
+  config.setup = env.test_stack ? [env.test_stack.up] : [];
+  config.probes = probes;
+  config.teardown = env.test_stack?.down ? [env.test_stack.down] : [];
+  return config;
 }
 
 export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string }>;
