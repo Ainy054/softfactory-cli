@@ -41,7 +41,7 @@ export async function serveMockups(root: string, ref: string, port = 0): Promise
   const mockups = await listMockups(root, ref);
   const known = new Map(mockups.map(m => [m.file, m]));
   const server = createServer((request, response) => {
-    void handle(root, ref, known, (request.url || '/'), request.method, response);
+    void handle(root, ref, known, (request.url || '/'), request.method || 'GET', response);
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
