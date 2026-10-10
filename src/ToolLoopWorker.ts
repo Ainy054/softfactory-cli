@@ -30,6 +30,20 @@ export class ToolLoopWorker implements IWorker {
     const claims = raw.filter((c: any) => c && typeof c.text === 'string' && typeof c.source === 'string').map((c: any) => ({ text: c.text.slice(0, 500), source: c.source.slice(0, 200) }));
     return claims.length ? claims : undefined;
   }
+  /**
+   * The CX reviewer's score as the model sent it, copied into the handoff like
+   * not_done. Only the shape the schema names survives: an object with the
+   * applicable and passed counts and each N/A item with its reason.
+   */
+  static cxScoreFrom(raw: unknown): Handoff['cx_score'] {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const value = raw as any;
+    if (typeof value.applicable !== 'number' || typeof value.passed !== 'number') return undefined;
+    const na = Array.isArray(value.na)
+      ? value.na.filter((n: any) => n && typeof n.item === 'string' && typeof n.why === 'string').map((n: any) => ({ item: n.item, why: n.why }))
+      : [];
+    return { applicable: value.applicable, passed: value.passed, na };
+  }
   static readonly NO_PROGRESS_WARN = 6;      // a nudge: enough reading, change a file
   static readonly NO_PROGRESS_ABORT = 12;    // allow initial inspection; cycle guards stop repetitive exploration sooner
   static readonly NO_PROGRESS_MAX = 30;
@@ -227,6 +241,19 @@ ${projectContext}
               items: { type: 'object', properties: { text: { type: 'string' }, source: { type: 'string' } }, required: ['text', 'source'] },
             },
             not_done: { type: 'array', items: { type: 'string' }, description: 'anything in the task you did not finish, one item each; leave empty when everything is done' },
+            cx_score: {
+              type: 'object',
+              description: 'CX reviewers only: applicable checklist items, how many pass, and each N/A item with its reason',
+              properties: {
+                applicable: { type: 'integer', description: 'How many checklist items are applicable' },
+                passed: { type: 'integer', description: 'How many of the applicable items pass' },
+                na: {
+                  type: 'array',
+                  description: 'Each checklist item marked N/A, with the reason it does not apply',
+                  items: { type: 'object', properties: { item: { type: 'string' }, why: { type: 'string' } }, required: ['item', 'why'] },
+                },
+              },
+            },
             wiring_patch: { type: 'string', description: 'changes to orchestrator-owned files only, as one unified diff with paths relative to the repository root; leave empty when there are none' },
             follow_ups: { type: 'array', items: { type: 'string' }, description: 'gaps noticed outside this task, one per item' },
             live_stack_untouched: { type: 'boolean', description: 'Affirm that you left the live stack untouched: set true when you finish.' },
@@ -460,6 +487,7 @@ ${projectContext}
                   review_answers: Array.isArray(args.review_answers) ? args.review_answers.map(String) : undefined,
                   claims: ToolLoopWorker.claimsFrom(args.claims),
                   not_done: Array.isArray(args.not_done) ? args.not_done.map(String) : undefined,
+                  cx_score: ToolLoopWorker.cxScoreFrom(args.cx_score),
                   follow_ups: Array.isArray(args.follow_ups) ? args.follow_ups.map(String) : undefined,
                   wiring_patch: typeof args.wiring_patch === 'string' && args.wiring_patch.trim() ? args.wiring_patch : undefined,
                   live_stack_untouched: typeof args.live_stack_untouched === 'boolean' ? args.live_stack_untouched : undefined };
