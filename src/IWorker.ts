@@ -26,6 +26,8 @@ export interface WorkerOptions {
    * written once so each task's description carries only its delta.
    */
   brief?: string;
+  /** Role guidance for a designer or CX reviewer task (see roleSection). */
+  roleBrief?: string;
   /** Globs of files only the orchestrator edits (environment.json); changes to them travel as the handoff's wiring_patch. */
   orchestratorFiles?: string[];
   /**
@@ -116,8 +118,8 @@ export function acceptanceLine(command: string | undefined): string {
 }
 
 /** The shared brief, spec, out-of-scope and notes block every worker prompt carries, when present. */
-export function briefSection(task: Pick<Task, 'spec' | 'out_of_scope' | 'notes_to_executor'>, brief?: string): string {
-  let section = '';
+export function briefSection(task: Pick<Task, 'spec' | 'out_of_scope' | 'notes_to_executor'>, brief?: string, roleBrief?: string): string {
+  let section = roleBrief || '';
   const shared = brief?.trim();
   if (shared) section += `\nRUN BRIEF (shared by every task in this run):\n${shared}\n`;
   if (task.spec) section += `\nSpec: ${task.spec}\n`;
@@ -135,6 +137,48 @@ export function briefSection(task: Pick<Task, 'spec' | 'out_of_scope' | 'notes_t
 export function wiringSection(files: string[] | undefined): string {
   if (!files?.length) return '';
   return `\nORCHESTRATOR-OWNED FILES (never edit these; put the exact change in the handoff's wiring_patch as one unified diff, paths relative to the repository root, --- a/<path> and +++ b/<path>; it is applied on your branch before review):\n${files.map(f => `- ${f}`).join('\n')}\n`;
+}
+
+/** Where designers put mockups: tracked, so they travel with the branch and the pull request. */
+export const MOCKUP_DIR = 'softfactory-design/mockups';
+
+/** Softhouse's CX checklist: applicable items must pass, N/A items must be justified. */
+export const CX_CHECKLIST = [
+  'Loading state: shows a skeleton or spinner while data loads',
+  'Empty state: a meaningful message when there is no data, not a blank screen',
+  'Error state: a user-friendly message with a retry action, not a raw error dump',
+  'Responsive: works at 375px (mobile), 768px (tablet) and 1280px+ (desktop)',
+  'Keyboard navigation: every interactive element reachable with Tab and activated with Enter or Space',
+  'Accessible: ARIA labels, semantic HTML (nav, main, button rather than div), contrast of 4.5:1 or more',
+  'Feedback: user actions produce a visible confirmation (save shows "Saved")',
+  'Form validation: inline errors on blur, submit disabled until valid',
+  'No raw technical errors visible (no stack traces, "undefined" or "NaN")',
+  'Consistent styling: the project\'s design tokens or theme, not arbitrary colors or sizes',
+];
+
+/**
+ * Role guidance, borrowed from Softhouse's designer and CX reviewer role
+ * texts. A designer designs before code: its approved mockup becomes the
+ * coder's acceptance target. A CX reviewer scores and fixes UI quality.
+ */
+export function roleSection(task: Pick<Task, 'id' | 'agent_role'>, designSystem?: string): string {
+  const system = designSystem?.trim() ? `\nPROJECT DESIGN SYSTEM (.softfactory/design/design.md; reuse what it declares):\n${designSystem.trim()}\n` : '';
+  if (task.agent_role === 'designer') {
+    return `\nROLE: DESIGNER. You design BEFORE code; the approved mockup becomes the coder's acceptance target.
+- Write one self-contained HTML mockup per screen at ${MOCKUP_DIR}/${task.id}-<screen>.html: all CSS inline from the project's tokens, real domain data, and the empty, error and loading variants as labelled sections.
+- Show the layout at 375px, 768px and 1280px; meet WCAG AA contrast; one primary action per view.
+- Reuse the project's tokens and components; a new one needs a stated reason in your summary.
+- Do NOT modify application code: only files under ${MOCKUP_DIR}/ may change.
+- In your summary give the design spec: tokens used, components reused or new, responsive behaviour, accessibility notes, deliberate deviations.
+${system}`;
+  }
+  if (task.agent_role === 'cx_reviewer') {
+    return `\nROLE: CX REVIEWER. Review the UI files the upstream task changed against this checklist; fix failing applicable items in the code; justify every item you mark N/A.
+${CX_CHECKLIST.map(item => `- ${item}`).join('\n')}
+- If an approved mockup is named in the task, mockup fidelity (structure, tokens, states) is the first and highest-weight check; an undocumented deviation is a failure.
+${system}`;
+  }
+  return '';
 }
 
 /** The requirement block every worker prompt carries, bounded so it cannot crowd out the task. */

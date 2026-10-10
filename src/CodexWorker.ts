@@ -35,7 +35,7 @@ ${task.review_questions?.length ? `Review questions (an independent reviewer ver
 ${previousFeedback ? `Previous feedback: ${previousFeedback}` : ''}
 ${options.memoryPatterns?.length ? `Verified project lessons:\n${options.memoryPatterns.map(x => `- ${x}`).join('\n')}` : ''}
 ${requirementSection(options.requirement)}
-${briefSection(task, options.brief)}
+${briefSection(task, options.brief, options.roleBrief)}
 ${wiringSection(options.orchestratorFiles)}
 ${options.retryBrief || ''}
 Before finishing, write ${handoffPath} as JSON with task_id, status, files_changed, summary, wiring_patch (only for orchestrator-owned files), claims (an array of {"text","source"} for each material claim; source is "path:line", "path:start-end", "command: <what ran>" or "UNVERIFIED"; a cited line that does not exist rejects the task) and, if there were review questions, review_answers.`;

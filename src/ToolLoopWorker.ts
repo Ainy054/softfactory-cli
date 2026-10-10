@@ -95,7 +95,7 @@ ${projectContext}
 `;
   }
 
-  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string, orchestratorFiles?: string[]): string {
+  private buildUserPrompt(task: Task, requirement?: string, retryBrief?: string, brief?: string, orchestratorFiles?: string[], roleBrief?: string): string {
     let userPrompt = `Task ID: ${task.id}\nTitle: ${task.title}\nRole: ${task.agent_role}\n\nDescription:\n${task.description}\n`;
     if (task.acceptance_criteria?.length) userPrompt += `\nAcceptance criteria:\n${task.acceptance_criteria.map(c => `- ${c}`).join('\n')}\n`;
     if (task.verification?.length) userPrompt += `\nVerification:\n${task.verification.map(v => `- ${v}`).join('\n')}\n`;
@@ -121,7 +121,7 @@ ${projectContext}
       userPrompt += `\nREVIEW QUESTIONS (an independent reviewer will verify each answer against your diff; answer every one in finish_task's review_answers, citing file:line):\n${task.review_questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}\n`;
     }
     userPrompt += requirementSection(requirement);
-    userPrompt += briefSection(task, brief);
+    userPrompt += briefSection(task, brief, roleBrief);
     userPrompt += wiringSection(orchestratorFiles);
     if (retryBrief) userPrompt += `\n${retryBrief}\n`;
     return userPrompt;
@@ -246,7 +246,7 @@ ${projectContext}
 
     let messages: ChatMessage[] = [
       { role: 'system', content: this.buildSystemPrompt(task, options?.projectContext || '', await this.projectRoots(worktreePath), options?.preamble) },
-      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief, options?.orchestratorFiles) },
+      { role: 'user', content: this.buildUserPrompt(task, options?.requirement, options?.retryBrief, options?.brief, options?.orchestratorFiles, options?.roleBrief) },
     ];
     // Emit the exact prompt the model will receive, once per attempt, before
     // any transport work. The orchestrator saves it so a retry can be compared

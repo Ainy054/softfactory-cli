@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execa } from 'execa';
 import { z } from 'zod';
+import { MOCKUP_DIR } from './IWorker.js';
 import { extractJson } from './extractJson.js';
 import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type ITextModel } from './TextModel.js';
 import { commandPolicyViolation } from './commandPolicy.js';
@@ -14,7 +15,7 @@ const BlueprintTaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
   title: z.string().min(4),
   description: z.string().min(12),
-  agent_role: z.enum(['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder']),
+  agent_role: z.enum(['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder', 'designer', 'cx_reviewer']),
   phase: z.number().int().positive(),
   dependencies: z.array(z.string()).default([]),
   blockedBy: z.array(z.string()).default([]),
@@ -109,7 +110,7 @@ export const OUTPUT_SCHEMA = {
           id: { type: 'string' },
           title: { type: 'string' },
           description: { type: 'string' },
-          agent_role: { type: 'string', enum: ['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder'] },
+          agent_role: { type: 'string', enum: ['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder', 'designer', 'cx_reviewer'] },
           phase: { type: 'integer', minimum: 1 },
           dependencies: { type: 'array', items: { type: 'string' } },
           blockedBy: { type: 'array', items: { type: 'string' } },
@@ -151,6 +152,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - Use dependencies for actual ordering. Same-phase tasks must not claim the same file.
 - acceptance_criteria are observable outcomes; verification lists concrete commands or checks.
 - Use agent+orchestrator with apply_steps for a change that is tested in the repository and then applied on a live system.
+- A NEW user-facing screen gets a chain: designer task (HTML mockups only) -> coder task depending on it -> cx_reviewer task depending on the coder.
 - A test_writer declares test_targets and production_targets, and depends on the implementation task when the behaviour does not exist yet.
 - requirements_covered must copy every markdown requirement section title (## or ###) from the user requirement.
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
@@ -572,6 +574,12 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
       .flatMap(other => [...other.files_hint, ...other.creates_files])
       .filter(file => !isTestFilePath(file));
     task.production_targets = [...new Set(fromDeps)];
+  }
+
+  // A designer writes mockups only; the runtime rejects anything else.
+  for (const task of blueprint.tasks.filter(t => t.agent_role === 'designer')) {
+    const outside = [...task.files_hint, ...task.creates_files].filter(file => !file.startsWith(`${MOCKUP_DIR}/`));
+    if (outside.length) errors.push(`${task.id} is a designer but lists files outside ${MOCKUP_DIR}/: ${outside.join(', ')}; a designer writes only ${MOCKUP_DIR}/${task.id}-<screen>.html`);
   }
 
   // The runtime rejects a test writer that changes source; a plan that gives

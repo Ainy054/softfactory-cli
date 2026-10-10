@@ -47,6 +47,24 @@ conventions and traps a newcomer would get wrong, not documentation.
     orchestrator_files: ['docker-compose.yml', 'src/routes/index.ts'],
   }, null, 2)}
 `,
+  'design/design.md': `# Design system
+
+Read by designer tasks before they draw a mockup, and by CX reviewers when
+they score an implementation against it. Designers reuse what is declared
+here; a new token or component needs a stated reason. Keep it short.
+
+## UI paradigm
+- (what a coder can build: e.g. React + Tailwind SPA, or server-rendered templates with no JS framework)
+
+## Tokens
+- Defined in: (the real theme or CSS-variables file; do not copy values that will drift)
+
+## Breakpoints
+- 375px mobile, 768px tablet, 1280px+ desktop
+
+## Components
+- (reusable components and where they live)
+`,
   'protected-paths.txt': `# Globs whose diffs get the blind frontier review and never the light tier.
 # One per line; # starts a comment.
 # src/auth/**
@@ -60,6 +78,7 @@ export async function initProject(baseDir: string): Promise<Array<{ file: string
   const results: Array<{ file: string; written: boolean }> = [];
   for (const [name, content] of Object.entries(TEMPLATES)) {
     const file = path.join(dir, name);
+    await fs.mkdir(path.dirname(file), { recursive: true });
     try {
       await fs.writeFile(file, content, { flag: 'wx' });
       results.push({ file: path.relative(baseDir, file), written: true });

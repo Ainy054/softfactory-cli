@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager, SharedCheckoutManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
-import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand, safetyPreamble } from './IWorker.js';
+import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand, safetyPreamble, roleSection, MOCKUP_DIR } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
@@ -892,6 +892,7 @@ export class Factory extends EventEmitter {
                 return;
             }
         }
+        this.designSystem = await this.loadDesignSystem();
         if (!this.baseline) await this.captureBaseline();
         this.runStartedAt = Date.now();
         while (this.hasUnfinishedTasks()) {
@@ -1184,6 +1185,7 @@ export class Factory extends EventEmitter {
                     brief: this.state?.brief,
                     preamble: safetyPreamble(this.environment),
                     orchestratorFiles: this.environment?.orchestrator_files,
+                    roleBrief: roleSection(task, this.designSystem),
                     retryBrief: task.attempts > 0 ? await this.retryBrief(task, worktreePath) : undefined,
                     memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
                     model,
@@ -1436,6 +1438,15 @@ export class Factory extends EventEmitter {
                 this.log(`REJECTED: ${task.id} — test writer changed source: ${scopeFiles}`);
                 processFailure(scopeViolation);
                 await this.recordAttempt(task, 'tests_rewrote_source', scopeFiles);
+                return null;
+            }
+            // A designer produces mockups, never application code (Softhouse's
+            // designer constraint), and must actually produce one.
+            const designProblem = designerScopeViolation(task, diff);
+            if (designProblem) {
+                this.log(`REJECTED: ${task.id} — ${designProblem.split('.')[0]}`);
+                processFailure(designProblem);
+                await this.recordAttempt(task, 'designer_scope', designProblem);
                 return null;
             }
             // Project rules no test catches: read once per run, then scanned
@@ -2976,6 +2987,16 @@ export class Factory extends EventEmitter {
         this.log(`Mid-wave UAT FAIL after ${task.id}: ${revert.exitCode === 0 ? 'its merge was reverted' : 'its merge could not be reverted cleanly'}; the rest of the phase merges without it.`);
     }
 
+    /** .softfactory/design/design.md, capped like the worker context; read once per workshop loop. */
+    designSystem: string | undefined;
+
+    async loadDesignSystem(): Promise<string | undefined> {
+        const text = await fs.readFile(path.join(this.baseDir, '.softfactory', 'design', 'design.md'), 'utf8').catch(() => '');
+        if (!text.trim()) return undefined;
+        const lines = text.split('\n');
+        return lines.length > 200 ? `${lines.slice(0, 200).join('\n')}\n[design.md truncated at 200 lines]` : text;
+    }
+
     /** environment.json, loaded once per invocation of the workshop loop. */
     environment: Environment | undefined;
 
@@ -3268,6 +3289,21 @@ export { isTestFilePath } from './Planner.js';
 export function testWriterScopeFiles(task: { agent_role?: string }, diff: string): string[] {
     if (task.agent_role !== 'test_writer') return [];
     return diffHeaderFiles(diff).filter(file => !isTestFilePath(file));
+}
+
+/**
+ * A designer may change only files under the mockup directory, and must leave
+ * at least one mockup named after its task. Null for any other role.
+ */
+export function designerScopeViolation(task: { id: string; agent_role?: string }, diff: string): string | null {
+    if (task.agent_role !== 'designer') return null;
+    const files = diffHeaderFiles(diff);
+    const outside = files.filter(file => !file.startsWith(`${MOCKUP_DIR}/`));
+    if (outside.length) return `A designer changes only mockups under ${MOCKUP_DIR}/, but this diff touches ${outside.join(', ')}. Revert those and keep the task to mockups.`;
+    if (!files.some(file => file.startsWith(`${MOCKUP_DIR}/${task.id}-`) && file.endsWith('.html'))) {
+        return `No mockup was written. Write ${MOCKUP_DIR}/${task.id}-<screen>.html with the default, empty, error and loading states.`;
+    }
+    return null;
 }
 
 /**

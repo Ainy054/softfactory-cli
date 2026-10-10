@@ -75,7 +75,7 @@ ${memoryPatterns.map(p => `- ${p}`).join('\n')}
     }
 
     prompt += requirementSection(requirement);
-    prompt += briefSection(task, options.brief);
+    prompt += briefSection(task, options.brief, options.roleBrief);
     prompt += wiringSection(options.orchestratorFiles);
 
     prompt += `

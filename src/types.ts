@@ -4,7 +4,7 @@ export const TaskSchema = z.object({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'Task IDs must be safe path components'),
   title: z.string(),
   description: z.string(),
-  agent_role: z.enum(['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder']),
+  agent_role: z.enum(['coder', 'test_writer', 'docs', 'devops', 'architect', 'builder', 'designer', 'cx_reviewer']),
   phase: z.number(),
   dependencies: z.array(z.string()).default([]),
   blockedBy: z.array(z.string()).default([]),
