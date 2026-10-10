@@ -34,6 +34,13 @@ export class GitHub {
     }
   }
 
+  /** The repository's web URL, so the body can link blobs (mockups, evidence). */
+  async repoUrl(): Promise<string> {
+    const result = await this.exec('gh', ['repo', 'view', '--json', 'url', '-q', '.url'], { cwd: this.baseDir });
+    if (result.exitCode !== 0) throw new Error(`Could not read the repository URL: ${(result.stderr || result.stdout).trim()}`);
+    return result.stdout.trim();
+  }
+
   async readIssue(number: number): Promise<Issue> {
     const result = await this.exec('gh', ['issue', 'view', String(number), '--json', 'number,title,body,url'], { cwd: this.baseDir });
     if (result.exitCode !== 0) throw new Error(`Could not read issue #${number}: ${(result.stderr || result.stdout).trim()}`);
@@ -94,6 +101,8 @@ export interface PullRequestBodyInput {
   sandbox: string;
   journal?: { ok: boolean; entries: number; head?: string; problems: string[] };
   metrics?: { first_attempt_rate: number; rejected_by_category: Record<string, number>; tokens: { input: number; output: number } };
+  /** Designer mockups changed on the integration branch, linked to their blob URLs. */
+  mockups?: Array<{ file: string; url: string }>;
   generator: string;
 }
 
@@ -124,6 +133,11 @@ export async function buildPullRequestBody(input: PullRequestBodyInput): Promise
       const tail = await readTail(path.join(input.baseDir, task.evidence!), 20);
       lines.push(`<details><summary>${task.id}: <code>${escapeCell(task.verification_command || '')}</code></summary>`, '', '```', tail, '```', '</details>', '');
     }
+  }
+  if (input.mockups?.length) {
+    lines.push('### Design mockups', '');
+    for (const mockup of input.mockups) lines.push(`- [${mockup.file}](${mockup.url})`);
+    lines.push('', `Run softfactory --design-review ${state.feature_id} to view them rendered.`, '');
   }
   lines.push('### Run record', '');
   lines.push(`- Strategy ${state.strategy}, cloud provider ${state.cloud_provider}, planner ${state.planner_provider}.`);
