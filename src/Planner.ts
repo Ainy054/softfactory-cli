@@ -30,6 +30,8 @@ const BlueprintTaskSchema = z.object({
   complexity: z.preprocess(v => (['simple', 'moderate', 'complex'].includes(v as string) ? v : undefined), z.enum(['simple', 'moderate', 'complex']).optional()),
   allocation_reason: z.string().optional(),
   executor: z.enum(['agent', 'orchestrator', 'user']).default('agent'),
+  /** Orchestrator or user tasks with the same window are applied together in one step. */
+  window: z.string().optional(),
   promotion: z.enum(['prod', 'test']).default('prod'),
   review_questions: z.array(z.string()).default([]),
   /** A pointer into a shared spec, such as "docs/api.md §3". */
@@ -95,9 +97,10 @@ export const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'promotion', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'window', 'promotion', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
         properties: {
           executor: { type: 'string', enum: ['agent', 'orchestrator', 'user'] },
+          window: { type: 'string' },
           promotion: { type: 'string', enum: ['prod', 'test'] },
           review_questions: { type: 'array', items: { type: 'string' } },
           id: { type: 'string' },
@@ -149,6 +152,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - The "feature" name must describe THIS requirement. Feature History is prior work for context only; never reuse a name from it.
 - Do not add DevOps work unless the requirement or repository evidence calls for it.
 - executor is a safety boundary: "agent" (default) is repository work a worker verifies in its worktree; "orchestrator" touches the host or a live system (secrets, .env, host config, deploys, restarts, git push, live migrations); "user" is a product decision. Split such work out of agent tasks. promotion "test" stops user-facing or money-moving work at TEST until a person promotes it.
+- window: orchestrator or user tasks with the same window land together in one step (a config change, a secret and a restart); an agent task never has a window.
 - verification_command: ONE command, run verbatim as the merge gate, testing only this task's own file (never the whole suite). No shell operators. Executable: npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another. No npx ("npm test -- --run src/x.test.ts"); a preload may name a package, never a file. A check needing the running system is "orchestrator: <command>".
 - review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
 
@@ -489,6 +493,9 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
     }
     if (task.executor !== 'agent' && task.agent_role === 'test_writer') {
       errors.push(`${task.id} is a test_writer task but routed to ${task.executor}; tests are agent work`);
+    }
+    if (task.executor === 'agent' && task.window) {
+      errors.push(`${task.id} has a window but is an agent task; only orchestrator and user tasks share a live window`);
     }
     const created = new Set(task.creates_files);
     for (const file of [...task.files_hint, ...task.creates_files]) {
