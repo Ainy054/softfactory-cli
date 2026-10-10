@@ -5,6 +5,17 @@ import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection, wiringSection } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
+/**
+ * The safety block ends by asking the worker to affirm "live stack untouched";
+ * that affirmation is the literal line, matched case-insensitively after
+ * trimming each line of the final output.
+ */
+function affirmsLiveStackUntouched(output: string | undefined): boolean {
+  return String(output ?? '')
+    .split('\n')
+    .some(line => line.trim().toLowerCase().includes('live stack untouched'));
+}
+
 export class AgyWorker implements IWorker {
   id = 'agy-cloud';
   name = 'Antigravity Cloud Worker';
@@ -29,7 +40,9 @@ export class AgyWorker implements IWorker {
     const handoffPath = path.join(worktreePath, '.softfactory', 'handoff.json');
     await fs.mkdir(path.dirname(handoffPath), { recursive: true });
 
-    let prompt = `
+    // The safety preamble is the very first text of the prompt, before the role line.
+    const preamble = options.preamble?.trim() ? `${options.preamble.endsWith('\n') ? options.preamble : `${options.preamble}\n`}` : '';
+    let prompt = `${preamble}
 You are a SoftFactory Line Worker operating via Antigravity CLI.
 Task ID: ${task.id}
 Title: ${task.title}
@@ -138,9 +151,11 @@ A claim whose cited line does not exist rejects the task.
       options.onUsage
     );
 
+    let output = '';
     if (proc.stdout) {
       let buffer = '';
       proc.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
         buffer += chunk.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -185,12 +200,14 @@ A claim whose cited line does not exist rejects the task.
       clearInterval(heartbeat);
     }
 
+    const affirmed = affirmsLiveStackUntouched(output);
+
     // Try reading handoff immediately with retries for filesystem flush
     for (let i = 0; i < 5; i++) {
       try {
         const content = await fs.readFile(handoffPath, 'utf-8');
         const json = JSON.parse(content);
-        return HandoffSchema.parse(json);
+        return { ...HandoffSchema.parse(json), ...(affirmed ? { live_stack_untouched: true } : {}) };
       } catch {
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
@@ -202,6 +219,7 @@ A claim whose cited line does not exist rejects the task.
       status: 'success',
       files_changed: task.files_hint,
       summary: `Completed ${task.title} using ${selectedModel}`,
+      ...(affirmed ? { live_stack_untouched: true } : {}),
     };
   }
 }
