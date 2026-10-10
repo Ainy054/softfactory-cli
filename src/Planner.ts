@@ -95,7 +95,7 @@ export const OUTPUT_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
+        required: ['id', 'title', 'description', 'agent_role', 'phase', 'dependencies', 'blockedBy', 'files_hint', 'creates_files', 'acceptance_criteria', 'verification', 'production_targets', 'test_targets', 'behavior_tags', 'verification_command', 'complexity', 'allocation_reason', 'executor', 'promotion', 'review_questions', 'spec', 'out_of_scope', 'notes_to_executor'],
         properties: {
           executor: { type: 'string', enum: ['agent', 'orchestrator', 'user'] },
           promotion: { type: 'string', enum: ['prod', 'test'] },
@@ -441,6 +441,14 @@ function isLocaleFile(file: string): boolean {
   return segments.slice(0, -1).some(segment => LOCALE_DIRS.has(segment));
 }
 
+/** True for a path that is a test file by language convention. */
+export function isTestFilePath(file: string): boolean {
+  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(file)
+    || /_test\.go$/.test(file)
+    || /(^|\/)(__tests__|test|tests)\//.test(file)
+    || /(^|\/)test_[^/]+\.py$|_test\.py$/.test(file);
+}
+
 export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint {
   const blueprint = BlueprintSchema.parse(raw);
   const errors: string[] = [];
@@ -499,6 +507,14 @@ export function validateBlueprint(raw: unknown, input: PlanningInput): Blueprint
       if (!ids.has(dependency)) errors.push(`${task.id} references missing dependency ${dependency}`);
       if (dependency === task.id) errors.push(`${task.id} depends on itself`);
     }
+  }
+
+  // The runtime rejects a test writer that changes source; a plan that gives
+  // one a source file to write can only fail (#41's T1 burned its attempts on
+  // src/Uat.ts). Production files belong in production_targets.
+  for (const task of blueprint.tasks.filter(t => t.agent_role === 'test_writer')) {
+    const source = [...task.files_hint, ...task.creates_files].filter(file => !isTestFilePath(file));
+    if (source.length) errors.push(`${task.id} is a test_writer but lists source files it may not change: ${source.join(', ')}; list only test files, put the code under test in production_targets, and depend on the task that implements it`);
   }
 
   const taskById = new Map(blueprint.tasks.map(task => [task.id, task]));

@@ -10,7 +10,7 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { isTestFilePath, AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
 import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
@@ -3176,13 +3176,7 @@ export function diffHeaderFiles(diff: string): string[] {
     return [...new Set(files)];
 }
 
-/** True for a path that is a test file by language convention. */
-export function isTestFilePath(file: string): boolean {
-    return /\.(test|spec)\.[cm]?[jt]sx?$/.test(file)
-        || /_test\.go$/.test(file)
-        || /(^|\/)(__tests__|test|tests)\//.test(file)
-        || /(^|\/)test_[^/]+\.py$|_test\.py$/.test(file);
-}
+export { isTestFilePath } from './Planner.js';
 
 /** The non-test files a test-writer diff touches; empty for any other role. */
 export function testWriterScopeFiles(task: { agent_role?: string }, diff: string): string[] {

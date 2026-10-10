@@ -109,3 +109,14 @@ describe('OUTPUT_SCHEMA', () => {
     assert.deepEqual([...task.required].sort(), Object.keys(task.properties).sort());
   });
 });
+
+describe('a test writer may only be given test files', () => {
+  it('rejects a test_writer whose files include source, as the runtime would on every attempt', () => {
+    const plan = structuredClone(valid);
+    plan.tasks.push({ ...structuredClone(plan.tasks[0]), id: 'T009', agent_role: 'test_writer', dependencies: ['T001'], files_hint: ['src/Uat.ts'], creates_files: ['src/UatSuites.test.ts'], production_targets: ['src/Uat.ts'], test_targets: ['src/UatSuites.test.ts'] });
+    assert.throws(() => validateBlueprint(plan, input), /T009 is a test_writer but lists source files it may not change: src\/Uat\.ts/);
+    plan.tasks[plan.tasks.length - 1].files_hint = ['src/UatSuites.test.ts'];
+    assert.doesNotThrow(() => validateBlueprint(plan, input));
+  });
+});
+
