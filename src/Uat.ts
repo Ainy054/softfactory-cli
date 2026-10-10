@@ -26,6 +26,10 @@ export const UatSchema = z.object({
   setup: z.array(z.string()).default([]),
   /** Reachability: commands through the real route with the real auth; non-zero exit or an unmatched `expect` is a FAIL. */
   probes: z.array(z.object({ name: z.string(), run: z.string(), expect: z.string().optional() })).default([]),
+  /** Ordered suites of commands, each through the same runner as the probes. Non-gating suites run first (file order), then gating ones; only a gating failure fails the run. */
+  suites: z.array(z.object({ name: z.string(), commands: z.array(z.string()).min(1), gating: z.boolean().default(true) })).default([]),
+  /** With a `build` command, re-run it (step `rebuild before <name>`) before every suite after the first; a failed rebuild fails UAT. */
+  rebuild_between: z.boolean().default(false),
   /** Always run at the end, pass or fail (stopping the stack). */
   teardown: z.array(z.string()).default([]),
   timeout_seconds: z.number().int().positive().max(3600).default(600),
@@ -116,8 +120,28 @@ export async function runUat(
       steps.push({ name: `probe: ${probe.name}`, command, passed, detail: passed ? 'reachable' : exitCode !== 0 ? `exit ${exitCode}: ${tail(output)}` : `output did not match /${probe.expect}/: ${tail(output)}` });
       failed ||= !passed;
     }
-    if (!config.build && !config.setup.length && !config.probes.length) {
-      steps.push({ name: 'definition', passed: false, detail: `${UAT_FILE} defines no build, setup or probe` });
+    // Legacy suites that are allowed to fail must not wedge a gating one: non-gating first, then gating, each in file order.
+    const orderedSuites = [...config.suites.filter(s => !s.gating), ...config.suites.filter(s => s.gating)];
+    for (const [index, suite] of (failed ? [] : orderedSuites).entries()) {
+      if (index > 0 && config.rebuild_between && config.build) {
+        const { exitCode, output } = await run(`rebuild before ${suite.name}`, config.build);
+        steps.push({ name: `rebuild before ${suite.name}`, command: config.build, passed: exitCode === 0, detail: exitCode === 0 ? 'rebuilt' : `exit ${exitCode}: ${tail(output)}` });
+        if (exitCode !== 0) { failed = true; break; }
+      }
+      for (const command of suite.commands) {
+        const { exitCode, output } = await run(`suite ${suite.name}: ${command}`, command);
+        const passed = exitCode === 0;
+        if (suite.gating) {
+          steps.push({ name: `suite ${suite.name}: ${command}`, command, passed, detail: passed ? 'ok' : `exit ${exitCode}: ${tail(output)}` });
+          if (!passed) { failed = true; break; }
+        } else {
+          steps.push({ name: `suite ${suite.name}: ${command}`, command, passed: true, detail: passed ? 'ok' : `non-gating suite failed: exit ${exitCode}: ${tail(output)}` });
+        }
+      }
+      if (failed && suite.gating) break;
+    }
+    if (!config.build && !config.setup.length && !config.probes.length && !config.suites.length) {
+      steps.push({ name: 'definition', passed: false, detail: `${UAT_FILE} defines no build, setup, probe or suite` });
       failed = true;
     }
   } finally {
