@@ -240,12 +240,12 @@ Every field is required on every task. Do not wrap the object in any other key.`
 
 const REPAIR_ROUNDS = 2;
 
-function repairPrompt(error: Error, requirement: string, draft: unknown): string {
+function repairPrompt(error: Error, requirement: string, draft: unknown, earlier: string[] = []): string {
   return `Your previous plan was rejected. Repair this SoftFactory blueprint and return the complete corrected blueprint using the required output schema.
 
 Validation errors:
 ${error.message}
-
+${earlier.length ? `\nEarlier drafts were rejected for these reasons too; do not reintroduce any of them:\n${earlier.join('\n')}\n` : ''}
 Mandatory rule: requirements_covered must contain these section titles exactly:
 ${requirementHeadings(requirement).map(heading => `- ${heading}`).join('\n') || '(none)'}
 
@@ -286,6 +286,9 @@ abstract class BasePlanner implements IPlanner {
 
   private async planWithRepair(prompt: string, requirement: string, validationInput: PlanningInput): Promise<Blueprint> {
     let draft = await this.run(prompt);
+    // Each round used to see only its own errors, so a repair fixed one rule
+    // and broke another: coverage, then a shell operator, then npx (#41's run).
+    const earlier: string[] = [];
     for (let round = 0; round <= REPAIR_ROUNDS; round++) {
       try {
         return validateBlueprint(draft, validationInput);
@@ -293,7 +296,8 @@ abstract class BasePlanner implements IPlanner {
         const reasons = String(error?.message ?? error).split('\n').filter(l => l.startsWith('- '));
         this.log?.(`Planner draft rejected${round < REPAIR_ROUNDS ? ` (repair round ${round + 1} of ${REPAIR_ROUNDS})` : ' (no repair rounds left)'}:${reasons.length ? '\n  ' + reasons.join('\n  ') : ' ' + String(error?.message ?? error).replace(/\s+/g, ' ').slice(0, 300)}`);
         if (round === REPAIR_ROUNDS) throw error;
-        draft = await this.run(repairPrompt(error, requirement, draft));
+        draft = await this.run(repairPrompt(error, requirement, draft, earlier));
+        for (const reason of reasons) if (!earlier.includes(reason)) earlier.push(reason);
       }
     }
     throw new Error('Planner repair loop ended unexpectedly.');

@@ -62,6 +62,19 @@ describe('planner semantic validation', () => {
 });
 
 describe('planner repair rounds are visible', () => {
+  it('carries every earlier rejection into later repair prompts, so a fix does not reintroduce an old error', async () => {
+    const { TextModelPlanner } = await import('./Planner.js');
+    const npx = { ...valid, tasks: [{ ...valid.tasks[0], verification_command: 'npx vitest run src/App.test.tsx' }] };
+    const piped = { ...valid, tasks: [{ ...valid.tasks[0], verification_command: 'npm test && echo ok' }] };
+    const replies = [JSON.stringify(npx), JSON.stringify(piped), JSON.stringify(valid)];
+    const prompts: string[] = [];
+    const planner = new TextModelPlanner('deepseek', { provider: 'deepseek', model: 'm', isAvailable: async () => true, complete: async (prompt: string) => { prompts.push(prompt); return replies.shift()!; } } as any);
+    await planner.generateBlueprint(input);
+    assert.equal(prompts.length, 3);
+    assert.doesNotMatch(prompts[1], /Earlier drafts were rejected/, 'the first repair has no history yet');
+    assert.match(prompts[2], /Earlier drafts were rejected for these reasons too; do not reintroduce any of them:\n- T001 verification_command cannot run under the command policy \(npx/);
+  });
+
   it('logs each rejected draft with the validator reasons, then accepts the repaired one', async () => {
     const { TextModelPlanner } = await import('./Planner.js');
     const invalid = { ...valid, tasks: [{ ...valid.tasks[0], files_hint: ['src/Nope.ts'], verification_command: 'node -r ./evil.js x.js' }] };
