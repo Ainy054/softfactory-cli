@@ -1,4 +1,5 @@
 import { Task, Handoff } from './types.js';
+import type { Environment } from './Environment.js';
 import type { SandboxManager } from './Sandbox.js';
 
 export interface WorkerOptions {
@@ -39,6 +40,38 @@ export interface WorkerOptions {
    * compared with the attempt before it and a rerun is reproducible.
    */
   onPrompt?: (prompt: string) => void;
+  /**
+   * The safety block every worker prompt must carry as its very first text,
+   * built once per run from environment.json. See safetyPreamble.
+   */
+  preamble?: string;
+}
+
+/**
+ * The safety block every worker prompt starts with. It is assembled from the
+ * run's environment.json facts, but is a pure function of `env`, so two calls
+ * with the same environment produce byte-identical text. Workers cannot run
+ * deploy scripts, reach the live stack, or edit the orchestrator's files, and
+ * each attempt must affirm that the live stack was left untouched.
+ */
+export function safetyPreamble(env: Environment | undefined): string {
+  const bullets: string[] = [];
+  bullets.push(env
+    ? `- Live system (never touch it; work only in your isolated worktree): ${env.live}`
+    : `- No environment.json: assume a live system may exist and touch nothing outside your worktree.`);
+  const deploys: string[] = [];
+  if (env?.test_env?.deploy) deploys.push(`${env.test_env.name || 'TEST'} deploy "${env.test_env.deploy}"`);
+  if (env?.production?.deploy) deploys.push(`production deploy "${env.production.deploy}"`);
+  bullets.push(deploys.length
+    ? `- Never run deploy scripts (${deploys.join(', ')}), never ssh, and never touch .env or secrets.`
+    : `- Never run deploy scripts, never ssh, and never touch .env or secrets.`);
+  bullets.push(`- Do not run \`docker compose up/down/build/restart\`; the orchestrator owns the stacks.`);
+  bullets.push(`- You are in an isolated worktree; never run git against another checkout.`);
+  if (env?.orchestrator_files?.length) {
+    bullets.push(`- Files only the orchestrator edits (never edit these; send the change as the handoff's wiring_patch): ${env.orchestrator_files.join(', ')}`);
+  }
+  bullets.push(`- When you finish, affirm "live stack untouched".`);
+  return `CRITICAL SAFETY:\n${bullets.join('\n')}\n`;
 }
 
 /**

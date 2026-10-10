@@ -21,7 +21,9 @@ export class CodexWorker implements IWorker {
     const previousFeedback = task.last_feedback
       ? task.last_feedback.slice(0, 4000)
       : '';
-    const prompt = `You are a SoftFactory worker in an isolated git worktree. Implement the task directly, run relevant tests, and do not modify files outside this worktree.
+    // The safety preamble is the very first text of the prompt, before the role line.
+    const preamble = options.preamble?.trim() ? `${options.preamble.endsWith('\n') ? options.preamble : `${options.preamble}\n`}` : '';
+    const prompt = `${preamble}You are a SoftFactory worker in an isolated git worktree. Implement the task directly, run relevant tests, and do not modify files outside this worktree.
 Task ${task.id}: ${task.title}
 Role: ${task.agent_role}
 Description: ${task.description}
@@ -40,7 +42,8 @@ Before finishing, write ${handoffPath} as JSON with task_id, status, files_chang
     options.onPrompt?.(prompt);
     options.onOutput?.(`[Codex Worker] Starting ${task.id}${model ? ` with ${model}` : ' with the configured Codex default model'}`);
     const proc = execa('codex', buildCodexExecArgs(prompt, model), buildCodexExecOptions(worktreePath, options.signal));
-    if (options.onOutput) proc.all?.on('data', chunk => options.onOutput?.(chunk.toString().trim()));
+    let output = '';
+    proc.all?.on('data', chunk => { output += chunk.toString(); options.onOutput?.(chunk.toString().trim()); });
     try {
       await proc;
     } catch (error: any) {
@@ -51,9 +54,21 @@ Before finishing, write ${handoffPath} as JSON with task_id, status, files_chang
       if (auth) throw new WorkerEnvironmentError(`Codex could not authenticate: ${auth.trim().slice(0, 200)}. No task retry was consumed.`);
       throw error;
     }
-    try { return HandoffSchema.parse(JSON.parse(await fs.readFile(handoffPath, 'utf8'))); }
-    catch { return { task_id: task.id, status: 'success', files_changed: task.files_hint, summary: `Completed with Codex/${model || 'default'}` }; }
+    const affirmed = affirmsLiveStackUntouched(output);
+    try { return { ...HandoffSchema.parse(JSON.parse(await fs.readFile(handoffPath, 'utf8'))), ...(affirmed ? { live_stack_untouched: true } : {}) }; }
+    catch { return { task_id: task.id, status: 'success', files_changed: task.files_hint, summary: `Completed with Codex/${model || 'default'}`, ...(affirmed ? { live_stack_untouched: true } : {}) }; }
   }
+}
+
+/**
+ * The safety block ends by asking the worker to affirm "live stack untouched";
+ * that affirmation is the literal line, matched case-insensitively after
+ * trimming each line of the final output.
+ */
+function affirmsLiveStackUntouched(output: string | undefined): boolean {
+  return String(output ?? '')
+    .split('\n')
+    .some(line => line.trim().toLowerCase().includes('live stack untouched'));
 }
 
 /** Build a non-interactive invocation. --approve-for-me already implies workspace-write. */

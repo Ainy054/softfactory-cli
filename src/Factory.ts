@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
 import { WorktreeManager, SharedCheckoutManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
-import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand } from './IWorker.js';
+import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand, safetyPreamble } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
@@ -1182,6 +1182,7 @@ export class Factory extends EventEmitter {
                     projectContext,
                     requirement: this.state?.requirement,
                     brief: this.state?.brief,
+                    preamble: safetyPreamble(this.environment),
                     orchestratorFiles: this.environment?.orchestrator_files,
                     retryBrief: task.attempts > 0 ? await this.retryBrief(task, worktreePath) : undefined,
                     memoryPatterns: [...await this.lessons.getRelevant(task), ...this.notesFor(task.id)],
@@ -1257,6 +1258,16 @@ export class Factory extends EventEmitter {
                 this.log(`REJECTED: ${task.id} — ${notDone}`);
                 processFailure(notDone);
                 await this.recordAttempt(task, 'reported_not_done', notDone);
+                return null;
+            }
+            // Every worker affirms it left the live stack alone. The affirmation
+            // is only required when the project declares a live system in
+            // environment.json; a project without one owes no such promise.
+            const unaffirmed = this.safetyAffirmationViolation(handoff);
+            if (unaffirmed) {
+                this.log(`REJECTED: ${task.id} — the handoff lacks the live-stack affirmation`);
+                processFailure(unaffirmed);
+                await this.recordAttempt(task, 'no_safety_affirmation', unaffirmed);
                 return null;
             }
             const fabricated = await this.claimProblems(task, handoff, worktreePath);
@@ -2732,6 +2743,7 @@ export class Factory extends EventEmitter {
         verification_sabotage: 'Do not disable, delete or weaken tests or the test script.',
         fabricated_claim: 'Do not cite a file line you have not read; cite real lines or mark the claim UNVERIFIED.',
         reported_not_done: 'Do not report the acceptance work as unfinished; finish it before calling finish_task.',
+        no_safety_affirmation: 'End by affirming "live stack untouched": set live_stack_untouched to true when you finish.',
         stale_fork: 'Do not assume the files are as they were: re-read them, they changed after your last attempt.',
         attempt_timeout: 'Do not run the whole suite or long commands; run the focused test only, and finish sooner.',
         worker_error: 'Do not repeat the step that crashed the previous attempt.',
@@ -2758,7 +2770,7 @@ export class Factory extends EventEmitter {
         this.log(`RECOVERED: ${task.id} — the worker stopped (${reason}) but left ${changed.length} changed file(s) whose acceptance command passes; the gates judge it.`);
         await this.recordAttempt(task, 'recovered_worker', reason);
         await this.journal()?.append('task:recovered', { task_id: task.id, reason, files: changed }, acceptance.evidencePath ? [acceptance.evidencePath] : []).catch(() => undefined);
-        return { task_id: task.id, status: 'success', files_changed: changed, summary: `Recovered after the worker stopped (${reason}); its acceptance command passes on the work it left.` };
+        return { task_id: task.id, status: 'success', files_changed: changed, live_stack_untouched: true, summary: `Recovered after the worker stopped (${reason}); its acceptance command passes on the work it left.` };
     }
 
     /**
@@ -2830,6 +2842,17 @@ export class Factory extends EventEmitter {
             if (quotesCommand || sharesWord) return `the worker reported acceptance work as not done: ${item}`;
         }
         return null;
+    }
+
+    /**
+     * Every worker must affirm it left the live stack untouched. The promise is
+     * only owed when the project declares a live system in environment.json; a
+     * project without one has nothing that could be touched.
+     */
+    safetyAffirmationViolation(handoff: Handoff): string | null {
+        if (!this.environment) return null;
+        if (handoff.live_stack_untouched === true) return null;
+        return 'Affirm "live stack untouched" when you finish.';
     }
 
     /** A per-task note, never a failure: the export may be wired by a later task of this run. */
