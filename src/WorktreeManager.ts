@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 export class WorktreeManager {
-  private baseDir: string;
+  protected baseDir: string;
   private worktreeBase: string;
   private hydratedFiles = new Map<string, Map<string, Buffer>>();
 
@@ -177,8 +177,13 @@ export class WorktreeManager {
     return /(^|[\\/])\.env(\.[A-Za-z0-9_.-]+)?$/.test(relativePath) && !/\.example$/i.test(relativePath);
   }
 
+  /** Where a task's files are; the main checkout in shared-sequential mode. */
+  protected worktreePathFor(taskId: string): string {
+    return path.join(this.worktreeBase, taskId);
+  }
+
   async commitWorktree(taskId: string): Promise<{ committed: boolean; filesChanged: number }> {
-    const worktreePath = path.join(this.worktreeBase, taskId);
+    const worktreePath = this.worktreePathFor(taskId);
 
     await execa('git', ['add', '.'], { cwd: worktreePath });
     await this.unstageHydratedAndSecretFiles(taskId, worktreePath);
@@ -298,5 +303,60 @@ export class WorktreeManager {
     for (const added of stdout.split('\n').filter(f => f && WorktreeManager.isSecretFile(f))) {
       await execa('git', ['reset', '--', added], { cwd: worktreePath, reject: false });
     }
+  }
+}
+
+/**
+ * Shared-sequential isolation, borrowed from Softhouse, for repositories
+ * where worktrees are impractical (a slow monorepo install). No worktrees:
+ * one task at a time works in the main checkout, on its own line/<task>
+ * branch, and merges as usual, so every gate and every diff is unchanged.
+ * The checkout must be clean. The worker can see .softfactory/ here, so the
+ * gate files are snapshotted before each task and restored if touched.
+ */
+export class SharedCheckoutManager extends WorktreeManager {
+  static readonly GATE_FILES = ['uat.json', 'environment.json', 'protected-paths.txt', 'non-negotiables.txt', 'config.json', 'worker-context.md'];
+  private target: string | undefined;
+  private snapshot = new Map<string, string | null>();
+
+  async getDefaultBranch(): Promise<string> {
+    return this.target ?? super.getDefaultBranch();
+  }
+
+  protected worktreePathFor(): string {
+    return this.baseDir;
+  }
+
+  async create(taskId: string, branchName: string, resume = false): Promise<string> {
+    const dirty = await this.uncommittedTrackedFiles();
+    if (dirty.length) throw new Error(`shared isolation needs a clean checkout; commit or stash: ${dirty.slice(0, 5).join(', ')}`);
+    const { stdout } = await execa('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: this.baseDir });
+    if (!stdout.trim().startsWith('line/')) this.target = stdout.trim();
+    if (resume && await this.branchExists(branchName)) await execa('git', ['checkout', '-q', branchName], { cwd: this.baseDir });
+    else await execa('git', ['checkout', '-q', '-B', branchName, this.target!], { cwd: this.baseDir });
+    this.snapshot.clear();
+    for (const name of SharedCheckoutManager.GATE_FILES) {
+      this.snapshot.set(name, await fs.readFile(path.join(this.baseDir, '.softfactory', name), 'utf8').catch(() => null));
+    }
+    return this.baseDir;
+  }
+
+  /** Gate files the task changed, each restored to its snapshot. */
+  async tamperedGateFiles(): Promise<string[]> {
+    const changed: string[] = [];
+    for (const [name, before] of this.snapshot) {
+      const file = path.join(this.baseDir, '.softfactory', name);
+      const now = await fs.readFile(file, 'utf8').catch(() => null);
+      if (now === before) continue;
+      changed.push(`.softfactory/${name}`);
+      if (before === null) await fs.rm(file, { force: true });
+      else await fs.writeFile(file, before);
+    }
+    return changed;
+  }
+
+  async cleanup(_taskId: string, branchName: string, keepBranch = false) {
+    if (this.target) await execa('git', ['checkout', '-q', this.target], { cwd: this.baseDir, reject: false });
+    if (!keepBranch) await execa('git', ['branch', '-D', branchName], { cwd: this.baseDir, reject: false });
   }
 }

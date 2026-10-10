@@ -3,7 +3,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { CURRENT_SCHEMA_VERSION, FactoryStateSchema, TaskSchema, type FactoryEvent, type FactoryState, type FeatureHistoryEntry, type Task } from './types.js';
-import { WorktreeManager } from './WorktreeManager.js';
+import { WorktreeManager, SharedCheckoutManager } from './WorktreeManager.js';
 import { WorkerRegistry, type CloudProvider, type WorkerStrategy } from './WorkerRegistry.js';
 import { isEnvironmentFailure, WorkerEnvironmentError, isDeferredAcceptance, deferredCommand } from './IWorker.js';
 import { TaskVerifier } from './TaskVerifier.js';
@@ -68,6 +68,8 @@ export interface FactoryOptions {
     issue?: { number: number; url: string; title: string };
     /** Skip .softfactory/uat.json at the end of the run. */
     skipUat?: boolean;
+    /** "shared": no worktrees; one task at a time in the main checkout (which must be clean). */
+    isolation?: 'worktree' | 'shared';
     /** Archive an unfinished feature, unfinished, so a new requirement can start. */
     abandon?: boolean;
     /** Asked once, between planning and the first worker; absent means unattended. */
@@ -179,7 +181,7 @@ export class Factory extends EventEmitter {
         this.archiveDir = path.join(baseDir, '.softfactory', 'archive');
         this.queueDir = path.join(baseDir, '.softfactory', 'queue');
         this.memoryPath = path.join(baseDir, '.softfactory', 'FACTORY_MEMORY.md');
-        this.worktreeManager = new WorktreeManager(baseDir);
+        this.worktreeManager = options.isolation === 'shared' ? new SharedCheckoutManager(baseDir) : new WorktreeManager(baseDir);
         // An explicit --local-model must pin every local tier. Passing undefined
         // left the light/heavy tiers on their hardcoded qwen defaults, so the
         // chosen model was honoured on a task's first attempt and silently
@@ -882,6 +884,14 @@ export class Factory extends EventEmitter {
             this.log(`HALTED: ${this.environmentFault}`);
             return;
         }
+        if (this.worktreeManager instanceof SharedCheckoutManager) {
+            const dirty = await this.worktreeManager.uncommittedTrackedFiles();
+            if (dirty.length) {
+                this.environmentFault = `shared isolation works in the main checkout, which has uncommitted changes (${dirty.slice(0, 5).join(', ')}). Commit or stash them, then --resume; no task retry was consumed.`;
+                this.log(`HALTED: ${this.environmentFault}`);
+                return;
+            }
+        }
         if (!this.baseline) await this.captureBaseline();
         this.runStartedAt = Date.now();
         while (this.hasUnfinishedTasks()) {
@@ -921,8 +931,10 @@ export class Factory extends EventEmitter {
                 }
                 return !overlaps;
             });
+            // Shared-sequential isolation: one task at a time in the main checkout.
+            if (this.worktreeManager instanceof SharedCheckoutManager) readyTasks.splice(1);
             this.emitEvent({ type: 'phase:start', phase: currentPhase });
-            this.log(`Phase ${currentPhase}: Running ${readyTasks.length} task(s) in parallel`);
+            this.log(`Phase ${currentPhase}: Running ${readyTasks.length} task(s) ${this.worktreeManager instanceof SharedCheckoutManager ? 'in the shared checkout' : 'in parallel'}`);
             // Pre-create worktrees sequentially (git uses a lock file, concurrent creates race)
             const worktreeMap = new Map();
             for (const task of readyTasks) {
@@ -1211,6 +1223,18 @@ export class Factory extends EventEmitter {
             // only treat a reported failure as fatal when the worktree is also
             // empty. Otherwise let the verifier and inspector adjudicate.
             // Commit changes in worktree so diff is visible for inspection
+            // In the shared checkout a worker can reach .softfactory/; a task may
+            // not change the files that judge it.
+            if (this.worktreeManager instanceof SharedCheckoutManager) {
+                const tampered = await this.worktreeManager.tamperedGateFiles();
+                if (tampered.length) {
+                    const feedback = `You changed ${tampered.join(', ')}, which only the operator may edit; it was restored. Do not touch .softfactory/.`;
+                    this.log(`REJECTED: ${task.id} — changed gate files ${tampered.join(', ')} (restored)`);
+                    processFailure(feedback);
+                    await this.recordAttempt(task, 'gate_file_changed', feedback);
+                    return null;
+                }
+            }
             const commitResult = await this.worktreeManager.commitWorktree(task.id);
             if (!commitResult.committed) {
                 if (handoff.status === 'failure') {

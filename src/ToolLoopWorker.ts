@@ -760,6 +760,9 @@ ${projectContext}
 
   private resolveToolPath(worktreePath: string, rawPath: unknown, task: Task, write: boolean, orchestratorFiles?: string[]): string {
     if (typeof rawPath !== 'string' || !rawPath || path.isAbsolute(rawPath)) throw new Error('Path must be a non-empty relative path.');
+    // The orchestrator's state and the repository's own metadata are never a worker's to write
+    // (in shared isolation the worker runs in the main checkout, where both are reachable).
+    if (write && /^(?:\.softfactory|\.git)(?:\/|$)/.test(path.normalize(rawPath))) throw new Error(`${rawPath} belongs to the orchestrator; workers may not write under .softfactory/ or .git/.`);
     if (write && orchestratorFiles?.some(glob => ProtectedPaths.toRegex(glob).test(path.normalize(rawPath)))) {
       throw new Error(`${rawPath} is orchestrator-owned: do not edit it. Put the exact change in finish_task's wiring_patch as a unified diff (--- a/${rawPath}, +++ b/${rawPath}); it is applied on your branch before review.`);
     }
