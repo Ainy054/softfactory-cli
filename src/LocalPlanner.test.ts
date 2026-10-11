@@ -156,3 +156,25 @@ describe('the Antigravity planner uses the shared prompt and repair loop', () =>
     assert.doesNotMatch(prompts[0], /DEVOPS FIRST/);
   });
 });
+
+describe('planning calls get the planner timeout, not the worker turn default', () => {
+  it('passes 15 minutes by default and honours SOFTFACTORY_PLANNER_TIMEOUT_MS', async () => {
+    const { TextModelPlanner } = await import('./Planner.js');
+    const timeouts: Array<number | undefined> = [];
+    const planner = new TextModelPlanner('agy', {
+      provider: 'agy', model: 'Gemini 3.1 Pro (High)', isAvailable: async () => true,
+      complete: async (_prompt: string, options: any = {}) => { timeouts.push(options.timeoutMs); return goodPlan; },
+    });
+    const saved = process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS;
+    try {
+      delete process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS;
+      await planner.generateBlueprint(input as any);
+      process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS = '1200000';
+      await planner.generateBlueprint(input as any);
+    } finally {
+      if (saved === undefined) delete process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS;
+      else process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS = saved;
+    }
+    assert.deepEqual(timeouts, [15 * 60_000, 1_200_000]);
+  });
+});

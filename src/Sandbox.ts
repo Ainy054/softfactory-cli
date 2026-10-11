@@ -110,13 +110,25 @@ const IMAGES: Record<string, string> = {
 const SANDBOX_TOOLS = ['git', 'ripgrep', 'make', 'ca-certificates'];
 
 export function sandboxDockerfile(base: string): string {
-  return `FROM ${base}\nRUN apt-get update && apt-get install -y --no-install-recommends ${SANDBOX_TOOLS.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
+  const apt = `RUN apt-get update && apt-get install -y --no-install-recommends ${SANDBOX_TOOLS.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
+  // pytest in the image itself: a greenfield Python plan's acceptance commands
+  // run before any requirements file exists, and the network is off.
+  const python = base === IMAGES.python ? `RUN pip install --no-cache-dir --disable-pip-version-check ${PYTHON_TOOLS.join(' ')}\n` : '';
+  return `FROM ${base}\n${apt}${python}`;
 }
 
-/** The locally built image for a stock base; an override image is used as is. */
+/** What every Python project's checks reach for, whatever its manifest lists. */
+const PYTHON_TOOLS = ['pytest'];
+
+/**
+ * The locally built image for a stock base; an override image is used as is.
+ * The tag carries the Dockerfile's hash, so a change to what the image ships
+ * rebuilds it instead of reusing an older build without the new tools.
+ */
 export function derivedImageName(base: string): string | undefined {
   const key = Object.entries(IMAGES).find(([, value]) => value === base)?.[0];
-  return key ? `softfactory-sandbox-${key}:latest` : undefined;
+  if (!key) return undefined;
+  return `softfactory-sandbox-${key}:${createHash('sha256').update(sandboxDockerfile(base)).digest('hex').slice(0, 12)}`;
 }
 
 export interface NodeDependencyPlan {
@@ -160,6 +172,50 @@ export async function nodeDependencyPlan(rootPath: string): Promise<NodeDependen
   return undefined;
 }
 
+export interface PythonDependencyPlan {
+  /** The manifest the dependencies come from. */
+  manifest: 'requirements.txt' | 'pyproject.toml';
+  rootPath: string;
+  /** Named Docker volume holding a virtualenv, one per manifest content and CPU architecture. */
+  volume: string;
+}
+
+/** Where the dependency virtualenv is mounted inside the sandbox. */
+export const PYTHON_VENV = '/opt/softfactory-venv';
+
+/**
+ * Python dependencies for the sandbox, the counterpart of nodeDependencyPlan:
+ * the network is off when commands run, so nothing a test imports (fastapi,
+ * httpx) is there unless it was installed beforehand. The install happens
+ * once per manifest content, into a virtualenv in a named volume, with
+ * pytest alongside so the venv is complete on its own.
+ */
+export async function pythonDependencyPlan(rootPath: string): Promise<PythonDependencyPlan | undefined> {
+  for (const manifest of ['requirements.txt', 'pyproject.toml'] as const) {
+    let content: string;
+    try { content = await fs.readFile(path.join(rootPath, manifest), 'utf8'); } catch { continue; }
+    const hash = createHash('sha256').update(`${manifest}\n${process.arch}\n${IMAGES.python}\nvenv-isolated\n${PYTHON_TOOLS.join(' ')}\n${content}`).digest('hex').slice(0, 12);
+    return { manifest, rootPath, volume: `softfactory-pydeps-${hash}` };
+  }
+  return undefined;
+}
+
+/**
+ * The install script for a plan. pyproject.toml lists dependencies without
+ * the package source being installable on its own, so its runtime and
+ * optional dependency lists are read and installed directly.
+ */
+export function pythonInstallScript(plan: PythonDependencyPlan): string {
+  const venv = `python -m venv ${PYTHON_VENV}`;
+  const pip = `${PYTHON_VENV}/bin/pip install --no-cache-dir --disable-pip-version-check`;
+  // pytest inside the venv too: the image's own pytest launcher runs the
+  // image's interpreter, which does not see the venv's packages.
+  const tools = `${pip} ${PYTHON_TOOLS.join(' ')}`;
+  if (plan.manifest === 'requirements.txt') return `${venv} && ${pip} -r /src/requirements.txt && ${tools}`;
+  const read = `import tomllib; p = tomllib.load(open('/src/pyproject.toml', 'rb')).get('project', {}); print('\\n'.join(p.get('dependencies', []) + [d for ds in p.get('optional-dependencies', {}).values() for d in ds]))`;
+  return `${venv} && python -c "${read}" > /tmp/deps.txt && if [ -s /tmp/deps.txt ]; then ${pip} -r /tmp/deps.txt; fi && ${tools}`;
+}
+
 /**
  * Decides where model-chosen commands run. "auto" uses Docker when it is
  * available and refuses to proceed when it is not, so an unsandboxed run is
@@ -170,6 +226,7 @@ export class SandboxManager {
   private detected = false;
   private readonly ensuredImages = new Set<string>();
   private readonly dependencyVolumes = new Map<string, Promise<boolean>>();
+  private readonly pythonVolumes = new Map<string, Promise<boolean>>();
   private readonly log: (line: string) => void;
   private agents: AgentContainer | undefined;
 
@@ -217,11 +274,14 @@ export class SandboxManager {
       python: await has('pyproject.toml') || await has('requirements.txt') || await has('pytest.ini'),
       rust: await has('Cargo.toml'),
     };
+    // The command names its toolchain even before any manifest exists: a
+    // greenfield plan's `pytest` once ran in the generic image and every
+    // acceptance probe came back unrunnable.
     if (executable) {
-      if (['npm', 'pnpm', 'yarn', 'node', 'vitest', 'tsc', 'eslint'].includes(executable) && present.node) return IMAGES.node;
-      if (executable === 'go' && present.go) return IMAGES.go;
-      if (['pytest', 'python', 'python3'].includes(executable) && present.python) return IMAGES.python;
-      if (executable === 'cargo' && present.rust) return IMAGES.rust;
+      if (['npm', 'npx', 'pnpm', 'yarn', 'node', 'vitest', 'tsc', 'eslint'].includes(executable)) return IMAGES.node;
+      if (executable === 'go') return IMAGES.go;
+      if (['pytest', 'python', 'python3', 'pip', 'pip3'].includes(executable)) return IMAGES.python;
+      if (executable === 'cargo') return IMAGES.rust;
     }
     for (const key of ['node', 'go', 'python', 'rust'] as const) if (present[key]) return IMAGES[key];
     return IMAGES.generic;
@@ -344,6 +404,46 @@ export class SandboxManager {
     }
   }
 
+  /** The dependency virtualenv for a Python root, read-only; empty without a manifest or when the install failed. */
+  async pythonDependencyMounts(rootPath: string): Promise<Mount[]> {
+    const plan = await pythonDependencyPlan(rootPath);
+    if (!plan) return [];
+    let pending = this.pythonVolumes.get(plan.volume);
+    if (!pending) {
+      pending = this.installPythonDependencyVolume(plan);
+      this.pythonVolumes.set(plan.volume, pending);
+    }
+    if (!await pending) return [];
+    return [{ host: plan.volume, container: PYTHON_VENV, readOnly: true }];
+  }
+
+  protected async installPythonDependencyVolume(plan: PythonDependencyPlan): Promise<boolean> {
+    try {
+      await execa('docker', ['volume', 'inspect', plan.volume], { timeout: 15000 });
+      return true;
+    } catch { /* not yet */ }
+    const image = await this.ensureImage(IMAGES.python);
+    const started = Date.now();
+    this.log(`Sandbox: installing Python dependencies from ${plan.manifest} into volume ${plan.volume} (Linux, network on for this step only)...`);
+    try {
+      await execa('docker', ['volume', 'create', '--label', 'softfactory.deps=1', '--label', 'softfactory.manager=pip', plan.volume], { timeout: 30000 });
+      await execa('docker', [
+        'run', '--rm', '--network', 'bridge', '--init', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--tmpfs', '/tmp:rw,exec,size=2g', '--memory', '4g', '--cpus', '2', '--pids-limit', '512',
+        '-v', `${path.join(plan.rootPath, plan.manifest)}:/src/${plan.manifest}:ro`, '-v', `${plan.volume}:${PYTHON_VENV}`,
+        '-e', 'HOME=/tmp', '-e', 'PIP_DISABLE_PIP_VERSION_CHECK=1',
+        '--entrypoint', 'sh', image, '-c', pythonInstallScript(plan),
+      ], { timeout: 15 * 60_000 });
+      this.log(`Sandbox: Python dependencies ready in ${Math.round((Date.now() - started) / 1000)}s (${plan.volume})`);
+      return true;
+    } catch (error: any) {
+      await execa('docker', ['volume', 'rm', '-f', plan.volume], { timeout: 30000 }).catch(() => undefined);
+      const tail = String(error?.stderr || error?.stdout || error?.message || error).trim().split('\n').slice(-4).join(' | ');
+      this.log(`Sandbox: Python dependency install failed; commands see only the image's own packages. ${tail}`);
+      return false;
+    }
+  }
+
   /** Where whole CLI agents run when the sandbox is active; built on first use. */
   agentContainer(): AgentContainer {
     if (!this.agents) this.agents = new AgentContainer(this.log);
@@ -357,12 +457,17 @@ export class SandboxManager {
 
   async runnerFor(rootPath: string, executable?: string): Promise<CommandRunner> {
     if (!this.active) return new HostRunner();
-    const image = await this.ensureImage(await this.imageFor(rootPath, executable));
+    const base = await this.imageFor(rootPath, executable);
+    const image = await this.ensureImage(base);
     const user = process.platform === 'linux' && typeof process.getuid === 'function' ? `${process.getuid()}:${process.getgid?.() ?? 0}` : undefined;
+    const python = base === IMAGES.python ? await this.pythonDependencyMounts(rootPath) : [];
     return new DockerRunner({
       image,
-      mounts: [...SandboxManager.mountsFor(rootPath), ...await SandboxManager.cacheMounts(), ...await this.nodeDependencyMounts(rootPath)],
-      env: { GOFLAGS: '-mod=mod', GOMODCACHE: '/go/pkg/mod', GOCACHE: '/tmp/gocache', npm_config_cache: '/tmp/.npm', npm_config_update_notifier: 'false', PIP_NO_INDEX: '1' },
+      mounts: [...SandboxManager.mountsFor(rootPath), ...await SandboxManager.cacheMounts(), ...await this.nodeDependencyMounts(rootPath), ...python],
+      env: {
+        GOFLAGS: '-mod=mod', GOMODCACHE: '/go/pkg/mod', GOCACHE: '/tmp/gocache', npm_config_cache: '/tmp/.npm', npm_config_update_notifier: 'false', PIP_NO_INDEX: '1',
+        ...(python.length ? { VIRTUAL_ENV: PYTHON_VENV, PATH: `${PYTHON_VENV}/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin` } : {}),
+      },
       user,
     });
   }

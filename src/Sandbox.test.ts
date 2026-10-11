@@ -79,6 +79,17 @@ describe('the docker runner', () => {
     await fs.writeFile(path.join(dir, '.softfactory', 'config.json'), JSON.stringify({ sandboxImage: 'my/toolchain:1' }));
     assert.equal(await sandbox.imageFor(dir, 'go'), 'my/toolchain:1');
   });
+
+  it('picks the toolchain from the command when no manifest exists yet', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-img-'));
+    const sandbox = new SandboxManager('docker');
+    // A greenfield Python plan's probes ran in the generic image: no python3, no pytest.
+    assert.match(await sandbox.imageFor(dir, 'pytest'), /^python:/);
+    assert.match(await sandbox.imageFor(dir, 'python3'), /^python:/);
+    assert.match(await sandbox.imageFor(dir, 'go'), /^golang:/);
+    assert.match(await sandbox.imageFor(dir, 'npx'), /^node:/);
+    assert.match(await sandbox.imageFor(dir, 'grep'), /^debian/);
+  });
 });
 
 describe('an unsandboxed run is a choice, never a default', () => {
@@ -152,8 +163,11 @@ describe('the verifier and the acceptance runner execute through the sandbox', (
 describe('the sandbox image carries the tools the allowlist promises', () => {
   it('derives a local image from each stock base, and leaves an override image alone', async () => {
     const { derivedImageName, sandboxDockerfile } = await import('./Sandbox.js');
-    assert.equal(derivedImageName('node:20-bookworm-slim'), 'softfactory-sandbox-node:latest');
-    assert.equal(derivedImageName('debian:bookworm-slim'), 'softfactory-sandbox-generic:latest');
+    // The tag follows the Dockerfile, so a new tool rebuilds an older image.
+    assert.match(derivedImageName('node:20-bookworm-slim')!, /^softfactory-sandbox-node:[0-9a-f]{12}$/);
+    assert.match(derivedImageName('debian:bookworm-slim')!, /^softfactory-sandbox-generic:[0-9a-f]{12}$/);
+    assert.match(sandboxDockerfile('python:3.12-slim-bookworm'), /pip install .*\bpytest\b/);
+    assert.doesNotMatch(sandboxDockerfile('node:20-bookworm-slim'), /pip install/);
     assert.equal(derivedImageName('my/toolchain:1'), undefined);
     const dockerfile = sandboxDockerfile('node:20-bookworm-slim');
     assert.match(dockerfile, /^FROM node:20-bookworm-slim\n/);
@@ -222,5 +236,27 @@ describe('Node dependencies are installed for the sandbox platform, not copied f
     sandbox.nodeDependencyMounts = async () => [{ host: 'softfactory-deps-abc', container: path.join(dir, 'node_modules') }];
     assert.deepEqual(await new TaskVerifier(sandbox as SandboxManager).prepare(dir, { files_hint: ['src/a.ts'] } as any), { ok: true });
     await assert.rejects(fs.access(path.join(dir, 'node_modules')), 'no host npm ci ran');
+  });
+});
+
+describe('Python dependencies are installed into a venv volume for the sandbox', () => {
+  it('plans one volume per manifest content and installs pytest beside the project deps', async () => {
+    const { pythonDependencyPlan, pythonInstallScript, PYTHON_VENV } = await import('./Sandbox.js');
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-py-'));
+    assert.equal(await pythonDependencyPlan(dir), undefined);
+    await fs.writeFile(path.join(dir, 'requirements.txt'), 'fastapi\n');
+    const first = (await pythonDependencyPlan(dir))!;
+    assert.equal(first.manifest, 'requirements.txt');
+    assert.match(first.volume, /^softfactory-pydeps-[0-9a-f]{12}$/);
+    await fs.writeFile(path.join(dir, 'requirements.txt'), 'fastapi\nhttpx\n');
+    assert.notEqual((await pythonDependencyPlan(dir))!.volume, first.volume, 'a changed manifest gets a fresh volume');
+    const script = pythonInstallScript(first);
+    assert.match(script, new RegExp(`python -m venv ${PYTHON_VENV}`));
+    assert.doesNotMatch(script, /system-site-packages/, 'pip would skip pytest when the image already has it');
+    assert.match(script, /-r \/src\/requirements\.txt/);
+    assert.match(script, /pip install [^&]*\bpytest\b/);
+    const pyproject = pythonInstallScript({ manifest: 'pyproject.toml', rootPath: dir, volume: 'v' });
+    assert.match(pyproject, /tomllib/);
+    assert.match(pyproject, /optional-dependencies/);
   });
 });

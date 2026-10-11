@@ -335,12 +335,18 @@ abstract class BasePlanner implements IPlanner {
   }
 }
 
+/** A planning turn reasons over the whole repository, so it gets longer than a worker turn. */
+export function plannerTimeoutMs(): number {
+  const value = Number(process.env.SOFTFACTORY_PLANNER_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 15 * 60_000;
+}
+
 /** Any ITextModel can plan: the prompt states the shape and the loop repairs it. */
 export class TextModelPlanner extends BasePlanner {
   constructor(readonly provider: PlannerProvider, private readonly textModel: ITextModel) { super(); }
 
   protected async run(prompt: string): Promise<unknown> {
-    return extractJson(await this.textModel.complete(`${prompt}\n${SCHEMA_INSTRUCTION}`, { json: true, temperature: 0.1 }));
+    return extractJson(await this.textModel.complete(`${prompt}\n${SCHEMA_INSTRUCTION}`, { json: true, temperature: 0.1, timeoutMs: plannerTimeoutMs() }));
   }
 
   protected contextCharBudget(): number | undefined {
@@ -366,7 +372,7 @@ export class CodexPlanner extends BasePlanner {
         '--output-last-message', outputPath,
         ...(this.model ? ['--model', this.model] : []),
         prompt,
-      ], { cwd: this.cwd, stdin: 'ignore', timeout: 300000, all: true });
+      ], { cwd: this.cwd, stdin: 'ignore', timeout: plannerTimeoutMs(), all: true });
       return JSON.parse(await fs.readFile(outputPath, 'utf8'));
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
