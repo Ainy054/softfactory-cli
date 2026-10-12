@@ -1696,6 +1696,7 @@ export class Factory extends EventEmitter {
                 this.log(`FINAL GATE FAILED on ${this.mergeTarget()}: ${blocking.map(c => c.testSummary).join('; ')}`);
                 this.log(blocking[0].output.slice(0, 1000));
                 this.state.status = 'failed';
+                this.state.failure_reason = `final gate failed: ${blocking.map(c => c.testSummary).join('; ')}`.slice(0, 300);
                 await this.saveState();
                 await this.updateHistory('failed');
             } else if (executed.some(check => !check.passed)) {
@@ -2997,6 +2998,7 @@ export class Factory extends EventEmitter {
         }
         this.log(`FINAL GATE FAILED: this run added library code that nothing calls: ${added.map(u => `${u.name} (${u.file})`).join(', ')}. Wire it, or stop exporting it.`);
         this.state.status = 'failed';
+        this.state.failure_reason = `final gate: new exports nothing calls: ${added.map(u => `${u.name} (${u.file})`).join(', ')}`.slice(0, 300);
         await this.saveState();
         await this.updateHistory('failed');
     }
@@ -3300,6 +3302,7 @@ export class Factory extends EventEmitter {
             this.log(`UAT FAILED: ${error.message}`);
             this.state.uat_result = 'failed';
             this.state.status = 'failed';
+            this.state.failure_reason = `UAT could not run: ${error.message}`.slice(0, 300);
             await this.saveState();
             await this.updateHistory('failed');
             return undefined;
@@ -3325,6 +3328,7 @@ export class Factory extends EventEmitter {
             const evidence = result.evidencePath ? path.relative(this.baseDir, result.evidencePath) : 'none';
             this.log(`UAT FAILED: the merged code does not pass live verification (evidence: ${evidence}).`);
             this.state.status = 'failed';
+            this.state.failure_reason = `UAT failed: ${result.steps.filter(step => !step.passed).map(step => step.name).join(', ')} (evidence: ${evidence})`.slice(0, 300);
             const blame = await this.blameUat(config, targetEnv).catch((error: any) => { this.log(`UAT blame skipped: ${error?.message || error}`); return null; });
             if (blame === 'base') {
                 this.log('UAT blame: live verification fails on the base too; no task of this run is blamed.');

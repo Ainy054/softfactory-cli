@@ -130,6 +130,8 @@ export const FactoryStateSchema = z.object({
   integration_branch: z.string().optional(),
   /** Planned token budget from past runs; past 80% of it the run asks or halts. */
   token_estimate: z.object({ tokens: z.number(), runs: z.number() }).optional(),
+  /** Why a run whose tasks all merged still ended failed (final gate, wiring, UAT). */
+  failure_reason: z.string().optional(),
   /** Set once a person agreed to run past the estimate; it is not asked again. */
   over_estimate_accepted: z.boolean().optional(),
   base_branch: z.string().optional(),
