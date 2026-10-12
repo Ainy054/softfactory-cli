@@ -12,7 +12,7 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
-import { loadProgram, saveProgram, formatStatus, stopProgram, resumeProgram, PROGRAM_FILE } from './Program.js';
+import { loadProgram, saveProgram, readiness, stopProgram, resumeProgram, PROGRAM_FILE, type Context } from './Program.js';
 import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
@@ -86,6 +86,24 @@ async function designReviewRef(root: string, featureId?: string): Promise<string
   return result.stdout.trim() || 'HEAD';
 }
 
+/** The archived feature record for a context's `feature_id`, or null when none is archived. */
+async function readArchived(baseDir: string, featureId: string): Promise<{ status?: string; pr?: number | null } | null> {
+  try {
+    const raw = await fs.readFile(path.join(baseDir, '.softfactory', 'archive', `${featureId}.json`), 'utf8');
+    const data = JSON.parse(raw) as { status?: unknown; pr?: unknown };
+    return { status: typeof data.status === 'string' ? data.status : undefined, pr: typeof data.pr === 'number' ? data.pr : null };
+  } catch {
+    return null;
+  }
+}
+
+/** One status line: id, status, size, depends_on and the readiness verdict (check or reason). */
+function statusLine(context: Context, verdict: { ready: boolean; reason: string } | undefined): string {
+  const deps = context.depends_on.length ? context.depends_on.join(', ') : '-';
+  const readinessText = verdict ? (verdict.ready ? '✓ ready' : verdict.reason) : 'unknown';
+  return `${context.id}  ${context.status}  ${context.size}  [${deps}]  ${readinessText}`;
+}
+
 /** `softfactory program <subcommand>`: args start after the word "program". */
 async function programCommand(baseDir: string, args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -117,7 +135,16 @@ async function programCommand(baseDir: string, args: string[]): Promise<void> {
     const program = await loadProgram(baseDir);
     console.log(`Program: ${program.goal}`);
     if (program.contexts.length === 0) console.log(`No contexts yet: add them to ${PROGRAM_FILE}.`);
-    for (const line of formatStatus(program)) console.log(`  ${line}`);
+    // The reasons come from Program.readiness; GitHub supplies the PR state and
+    // gates are stubbed to [] until .softfactory/gates.md lands (#66).
+    const github = new GitHub(baseDir);
+    const verdicts = await readiness(program, {
+      archived: featureId => readArchived(baseDir, featureId),
+      prState: number => github.prState(number),
+      openGates: async () => [],
+    });
+    const verdictById = new Map(verdicts.map(verdict => [verdict.id, verdict]));
+    for (const context of program.contexts) console.log(`  ${statusLine(context, verdictById.get(context.id))}`);
     process.exit(0);
   }
 
