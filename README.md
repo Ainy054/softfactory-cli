@@ -209,6 +209,20 @@ Decisions a program meets live in `.softfactory/gates.md`, a table people edit b
 
 A gate whose class is in the program's `always_stop` (by default `cutover`, `contract`, `regulatory`, `activation`) waits for a person: while it is `open`, every context whose scope overlaps its scope (comma-separated globs) is not ready. Any other class the driver decides, recording its choice and reason. A question already decided is cited, not asked again. To decide one, set its status to `decided` and fill in `chosen by`. `softfactory program gate <class> "<scope>" "<question>" "<choice>" "<reason>"` records a gate from the command line, and `program status` lists the open always-stop gates, plus any row it could not read.
 
+### Plan checklist
+
+`softfactory --checklist <context-id> "<requirement>"` runs one program context unattended. Instead of a person approving the plan, seven checks do:
+
+1. every agent task's acceptance command is red at planning time (not unrunnable, timed out, or already passing);
+2. every file the plan touches is inside the context's `scope`;
+3. nothing that always stops: a step a person performs, a live window, TEST promotion, an open always-stop gate on the scope, or a task about cutover, contract, regulatory or activation work (only the classes in `always_stop`);
+4. every protected task has a specific review question;
+5. the planned tokens (or `--max-tokens`) fit what is left of `budget_window`, counting the `tokens` recorded in `history`;
+6. same-phase tasks that share a file depend on one another;
+7. acceptance commands name only files inside scope or created by the plan.
+
+A plan that passes starts. Otherwise each miss is logged, the plan is saved as `planned`, and an open `plan` gate with the misses is added to `.softfactory/gates.md`. Fix the plan with `--refine`, or start it with `--resume`.
+
 `program` is dispatched before any provider or flag parsing, so its words are never read as a requirement and no Factory is needed. A bare `softfactory program` prints `not implemented yet`.
 
 ## A whole agent as the worker
