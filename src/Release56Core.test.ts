@@ -124,6 +124,11 @@ describe('#23 file lists derived by repository search', () => {
     assert.match(problems[0], /T1 changes `toCents`, but these files use it and no task lists them: src\/adapter\.ts/);
     assert.deepEqual(await factory.fileListProblems([rename, task({ id: 'T2', files_hint: ['src/adapter.ts'], verification_command: undefined })]), []);
     assert.deepEqual(await factory.fileListProblems([task({ verification_command: undefined })]), [], 'only renames, removals and consolidations are checked');
+    // #68: a removal in one sentence does not make every other named symbol a rename.
+    const advance = task({ title: 'Program advance', description: 'Call `toCents` to price the run. Remove the stale lock file when its pid is dead.', files_hint: ['src/money.ts'], verification_command: undefined });
+    assert.deepEqual(await factory.fileListProblems([advance]), []);
+    const removal = task({ title: 'Clean up', description: 'Price with `toCents`; then remove `toCents` from the cart.', files_hint: ['src/money.ts'], verification_command: undefined });
+    assert.match((await factory.fileListProblems([removal]))[0] ?? '', /T1 changes `toCents`/, 'the removal sentence still counts');
   });
 });
 
