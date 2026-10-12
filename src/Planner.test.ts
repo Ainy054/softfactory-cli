@@ -91,6 +91,41 @@ describe('planner repair rounds are visible', () => {
   });
 });
 
+describe('an unparsable planner reply is retried, not fatal', () => {
+  it('asks once more for the complete object when a reply is cut off mid-description', async () => {
+    const { TextModelPlanner } = await import('./Planner.js');
+    const cutOff = JSON.stringify(valid).slice(0, 120);
+    const replies = [cutOff, JSON.stringify(valid)];
+    const prompts: string[] = [];
+    const lines: string[] = [];
+    const planner = new TextModelPlanner('deepseek', { provider: 'deepseek', model: 'm', isAvailable: async () => true, complete: async (prompt: string) => { prompts.push(prompt); return replies.shift()!; } } as any);
+    planner.log = line => lines.push(line);
+    const blueprint = await planner.generateBlueprint(input);
+    assert.equal(blueprint.tasks.length, valid.tasks.length);
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /YOUR PREVIOUS REPLY WAS NOT VALID JSON/);
+    assert.match(lines[0], /not valid JSON/);
+  });
+
+  it('still fails when the retry is not JSON either', async () => {
+    const { TextModelPlanner } = await import('./Planner.js');
+    const planner = new TextModelPlanner('deepseek', { provider: 'deepseek', model: 'm', isAvailable: async () => true, complete: async () => '{"feature": "x", "tasks": [' } as any);
+    await assert.rejects(() => planner.generateBlueprint(input), /Failed to parse JSON/);
+  });
+
+  it('DeepSeek reports a reply cut off at the output limit', async () => {
+    const { DeepSeekTextModel } = await import('./TextModel.js');
+    const saved = process.env.DEEPSEEK_API_KEY;
+    process.env.DEEPSEEK_API_KEY = 'test-key';
+    try {
+      const model = new DeepSeekTextModel('deepseek-v4-pro', (async () => new Response(JSON.stringify({ choices: [{ message: { content: '{"feature": "x"' }, finish_reason: 'length' }] }), { status: 200 })) as any);
+      await assert.rejects(() => model.complete('plan', { json: true }), /cut off at the output limit/);
+    } finally {
+      if (saved === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = saved;
+    }
+  });
+});
+
 describe('a task that changes no files is not worker work', () => {
   it('rejects "run the test suite" tasks and tells the planner where the command belongs', () => {
     const runOnly = { ...valid, tasks: [valid.tasks[0], { ...valid.tasks[0], id: 'T002', title: 'Run full test suite', dependencies: ['T001'], phase: 2, files_hint: [], creates_files: [], verification_command: 'npm test' }] };

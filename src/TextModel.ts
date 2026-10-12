@@ -369,6 +369,7 @@ export class DeepSeekTextModel implements ITextModel {
     }, options.timeoutMs ?? 8 * 60_000, 'DeepSeek');
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw new Error(`DeepSeek model ${this.model} returned an empty response.`);
+    if (data.choices?.[0]?.finish_reason === 'length') throw new Error(`DeepSeek model ${this.model} reply was cut off at the output limit (${content.length} characters).`);
     return content;
   }
 }
