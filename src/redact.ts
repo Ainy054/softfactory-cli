@@ -4,7 +4,7 @@
  * missed: provider token prefixes, env-style assignments, URL credentials,
  * JSON-quoted keys and PEM blocks.
  */
-const PATTERNS: RegExp[] = [
+export const PATTERNS: RegExp[] = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   /\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b/g,                       // OpenAI / Stripe style
   /\bsk-ant-[A-Za-z0-9_-]{16,}\b/g,                           // Anthropic
@@ -29,4 +29,115 @@ export function redactSecrets(value: string): string {
   text = text.replace(PATTERNS[11], '$1[REDACTED_SECRET]');
   text = text.replace(PATTERNS[12], '[REDACTED_SECRET]');
   return text;
+}
+
+interface SecretPattern {
+  pattern: RegExp;
+  kind: string;
+  /**
+   * Only the generic `key = value` / `key: value` assignments are allowed to
+   * be dropped when their value is an obvious placeholder. Provider-prefixed
+   * patterns stay strict so a fixture-looking token still fails the gate.
+   */
+  placeholderFilter?: boolean;
+}
+
+const SECRET_PATTERNS: SecretPattern[] = [
+  { pattern: PATTERNS[0], kind: 'PEM private key' },
+  { pattern: PATTERNS[1], kind: 'OpenAI/Stripe key' },
+  { pattern: PATTERNS[2], kind: 'Anthropic key' },
+  { pattern: PATTERNS[3], kind: 'GitHub token' },
+  { pattern: PATTERNS[4], kind: 'GitHub token' },
+  { pattern: PATTERNS[5], kind: 'Slack token' },
+  { pattern: PATTERNS[6], kind: 'AWS access key' },
+  { pattern: PATTERNS[7], kind: 'Google API key' },
+  { pattern: PATTERNS[8], kind: 'JWT' },
+  { pattern: PATTERNS[9], kind: 'URL credential' },
+  { pattern: PATTERNS[10], kind: 'JSON key assignment' },
+  { pattern: PATTERNS[11], kind: 'Generic assignment', placeholderFilter: true },
+  { pattern: PATTERNS[12], kind: 'Generic assignment', placeholderFilter: true },
+];
+
+const PLACEHOLDER_VALUES = new Set(['xxx', 'your-api-key', 'changeme', 'example']);
+
+/**
+ * Placeholder detection inspects only the value side of an assignment (not the
+ * key), so a real key named `EXAMPLE_API_KEY` never hides a real token behind
+ * the word "example".
+ */
+function isPlaceholderValue(raw: string): boolean {
+  const value = raw.trim().replace(/^["']|["']$/g, '');
+  if (!value) return false;
+  const normalized = value.toLowerCase().replace(/_/g, '-');
+  if (PLACEHOLDER_VALUES.has(normalized)) return true;
+  if (/^<[^>]+>$/.test(value)) return true;
+  if (value.length > 0 && [...value].every((ch) => ch === value[0])) return true;
+  return false;
+}
+
+/** Pulls the value out of a generic `key = value` / `key: value` match. */
+function assignmentValue(match: string): string {
+  const eq = match.indexOf('=');
+  const colon = match.indexOf(':');
+  let at = -1;
+  if (eq !== -1 && colon !== -1) at = Math.min(eq, colon);
+  else if (eq !== -1) at = eq;
+  else if (colon !== -1) at = colon;
+  if (at === -1) return match;
+  return match.slice(at + 1).replace(/^Bearer\s+/i, '').trim();
+}
+
+/** Returns the full line (without the trailing `\n`) that contains `index`. */
+function lineForIndex(text: string, index: number): string {
+  const lineStart = text.lastIndexOf('\n', index - 1) + 1;
+  let lineEnd = text.indexOf('\n', index);
+  if (lineEnd === -1) lineEnd = text.length;
+  return text.slice(lineStart, lineEnd).replace(/\r$/, '');
+}
+
+/**
+ * Scans a string with the credential patterns shared with `redactSecrets`.
+ *
+ * `allowedPatterns` skips any line that matches one of the allow regexes
+ * (matched case-insensitively and anchored to the line that holds the hit, so
+ * an allow entry can never leak across line boundaries).
+ */
+export function findSecrets(
+  text: string,
+  options: { allowedPatterns?: RegExp[] } = {},
+): Array<{ kind: string; match: string }> {
+  const input = String(text ?? '');
+  const allowedPatterns = (options.allowedPatterns ?? []).map((raw) => {
+    const flags = raw.flags.includes('i') ? raw.flags : `${raw.flags}i`;
+    return new RegExp(raw.source, flags);
+  });
+
+  const isAllowed = (line: string): boolean => {
+    for (const pattern of allowedPatterns) {
+      pattern.lastIndex = 0;
+      if (pattern.test(line)) return true;
+    }
+    return false;
+  };
+
+  const hits: Array<{ kind: string; match: string }> = [];
+  for (const { pattern, kind, placeholderFilter } of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(input)) !== null) {
+      const matched = match[0];
+      const line = lineForIndex(input, match.index);
+      if (allowedPatterns.length > 0 && isAllowed(line)) {
+        if (matched.length === 0) pattern.lastIndex++;
+        continue;
+      }
+      if (placeholderFilter && isPlaceholderValue(assignmentValue(matched))) {
+        if (matched.length === 0) pattern.lastIndex++;
+        continue;
+      }
+      hits.push({ kind, match: matched });
+      if (matched.length === 0) pattern.lastIndex++;
+    }
+  }
+  return hits;
 }
