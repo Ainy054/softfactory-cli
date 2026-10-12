@@ -75,6 +75,17 @@ describe('Program save/load round trip', () => {
     assert.deepEqual(onDisk, program);
   });
 
+  it('keeps the advance fields of a history entry (commits, tokens) and slice text', async () => {
+    const baseDir = await makeDir();
+    const program = sampleProgram();
+    program.contexts[0].slices = ['models and storage', 'routes'];
+    program.history.push({ at: '2026-10-12T00:00:00.000Z', context: program.contexts[0].id, action: 'started', feature_id: 'f-1', result: 'completed', commits: 3, tokens: 812000 });
+
+    await saveProgram(baseDir, program);
+
+    assert.deepEqual(await loadProgram(baseDir), program);
+  });
+
   it('returns the default skeleton when program.json is missing', async () => {
     const baseDir = await makeDir();
 

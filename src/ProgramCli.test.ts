@@ -113,10 +113,31 @@ describe('softfactory program status', () => {
 
     assert.equal(result.exitCode, 0, result.stderr);
     assert.deepEqual(result.stdout.split('\n').filter(Boolean), [
-      'api  pending  m  [-]  pending',
-      'web  pending  l  [api]  waits on api',
-      'worker  done  s  [api]  done',
-      'cutover  parked  xl  [web, worker]  parked: needs approval',
+      'Program: Ship the rates service',
+      '  api  pending  m  [-]  pending',
+      '  web  pending  l  [api]  waits on api',
+      '  worker  done  s  [api]  done',
+      '  cutover  parked  xl  [web, worker]  parked: needs approval',
     ]);
+  });
+
+  it('says how to start when there is no program file', async () => {
+    const repo = await makeRepo();
+    const result = await softfactory(repo, ['program', 'status']);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.match(result.stdout, /No program: run 'softfactory program init/);
+  });
+
+  it('names the invalid field of a hand-edited program.json instead of a stack trace', async () => {
+    const repo = await makeRepo();
+    await fs.mkdir(path.join(repo, '.softfactory'), { recursive: true });
+    await fs.writeFile(path.join(repo, PROGRAM_FILE), JSON.stringify({
+      goal: 'g',
+      contexts: [{ id: 'web', scope: ['web/**'], depends_on: ['api'] }],
+    }));
+    const result = await softfactory(repo, ['program', 'status']);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /program\.json: contexts\.0\.depends_on: unknown depends_on id "api"/);
+    assert.doesNotMatch(result.stderr, /at .*\.ts:\d+/);
   });
 });

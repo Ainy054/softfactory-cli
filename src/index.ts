@@ -86,6 +86,58 @@ async function designReviewRef(root: string, featureId?: string): Promise<string
   return result.stdout.trim() || 'HEAD';
 }
 
+/** `softfactory program <subcommand>`: args start after the word "program". */
+async function programCommand(baseDir: string, args: string[]): Promise<void> {
+  const subcommand = args[0];
+
+  if (subcommand === 'init') {
+    const goal = args.slice(1).join(' ').trim();
+    if (!goal) {
+      console.error('Error: program init requires a goal.');
+      console.error('Example: softfactory program init "Ship the rates service"');
+      process.exit(1);
+    }
+    const programFile = path.join(baseDir, PROGRAM_FILE);
+    if (await fs.access(programFile).then(() => true).catch(() => false)) {
+      console.error(`Error: ${PROGRAM_FILE} already exists; refusing to overwrite it.`);
+      process.exit(1);
+    }
+    const program = await loadProgram(baseDir);
+    program.goal = goal;
+    await saveProgram(baseDir, program);
+    console.log(`wrote   ${PROGRAM_FILE}`);
+    process.exit(0);
+  }
+
+  if (subcommand === 'status') {
+    if (!await fs.access(path.join(baseDir, PROGRAM_FILE)).then(() => true).catch(() => false)) {
+      console.log(`No program: run 'softfactory program init "<goal>"' to start one.`);
+      process.exit(0);
+    }
+    const program = await loadProgram(baseDir);
+    console.log(`Program: ${program.goal}`);
+    if (program.contexts.length === 0) console.log(`No contexts yet: add them to ${PROGRAM_FILE}.`);
+    for (const line of formatStatus(program)) console.log(`  ${line}`);
+    process.exit(0);
+  }
+
+  if (subcommand === 'stop') {
+    const reason = args.slice(1).join(' ').trim() || undefined;
+    await stopProgram(baseDir, reason);
+    console.log(`[SoftFactory] Program stopped${reason ? `: ${reason}` : ''}. Run 'softfactory program resume' to continue.`);
+    process.exit(0);
+  }
+
+  if (subcommand === 'resume') {
+    await resumeProgram(baseDir);
+    console.log('[SoftFactory] Program resumed.');
+    process.exit(0);
+  }
+
+  console.log('not implemented yet');
+  process.exit(0);
+}
+
 async function main() {
   // Keys in the repository's .env are read for names not already exported.
   // The file itself never reaches a worktree or a commit.
@@ -109,47 +161,14 @@ async function main() {
   // bare checkout needs no Factory.
   if (args[0] === 'program') {
     const baseDir = process.cwd();
-    const subcommand = args[1];
-
-    if (subcommand === 'init') {
-      const goal = args.slice(2).join(' ').trim();
-      if (!goal) {
-        console.error('Error: program init requires a goal.');
-        console.error('Example: softfactory program init "Ship the rates service"');
-        process.exit(1);
-      }
-      const programFile = path.join(baseDir, PROGRAM_FILE);
-      if (await fs.access(programFile).then(() => true).catch(() => false)) {
-        console.error(`Error: ${PROGRAM_FILE} already exists; refusing to overwrite it.`);
-        process.exit(1);
-      }
-      const program = await loadProgram(baseDir);
-      program.goal = goal;
-      await saveProgram(baseDir, program);
-      console.log(`wrote   ${PROGRAM_FILE}`);
-      process.exit(0);
+    try {
+      await programCommand(baseDir, args.slice(1));
+    } catch (error: any) {
+      // A hand-edited program.json that fails validation names its fields, not a stack.
+      const issues = error?.issues as Array<{ path: Array<string | number>; message: string }> | undefined;
+      console.error(`[SoftFactory] ${PROGRAM_FILE}: ${issues ? issues.map(i => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ') : error?.message}`);
+      process.exit(1);
     }
-
-    if (subcommand === 'status') {
-      for (const line of formatStatus(await loadProgram(baseDir))) console.log(line);
-      process.exit(0);
-    }
-
-    if (subcommand === 'stop') {
-      const reason = args.slice(2).join(' ').trim() || undefined;
-      await stopProgram(baseDir, reason);
-      console.log(`[SoftFactory] Program stopped${reason ? `: ${reason}` : ''}. Run 'softfactory program resume' to continue.`);
-      process.exit(0);
-    }
-
-    if (subcommand === 'resume') {
-      await resumeProgram(baseDir);
-      console.log('[SoftFactory] Program resumed.');
-      process.exit(0);
-    }
-
-    console.log('not implemented yet');
-    process.exit(0);
   }
 
   if (args.includes('--adopt')) {

@@ -21,7 +21,7 @@ export const STOPPED_FILE = path.join('.softfactory', 'STOPPED');
 export const SizeSchema = z.enum(['s', 'm', 'l', 'xl']);
 export const ContextStatusSchema = z.enum(['pending', 'active', 'done', 'parked']);
 
-/** Words in a context goal that always stop the driver for a person. */
+/** Gate classes that always wait for a person (see .softfactory/gates.md). */
 export const DEFAULT_ALWAYS_STOP = ['cutover', 'contract', 'regulatory', 'activation'];
 
 export const ContextSchema = z.strictObject({
@@ -32,10 +32,11 @@ export const ContextSchema = z.strictObject({
   scope: z.array(z.string()).min(1, 'scope must not be empty'),
   depends_on: z.array(z.string()).default([]),
   size: SizeSchema.default('m'),
-  slices: z.array(z.unknown()).default([]),
+  /** Requirement text for each slice of a context too big for one plan. */
+  slices: z.array(z.string()).default([]),
   status: ContextStatusSchema.default('pending'),
   feature_id: z.string().nullable().default(null),
-  pr: z.union([z.string(), z.number()]).nullable().default(null),
+  pr: z.number().int().positive().nullable().default(null),
   parked_reason: z.string().nullable().default(null),
   slice_index: z.number().int().nonnegative().default(0),
 });
@@ -59,7 +60,8 @@ export const HistoryEntrySchema = z.strictObject({
   action: z.string(),
   feature_id: z.string().optional(),
   result: z.string(),
-  commits: z.array(z.string()).optional(),
+  commits: z.number().int().nonnegative().optional(),
+  tokens: z.number().int().nonnegative().optional(),
 });
 
 /** A fully populated default policy; used for the skeleton and as a base. */

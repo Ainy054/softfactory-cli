@@ -160,7 +160,7 @@ Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (and `DASHSCOPE_BASE_URL`, 
 
 ## Programs
 
-A requirement too big for one plan is a *program*: several bounded contexts with an order between them. `.softfactory/program.json` (git-ignored) records the goal, the contexts and what each one waits on, the policy that decides when a person is needed, and an append-only history. It is written only by the commands below.
+A requirement too big for one plan is a *program*: several bounded contexts with an order between them. `.softfactory/program.json` records the goal, the contexts and what each one waits on, the policy that decides when a person is needed, and an append-only history. Write the contexts by hand; the commands below create the file and record stops and resumes.
 
 ```json
 {
@@ -181,14 +181,14 @@ A requirement too big for one plan is a *program*: several bounded contexts with
 ```
 
 - `goal` is the whole program; `contexts` are its parts. A context has a stable `id`, its own `goal`, the `scope` globs it owns, the `depends_on` ids it waits for, a `size` (`s`, `m`, `l`, `xl`), and where it got to: `status` (`pending`, `active`, `done`, `parked`) plus `feature_id`, `pr`, `parked_reason` and `slice_index`. An empty `scope` is rejected.
-- `policy` decides when the driver stops for a person: `always_stop` words, the `size_threshold` at which it stops, the `budget_window` of tokens and hours, and whether work goes out as a pull request (`pr`).
-- `history` is append-only: `{ "at", "context", "action", "result" }`, with optional `feature_id` and `commits`.
-- Validation names the field it rejects: a duplicate context `id`, a `depends_on` that names no context, or a dependency cycle.
+- `policy`: `always_stop` lists the gate classes that always wait for a person; a context whose `size` is at or above `size_threshold` is planned one entry of `slices` at a time; `budget_window` caps the tokens spent in a rolling number of hours; `pr` sends each context's work out as a pull request.
+- `history` is append-only: `{ "at", "context", "action", "result" }`, with optional `feature_id`, `commits` and `tokens`.
+- Validation names the field it rejects: a duplicate context `id`, a `depends_on` that names no context, a dependency cycle, or an unknown key; the command prints the field and exits 1.
 
 | Command | Description |
 | :--- | :--- |
 | `softfactory program init "<goal>"` | Write the skeleton above with the goal and an empty `contexts` array; refuses to overwrite an existing `program.json` |
-| `softfactory program status` | One line per context: id, status, size, `depends_on`, and the readiness reason (`pending`, `waits on api`, `done`, `parked: <reason>`) |
+| `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and the readiness reason (`pending`, `waits on api`, `done`, `parked: <reason>`) |
 | `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
 | `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
 
