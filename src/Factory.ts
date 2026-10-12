@@ -2217,8 +2217,13 @@ export class Factory extends EventEmitter {
         const claimed = new Set(tasks.flatMap(t => [...t.files_hint, ...t.creates_files, ...t.test_targets, ...t.production_targets]));
         const problems: string[] = [];
         for (const task of tasks) {
-            if (!/\b(?:renam\w*|remov\w*|delet\w*|drop\w*|consolidat\w*|deprecat\w*|replac\w*)\b/i.test(`${task.title} ${task.description}`)) continue;
-            const symbols = [...new Set([...`${task.title} ${task.description}`.matchAll(/`([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)(?:\(\))?`/g)].map(m => m[1].split('.').pop()!).filter(s => s.length >= 3))];
+            // Only symbols in a sentence that renames or removes something: a
+            // description saying "remove the stale lock" once made every other
+            // backticked name in it (`now`, `deps`, `Factory`) a rename (#68).
+            const verb = /\b(?:renam\w*|remov\w*|delet\w*|drop\w*|consolidat\w*|deprecat\w*|replac\w*)\b/i;
+            const sentences = `${task.title}. ${task.description}`.split(/(?<=[.;!?])\s+|\n+/).filter(sentence => verb.test(sentence));
+            if (sentences.length === 0) continue;
+            const symbols = [...new Set(sentences.flatMap(sentence => [...sentence.matchAll(/`([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)(?:\(\))?`/g)].map(m => m[1].split('.').pop()!)).filter(s => s.length >= 3))];
             for (const symbol of symbols.slice(0, 6)) {
                 const { stdout } = await execa('git', ['grep', '-l', '-w', '-I', '--', symbol], { cwd: this.baseDir, reject: false });
                 const users = stdout.split('\n').filter(f => f && !/(?:^|\/)(?:node_modules|dist|vendor)\//.test(f));
