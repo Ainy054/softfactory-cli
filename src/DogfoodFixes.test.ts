@@ -64,26 +64,54 @@ describe('the worker sees the requirement, not only the planner\'s paraphrase', 
 });
 
 describe('a worker that only reads is nudged before it is stopped', () => {
-  it('appends the nudge to the sixth fruitless tool result, and still aborts at the limit', async () => {
-    const files = ToolLoopWorker.NO_PROGRESS_ABORT + 2;
-    const dir = await worktree(files);
+  const editTask = TaskSchema.parse({ ...task, files_hint: ['f1.ts'], creates_files: [] });
+
+  async function readOnly(t: typeof task, reads: (i: number) => string, turnsCount: number, dir: string) {
     const seen: string[] = [];
-    const turns = Array.from({ length: files }, (_, i) => (request: ChatRequest) => {
+    const turns = Array.from({ length: turnsCount }, (_, i) => (request: ChatRequest) => {
       const last = request.messages[request.messages.length - 1];
       if (last.role === 'tool') seen.push(last.content);
-      return { content: '', toolCalls: [call(`r${i}`, 'read_file', { filepath: `f${i + 1}.ts` })] };
+      return { content: '', toolCalls: [call(`r${i}`, 'read_file', { filepath: reads(i) })] };
     });
-    const transport = scripted(turns);
     const output: string[] = [];
-    const handoff = await new ToolLoopWorker(transport, 'fake').execute(task, dir, { onOutput: line => output.push(line) });
-    // seen[k] is the result of read k+1; the nudge rides on read number NO_PROGRESS_WARN.
+    const handoff = await new ToolLoopWorker(scripted(turns), 'fake').execute(t, dir, { onOutput: line => output.push(line) });
+    return { seen, output, handoff };
+  }
+
+  it('appends the nudge at the warn call, and aborts once re-reading stops adding code', async () => {
+    const dir = await worktree(4);
+    const limits = await ToolLoopWorker.progressLimits(dir, ['f1.ts']);
+    // A 4-file cycle: the four first reads each raise the limit by one; the rest do not.
+    const { seen, output, handoff } = await readOnly(editTask, i => `f${(i % 4) + 1}.ts`, 40, dir);
     const nudged = seen.findIndex(content => content.includes('[orchestrator]'));
-    assert.equal(nudged + 1, ToolLoopWorker.NO_PROGRESS_WARN, `nudge on call ${ToolLoopWorker.NO_PROGRESS_WARN}, got ${nudged + 1}`);
-    assert.match(seen[nudged], new RegExp(`${ToolLoopWorker.NO_PROGRESS_WARN} tool calls and no file changed yet`));
+    assert.equal(nudged + 1, limits.warn, `nudge on call ${limits.warn}, got ${nudged + 1}`);
+    assert.match(seen[nudged], new RegExp(`${limits.warn} tool calls and no file changed yet. You have enough context`));
     assert.equal(seen.slice(0, nudged).some(c => c.includes('[orchestrator]')), false, 'no nudge before that');
     assert.equal(handoff.status, 'failure');
-    assert.match(handoff.summary ?? '', new RegExp(`${ToolLoopWorker.NO_PROGRESS_ABORT} tool calls without a single successful edit`));
+    assert.match(handoff.summary ?? '', new RegExp(`${limits.abort + 4} tool calls without a single successful edit`));
+    assert.ok(output.some(l => new RegExp(`Aborting: ${limits.abort + 4} tool calls with no successful edit \\(limit ${limits.abort + 4}\\)`).test(l)), output.join('\n'));
     assert.ok(output.some(l => /nudged/.test(l)));
+  });
+
+  it('a create task reading new code is not stopped before its first edit (#75)', async () => {
+    const dir = await worktree(1);
+    await fs.writeFile(path.join(dir, 'big.ts'), Array.from({ length: 3000 }, (_, i) => `export const l${i} = ${i};`).join('\n'));
+    const turns = [
+      ...Array.from({ length: 16 }, (_, i) => () => ({ content: '', toolCalls: [call(`r${i}`, 'read_file', { filepath: 'big.ts', start_line: 1 + i * 200, end_line: 200 + i * 200 })] })),
+      () => ({ content: '', toolCalls: [call('w', 'write_file', { filepath: 'src/AgyStream.ts', content: 'export const parseAgyEvent = (line: string) => JSON.parse(line);\n' })] }),
+    ];
+    const output: string[] = [];
+    await new ToolLoopWorker(scripted(turns), 'fake').execute(task, dir, { onOutput: line => output.push(line) });
+    assert.equal(output.some(l => /Aborting/.test(l)), false, output.join('\n'));
+    assert.match(await fs.readFile(path.join(dir, 'src', 'AgyStream.ts'), 'utf8'), /parseAgyEvent/);
+  });
+
+  it('a create task\'s nudge names the file to write, and a cycle over the same files still ends', async () => {
+    const dir = await worktree(4);
+    const { seen, output } = await readOnly(task, i => `f${(i % 4) + 1}.ts`, 40, dir);
+    const nudge = seen.find(content => content.includes('[orchestrator]'));
+    assert.match(nudge ?? '', /Write src\/AgyStream\.ts now with write_file: the exports the task names/);
+    assert.ok(output.some(l => /Aborting: 24 tool calls with no successful edit \(limit 24\)/.test(l)), output.join('\n'));
   });
 });
 

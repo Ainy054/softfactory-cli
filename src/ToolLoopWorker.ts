@@ -46,21 +46,36 @@ export class ToolLoopWorker implements IWorker {
   }
   static readonly NO_PROGRESS_WARN = 6;      // a nudge: enough reading, change a file
   static readonly NO_PROGRESS_ABORT = 12;    // allow initial inspection; cycle guards stop repetitive exploration sooner
+  static readonly NO_PROGRESS_ABORT_CREATE = 20; // a new module is fitted to code the task does not name
   static readonly NO_PROGRESS_MAX = 30;
 
   /**
    * The read budget before the first edit, scaled to the files the task
    * names: one extra call per 200 lines, up to 30 in all. A flat 12 stopped
    * a worker before its first edit to the 2,400-line Factory.ts, which takes
-   * twelve reads to see once (dogfood issue #4).
+   * twelve reads to see once (dogfood issue #4). A task whose files to
+   * create do not exist yet starts at 20: its named files add nothing, and
+   * #64, #66 and #67 each lost a new module at 12 calls of reading the code
+   * it had to fit into (#75).
    */
-  static async progressLimits(worktreePath: string, files: string[]): Promise<{ warn: number; abort: number }> {
+  static async progressLimits(worktreePath: string, files: string[], creates: string[] = []): Promise<{ warn: number; abort: number }> {
     let lines = 0;
     for (const file of files) {
       try { lines += (await fs.readFile(path.join(worktreePath, file), 'utf8')).split('\n').length; } catch { /* not created yet */ }
     }
-    const abort = Math.min(ToolLoopWorker.NO_PROGRESS_MAX, ToolLoopWorker.NO_PROGRESS_ABORT + Math.ceil(lines / 200));
+    const missing = await ToolLoopWorker.missingFiles(worktreePath, creates);
+    const base = creates.length > 0 && missing.length === creates.length ? ToolLoopWorker.NO_PROGRESS_ABORT_CREATE : ToolLoopWorker.NO_PROGRESS_ABORT;
+    const abort = Math.min(ToolLoopWorker.NO_PROGRESS_MAX, base + Math.ceil(lines / 200));
     return { warn: Math.max(ToolLoopWorker.NO_PROGRESS_WARN, Math.floor(abort / 2)), abort };
+  }
+
+  /** The files in `files` that do not exist in the worktree yet. */
+  static async missingFiles(worktreePath: string, files: string[]): Promise<string[]> {
+    const missing: string[] = [];
+    for (const file of files) {
+      try { await fs.access(path.join(worktreePath, file)); } catch { missing.push(file); }
+    }
+    return missing;
   }
   static readonly MAX_ITERATIONS = 30;
   private readonly verifier = new TaskVerifier();
@@ -308,7 +323,12 @@ ${projectContext}
     let callsSinceProgress = 0;
     // The code a test writer must read counts too: issue #18's test task was
     // stopped at 12 calls while reading the 2,400-line file its tests exercise.
-    const limits = await ToolLoopWorker.progressLimits(worktreePath, [...new Set([...(task.files_hint || []), ...(task.creates_files || []), ...(task.production_targets || [])])]);
+    const limits = await ToolLoopWorker.progressLimits(worktreePath, [...new Set([...(task.files_hint || []), ...(task.creates_files || []), ...(task.production_targets || [])])], task.creates_files || []);
+    // Reading code the worker has not seen yet is progress toward the first
+    // edit, so each new file range raises the limit by one, up to the cap;
+    // re-reading a range does not.
+    let abortLimit = limits.abort;
+    const rangesRead = new Set<string>();
     let stalledWithoutProgress = false;
     let finishAborted = false;
     let lastFinishFailure = '';
@@ -413,6 +433,11 @@ ${projectContext}
               const start = Number.isInteger(Number(args.start_line)) && Number(args.start_line) > 0 ? Number(args.start_line) : 1;
               const end = Number.isInteger(Number(args.end_line)) && Number(args.end_line) >= start ? Math.min(Number(args.end_line), allLines.length) : Math.min(allLines.length, start + 199);
               toolResult = `FILE: ${args.filepath}\nLINES: ${start}-${end}/${allLines.length}\n${allLines.slice(start - 1, end).map((line, i) => `${start + i} | ${line}`).join('\n')}`.slice(0, this.maxFileRead);
+              const range = `${path.normalize(String(args.filepath))}:${start}`;
+              if (!rangesRead.has(range)) {
+                rangesRead.add(range);
+                abortLimit = Math.min(ToolLoopWorker.NO_PROGRESS_MAX, abortLimit + 1);
+              }
             } else if (name === 'replace_lines') {
               onOutput(`[${this.label}] ✂️ Replacing lines ${args.start_line}-${args.end_line} in ${args.filepath}`);
               const fullPath = this.resolveToolPath(worktreePath, args.filepath, task, true, options?.orchestratorFiles);
@@ -523,11 +548,14 @@ ${projectContext}
           // A rejected finish_task is not progress; only an accepted one is.
           if (mutated || (name === 'finish_task' && handoffResult)) {
             callsSinceProgress = 0;
-          } else if (++callsSinceProgress >= limits.abort) {
+          } else if (++callsSinceProgress >= abortLimit) {
             stalledWithoutProgress = true;
-            onOutput(`[${this.label}] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit.`);
+            onOutput(`[${this.label}] ⛔ Aborting: ${callsSinceProgress} tool calls with no successful edit (limit ${abortLimit}).`);
           } else if (callsSinceProgress === limits.warn) {
-            toolResult += `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. You have enough context: create or edit the file now with write_file or replace_content, then run the acceptance command. The attempt ends after ${limits.abort} calls without an edit.`;
+            const [toCreate] = await ToolLoopWorker.missingFiles(worktreePath, task.creates_files || []);
+            toolResult += toCreate
+              ? `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. Write ${toCreate} now with write_file: the exports the task names, with bodies, then refine it and run the acceptance command. Reading new code extends the limit, but re-reading does not; the limit is now ${abortLimit} calls without an edit.`
+              : `\n\n[orchestrator] ${callsSinceProgress} tool calls and no file changed yet. You have enough context: create or edit the file now with write_file or replace_content, then run the acceptance command. The attempt ends after ${abortLimit} calls without an edit.`;
             onOutput(`[${this.label}] ${callsSinceProgress} calls without an edit; nudged.`);
           }
 
@@ -565,9 +593,9 @@ ${projectContext}
         : finishAborted
         ? `${who} called finish_task twice while verification was still failing (${lastFinishFailure}). Fix the failing tests before finishing, or report the concrete blocker.`
         : stalledWithoutProgress && changedFiles.size > 0
-        ? `${who} stopped after ${limits.abort} tool calls with no further edit; the ${changedFiles.size} edited file(s) stand and go to verification. Call finish_task once the focused tests pass instead of re-running the suite.`
+        ? `${who} stopped after ${abortLimit} tool calls with no further edit; the ${changedFiles.size} edited file(s) stand and go to verification. Call finish_task once the focused tests pass instead of re-running the suite.`
         : stalledWithoutProgress
-        ? `${who} made ${limits.abort} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
+        ? `${who} made ${abortLimit} tool calls without a single successful edit. Stop exploring and change a file, or report why the task cannot be done.`
         : repeatedCall?.startsWith('scope:')
         ? `${who} attempted out-of-scope edits repeatedly (${repeatedCall.slice(6)}). Stop and report the blocker or revise the task scope.`
         : repeatedCall?.startsWith('syntax:')
