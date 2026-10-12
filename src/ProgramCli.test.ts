@@ -196,3 +196,29 @@ describe('softfactory program status', () => {
     assert.doesNotMatch(result.stderr, /at .*\.ts:\d+/);
   });
 });
+
+describe('softfactory program next', () => {
+  it('prints the requirement the next advance would run, or why nothing is ready', async () => {
+    const repo = await makeRepo();
+    const program = defaultProgram('Ship the rates service');
+    program.contexts = [
+      { id: 'api', goal: 'FastAPI app with /rates', scope: ['app/**', 'tests/**'], depends_on: [], size: 'xl', slices: ['models and storage', 'routes'], status: 'pending', feature_id: null, pr: null, parked_reason: null, slice_index: 1 },
+      { id: 'web', goal: 'Dashboard', scope: ['web/**'], depends_on: ['api'], size: 'm', slices: [], status: 'pending', feature_id: null, pr: null, parked_reason: null, slice_index: 0 },
+    ];
+    await saveProgram(repo, program);
+
+    const next = await softfactory(repo, ['program', 'next']);
+    assert.equal(next.exitCode, 0, next.stderr);
+    assert.match(next.stdout, /^Next: api/);
+    assert.match(next.stdout, /change only files under: app\/\*\*, tests\/\*\*/);
+    assert.match(next.stdout, /routes/);
+    assert.match(next.stdout, /this is slice 2 of 2; earlier slices are merged/);
+
+    program.contexts[0].status = 'parked';
+    program.contexts[0].parked_reason = 'blocked task';
+    await saveProgram(repo, program);
+    const none = await softfactory(repo, ['program', 'next']);
+    assert.equal(none.exitCode, 0, none.stderr);
+    assert.match(none.stdout, /No context is ready:\n  api: parked: blocked task\n  web: waits on api/);
+  });
+});

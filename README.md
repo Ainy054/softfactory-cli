@@ -189,6 +189,7 @@ A requirement too big for one plan is a *program*: several bounded contexts with
 | :--- | :--- |
 | `softfactory program init "<goal>"` | Write the skeleton above with the goal and an empty `contexts` array; refuses to overwrite an existing `program.json` |
 | `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and `✓ ready` or the reason it is not |
+| `softfactory program next` | The requirement text the next advance would run for the first ready context (goal, scope, current slice), or why no context is ready |
 | `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
 | `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
 
