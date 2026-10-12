@@ -192,7 +192,10 @@ A requirement too big for one plan is a *program*: several bounded contexts with
 | `softfactory program next` | The requirement text the next advance would run for the first ready context (goal, scope, current slice), or why no context is ready |
 | `softfactory program gate <class> "<scope>" "<question>" ["<choice>" "<reason>"]` | Record a gate: decided with the choice and reason, or `open` when the class always stops |
 | `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
-| `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
+| `softfactory program resume [context]` | Remove `.softfactory/STOPPED` and append a history entry; with a context id, put that parked context back in line |
+| `softfactory program [run flags]` | One advance (below); takes the usual provider flags |
+| `softfactory program schedule [--every <minutes>] [run flags]` | Write the launchd agent that runs one advance on an interval |
+| `softfactory program unschedule` | Remove it |
 
 A context is **ready** when its status is `pending` (or `active`), every `depends_on` context is done, no open gate of an `always_stop` class in `.softfactory/gates.md` covers its scope, and, at or above `size_threshold`, it has `slices`. A dependency is done when it is marked `done`, when its `pr` is merged on GitHub, or (with `pr: false`) when its archived run completed. `program status` prints `✓ ready` or the reason, such as `waits on api (PR #12 open)` or `needs slices (size xl ≥ threshold l)`; when GitHub cannot be asked it says `state unknown` rather than failing.
 
@@ -223,7 +226,29 @@ A gate whose class is in the program's `always_stop` (by default `cutover`, `con
 
 A plan that passes starts. Otherwise each miss is logged, the plan is saved as `planned`, and an open `plan` gate with the misses is added to `.softfactory/gates.md`. Fix the plan with `--refine`, or start it with `--resume`.
 
-`program` is dispatched before any provider or flag parsing, so its words are never read as a requirement and no Factory is needed. A bare `softfactory program` prints `not implemented yet`.
+The `program` subcommands are dispatched before any provider or flag parsing, so their words are never read as a requirement and no Factory is needed.
+
+### Running a program unattended
+
+`softfactory program [run flags]` makes one advance:
+
+1. **Lock:** `.softfactory/program.lock` (pid, host, start time). While another advance's pid is alive it exits at once with code 75. A dead pid or a lock older than 6 hours is replaced.
+2. **Stop conditions:** it does nothing while `.softfactory/STOPPED` exists. After three runs in a row merge nothing, it writes `STOPPED` itself. It waits while `budget_window` is spent.
+3. **In flight:** a context whose feature is still active or paused in `factory.json` is resumed, not started again.
+4. **Pick:** the first ready context in file order, or log why none is ready.
+5. **Run:** the context's requirement (goal, scope, current slice) runs like `--pr --yes`, with the plan checklist as the approver.
+6. **Record:** a completed run marks the context `done`, or moves it to its next slice; dependents and later slices still wait for the PR to merge. A failed or partial run, a plan the checklist declined, or a run that throws parks the context with the first blocking reason, and the next advance moves on. `program resume <context>` un-parks it.
+7. **History:** every advance appends what it did, how many tasks it merged and the tokens it spent.
+
+To run it on a schedule on this Mac:
+
+```sh
+softfactory program schedule --every 60 --strategy=cloud --cloud-provider=deepseek --second-reviewer qwen/qwen3.7-plus
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.softfactory.<hash>.plist   # the line it prints
+tail -f .softfactory/program.log
+```
+
+The agent runs `node <softfactory>/dist/index.js program <run flags>` in the repository every interval while the Mac is awake. It uses the repository's `.env` and the PATH from when you scheduled it. `softfactory program unschedule` prints the `launchctl bootout` line and removes the plist; `softfactory program stop "reason"` pauses the program without unloading the agent.
 
 ## A whole agent as the worker
 

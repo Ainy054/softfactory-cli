@@ -12,8 +12,9 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
-import { loadProgram, saveProgram, readiness, nextRequirement, stopProgram, resumeProgram, PROGRAM_FILE, type Context } from './Program.js';
+import { loadProgram, saveProgram, readiness, nextRequirement, stopProgram, resumeProgram, unparkContext, PROGRAM_FILE, type Context } from './Program.js';
 import { readGates, openGates, decideGate, answered, GATES_FILE } from './Gates.js';
+import { launchdPlist, launchdPlistPath } from './ProgramAdvance.js';
 import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
@@ -25,7 +26,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design', '--checklist'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id]] [--checklist <program-context-id>] <requirement> | program init "<goal>" | program status | program next | program gate <class> "<scope>" "<question>" "<choice>" "<reason>" | program stop ["reason"] | program resume';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id]] [--checklist <program-context-id>] <requirement> | program init "<goal>" | program status | program next | program gate <class> "<scope>" "<question>" "<choice>" "<reason>" | program [run flags] | program schedule [--every <minutes>] [run flags] | program unschedule | program stop ["reason"] | program resume [context]';
 
 let globalFactory: Factory | null = null;
 
@@ -195,13 +196,52 @@ async function programCommand(baseDir: string, args: string[]): Promise<void> {
   }
 
   if (subcommand === 'resume') {
+    if (args[1]) {
+      await unparkContext(baseDir, args[1]);
+      console.log(`[SoftFactory] Context ${args[1]} is back in line.`);
+      process.exit(0);
+    }
     await resumeProgram(baseDir);
     console.log('[SoftFactory] Program resumed.');
     process.exit(0);
   }
 
-  console.log('not implemented yet');
-  process.exit(0);
+  if (subcommand === 'schedule' || subcommand === 'unschedule') {
+    const plistPath = launchdPlistPath(baseDir);
+    const uid = process.getuid?.() ?? '$UID';
+    if (subcommand === 'unschedule') {
+      console.log(`Unload it first:\n  launchctl bootout gui/${uid} ${plistPath}`);
+      await fs.rm(plistPath, { force: true });
+      console.log(`removed ${plistPath}`);
+      process.exit(0);
+    }
+    // softfactory program schedule [--every <minutes>] [run flags for each advance...]
+    const rest = args.slice(1);
+    const everyIndex = rest.findIndex(arg => arg === '--every' || arg.startsWith('--every='));
+    const everyRaw = everyIndex === -1 ? '60' : rest[everyIndex].includes('=') ? rest[everyIndex].split('=')[1] : rest[everyIndex + 1];
+    const everyMinutes = Number(everyRaw);
+    if (!Number.isFinite(everyMinutes) || everyMinutes < 1) {
+      console.error(`Error: --every expects a number of minutes; got "${everyRaw}".`);
+      process.exit(1);
+    }
+    const runFlags = rest.filter((_, i) => everyIndex === -1 || (i !== everyIndex && !(i === everyIndex + 1 && !rest[everyIndex].includes('='))));
+    if (!await fs.access(path.join(baseDir, PROGRAM_FILE)).then(() => true).catch(() => false)) {
+      console.error(`Error: no ${PROGRAM_FILE}; run 'softfactory program init "<goal>"' first.`);
+      process.exit(1);
+    }
+    const cliPath = await fs.realpath(process.argv[1]);
+    await fs.mkdir(path.dirname(plistPath), { recursive: true });
+    await fs.writeFile(plistPath, launchdPlist({ repoPath: baseDir, nodePath: process.execPath, cliPath, everyMinutes, args: runFlags, path: process.env.PATH }));
+    console.log(`wrote   ${plistPath}`);
+    console.log(`Every ${everyMinutes} min: ${process.execPath} ${cliPath} program${runFlags.length ? ` ${runFlags.join(' ')}` : ''}`);
+    console.log(`Log: ${path.join(baseDir, '.softfactory', 'program.log')}`);
+    console.log(`Load it:\n  launchctl bootstrap gui/${uid} ${plistPath}`);
+    process.exit(0);
+  }
+
+  console.error(`Error: unknown program command "${subcommand}".`);
+  console.error(USAGE);
+  process.exit(1);
 }
 
 async function main() {
@@ -209,7 +249,11 @@ async function main() {
   // The file itself never reaches a worktree or a commit.
   const loadedFromDotEnv = await loadDotEnv(process.cwd());
   const apiKey = process.env.GEMINI_API_KEY || '';
-  const args = process.argv.slice(2);
+  // A bare `softfactory program [run flags]` is one advance: it takes the
+  // usual provider flags, so it goes through the normal parsing below.
+  const rawArgs = process.argv.slice(2);
+  const programAdvance = rawArgs[0] === 'program' && (rawArgs.length === 1 || rawArgs[1].startsWith('--'));
+  const args = programAdvance ? rawArgs.slice(1) : rawArgs;
   if (args.includes('--help') || args.includes('-h')) {
     console.log(USAGE);
     process.exit(0);
@@ -431,7 +475,7 @@ async function main() {
     issue = { number: loaded.number, url: loaded.url, title: loaded.title };
   }
 
-  if (!resumeMode && !nextMode && !markDoneId && !backlogMode && !promoteId && !approveDesignId && !requirement) {
+  if (!programAdvance && !resumeMode && !nextMode && !markDoneId && !backlogMode && !promoteId && !approveDesignId && !requirement) {
     console.error(USAGE);
     process.exit(1);
   }
@@ -484,6 +528,57 @@ async function main() {
     abandon: args.includes('--abandon'),
     issue,
   };
+
+  if (programAdvance) {
+    const baseDir = process.cwd();
+    const { advance } = await import('./ProgramAdvance.js');
+    const { checklistApprover, programChecklistContext } = await import('./PlanChecklist.js');
+    const github = new GitHub(baseDir);
+    const program = await loadProgram(baseDir).catch((error: any) => {
+      console.error(`[SoftFactory] ${PROGRAM_FILE}: ${error?.issues ? error.issues.map((i: any) => `${i.path.join('.')}: ${i.message}`).join('; ') : error?.message}`);
+      process.exit(1);
+    });
+    const stopping = await openGates(baseDir, program.policy.always_stop);
+    const result = await advance(baseDir, {
+      archived: featureId => readArchived(baseDir, featureId),
+      prState: number => github.prState(number),
+      openGates: async () => stopping,
+      now: () => Date.now(),
+      pidAlive: pid => { try { process.kill(pid, 0); return true; } catch (error: any) { return error?.code === 'EPERM'; } },
+      log: line => console.log(`[SoftFactory] ${line}`),
+      inFlight: async () => {
+        try {
+          const state = JSON.parse(await fs.readFile(path.join(baseDir, '.softfactory', 'factory.json'), 'utf8'));
+          return state.status === 'active' || state.status === 'paused' ? { feature_id: state.feature_id, status: state.status } : null;
+        } catch { return null; }
+      },
+      runContext: async (contextId, contextRequirement, { resume }) => {
+        // Unattended, like --pr --yes; a new context archives a plan left planned by a declined checklist.
+        const factory = new Factory(baseDir, apiKey, { ...factoryOptions, streamToTerminal: true, prMode: program.policy.pr, issue: undefined, abandon: !resume });
+        globalFactory = factory;
+        await factory.init();
+        factory.approvePlan = checklistApprover(baseDir, await programChecklistContext(baseDir, contextId, maxTokensArg));
+        factory.on('worker:output', (event: { taskId: string; line: string }) => console.log(`[${event.taskId}] ${String(event.line).slice(0, 240)}`));
+        await startFactoryRun(factory, contextRequirement, { resumeMode: resume });
+        const state = factory.state;
+        const done = state.tasks.filter(t => t.status === 'done').length;
+        const stuck = state.tasks.find(t => t.status === 'blocked' || t.status === 'failed' || t.status === 'rejected');
+        const status = state.status === 'completed' ? 'completed'
+          : state.status === 'planned' ? 'planned'
+          : state.status === 'active' || state.status === 'paused' ? 'halted'
+          : done > 0 ? 'partial' : 'failed';
+        return {
+          feature_id: state.feature_id,
+          status,
+          pr: state.pull_request?.number,
+          commits: done,
+          tokens: (state.usage?.input_tokens ?? 0) + (state.usage?.output_tokens ?? 0),
+          blocked_reason: stuck ? `${stuck.id} ${stuck.status}: ${String(stuck.last_feedback || stuck.title).split('\n').find(Boolean)?.slice(0, 160) ?? ''}` : undefined,
+        };
+      },
+    });
+    process.exit(result.action === 'locked' ? 75 : 0);
+  }
 
   // --backlog is dispatch-only: it never becomes requirement text and, for the
   // list and keep/drop cases, never needs a Factory (so it works from a bare

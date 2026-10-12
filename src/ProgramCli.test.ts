@@ -22,8 +22,8 @@ after(async () => {
 });
 
 /** Spawn the CLI inside the temp repo the same way the acceptance command does. */
-function softfactory(cwd: string, args: string[]) {
-  return execa('node', ['--import', 'tsx', cli, ...args], { cwd, reject: false });
+function softfactory(cwd: string, args: string[], env: Record<string, string> = {}) {
+  return execa('node', ['--import', 'tsx', cli, ...args], { cwd, reject: false, env });
 }
 
 describe('softfactory program init', () => {
@@ -248,5 +248,45 @@ describe('softfactory program gate', () => {
     assert.equal(status.exitCode, 0, status.stderr);
     assert.match(status.stdout, /  api  pending  m  \[-\]  open contract gate G2 covers scope/);
     assert.match(status.stdout, /Open gates waiting for a person \(\.softfactory\/gates\.md\):\n  G2  contract  api\/\*\*  Version the \/rates response\?/);
+  });
+});
+
+describe('softfactory program schedule, resume <context> and unknown commands', () => {
+  it('writes the launchd plist under HOME, prints the bootstrap line, and unschedule removes it', async () => {
+    const repo = await makeRepo();
+    const home = await makeRepo();
+    const program = defaultProgram('Ship the rates service');
+    await saveProgram(repo, program);
+
+    const scheduled = await softfactory(repo, ['program', 'schedule', '--every', '30', '--strategy=cloud', '--cloud-provider=deepseek'], { HOME: home });
+    assert.equal(scheduled.exitCode, 0, scheduled.stderr);
+    const plistPath = scheduled.stdout.match(/^wrote\s+(\S+\.plist)$/m)?.[1] ?? '';
+    assert.ok(plistPath.startsWith(path.join(home, 'Library', 'LaunchAgents', 'dev.softfactory.')), scheduled.stdout);
+    const plist = await fs.readFile(plistPath, 'utf8');
+    assert.match(plist, /<integer>1800<\/integer>/);
+    assert.match(plist, /<string>program<\/string>\n    <string>--strategy=cloud<\/string>\n    <string>--cloud-provider=deepseek<\/string>/);
+    assert.doesNotMatch(plist, /--every/);
+    assert.match(scheduled.stdout, /launchctl bootstrap gui\/\d+ .*\.plist/);
+
+    const removed = await softfactory(repo, ['program', 'unschedule'], { HOME: home });
+    assert.equal(removed.exitCode, 0, removed.stderr);
+    assert.match(removed.stdout, /launchctl bootout gui\/\d+ /);
+    await assert.rejects(fs.access(plistPath));
+  });
+
+  it('resume <context> un-parks one context; an unknown command is an error', async () => {
+    const repo = await makeRepo();
+    const program = defaultProgram('g');
+    program.contexts = [{ id: 'api', goal: 'API', scope: ['api/**'], depends_on: [], size: 'm', slices: [], status: 'parked', feature_id: 'f-1', pr: null, parked_reason: 'T2 blocked', slice_index: 0 }];
+    await saveProgram(repo, program);
+    const resumed = await softfactory(repo, ['program', 'resume', 'api']);
+    assert.equal(resumed.exitCode, 0, resumed.stderr);
+    assert.match(resumed.stdout, /Context api is back in line/);
+    const status = await softfactory(repo, ['program', 'status']);
+    assert.match(status.stdout, /  api  pending  m  \[-\]  ✓ ready/);
+
+    const unknown = await softfactory(repo, ['program', 'frobnicate']);
+    assert.equal(unknown.exitCode, 1);
+    assert.match(unknown.stderr, /unknown program command "frobnicate"/);
   });
 });

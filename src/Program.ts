@@ -311,6 +311,16 @@ async function computeReadiness(program: Program, deps: Deps): Promise<Array<{ i
       continue;
     }
 
+    // A later slice waits for the PR of the slice before it.
+    if (context.slice_index > 0 && context.pr != null) {
+      let state: string;
+      try { state = await deps.prState(context.pr); } catch { state = 'UNKNOWN'; }
+      if (state !== 'MERGED') {
+        results.push({ id: context.id, ready: false, reason: `waits on its slice ${context.slice_index} PR #${context.pr} (${state.toLowerCase()})` });
+        continue;
+      }
+    }
+
     const depReason: string | null = await (async () => {
       for (const id of context.depends_on) {
         const dependency = byId.get(id);
@@ -403,4 +413,16 @@ export async function resumeProgram(baseDir: string): Promise<Program> {
     action: 'resume',
     result: 'resumed',
   });
+}
+
+/** Puts a parked context back in line and records it; the fruitless count is not reset. */
+export async function unparkContext(baseDir: string, contextId: string): Promise<Program> {
+  const program = await loadProgram(baseDir);
+  const context = program.contexts.find(candidate => candidate.id === contextId);
+  if (!context) throw new Error(`no context "${contextId}" in ${PROGRAM_FILE} (contexts: ${program.contexts.map(c => c.id).join(', ') || 'none'})`);
+  if (context.status !== 'parked') throw new Error(`context "${contextId}" is ${context.status}, not parked`);
+  const reason = context.parked_reason;
+  context.status = 'pending';
+  context.parked_reason = null;
+  return appendHistory(baseDir, program, { at: new Date().toISOString(), context: contextId, action: 'unpark', result: reason ? `was parked: ${reason}` : 'unparked' });
 }
