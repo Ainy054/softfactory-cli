@@ -158,6 +158,42 @@ softfactory --no-tui --sandbox=docker "implement transaction reversal endpoint"
 
 Environment: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY` (and `DASHSCOPE_BASE_URL`, default the international compatible-mode endpoint), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `META_API_KEY`; `SOFTFACTORY_COMPAT_BASE_URL`, `SOFTFACTORY_COMPAT_API_KEY`, `SOFTFACTORY_COMPAT_LABEL`, `SOFTFACTORY_COMPAT_CONTEXT` for any other OpenAI-compatible endpoint; `SOFTFACTORY_SANDBOX_IMAGE` (or `sandboxImage` in `.softfactory/config.json`) to pick the container image; `SOFTFACTORY_AGENT_IMAGE` (or `agentImage`) for the agent container's image when the project needs more than node in it; `SOFTFACTORY_EGRESS_ALLOW` for extra hosts (`host` or `host:port`, `*.example.com`) the agent container may reach; `SOFTFACTORY_LOCAL_NUM_CTX` for the local context window; `SOFTFACTORY_WORKER_TIMEOUT_MS` (or a per-provider `SOFTFACTORY_<PROVIDER>_TIMEOUT_MS`) for one model turn; `SOFTFACTORY_PLANNER_TIMEOUT_MS` for one planning call (default 15 minutes); `SOFTFACTORY_TRAINING_CAPTURE=0` to opt out of training-record capture.
 
+## Programs
+
+A requirement too big for one plan is a *program*: several bounded contexts with an order between them. `.softfactory/program.json` records the goal, the contexts and what each one waits on, the policy that decides when a person is needed, and an append-only history. Write the contexts by hand; the commands below create the file and record stops and resumes.
+
+```json
+{
+  "goal": "Ship the rates service",
+  "contexts": [
+    { "id": "api", "goal": "FastAPI app with /rates", "scope": ["app/**", "tests/**"],
+      "depends_on": [], "size": "m", "slices": [],
+      "status": "pending", "feature_id": null, "pr": null, "parked_reason": null, "slice_index": 0 }
+  ],
+  "policy": {
+    "always_stop": ["cutover", "contract", "regulatory", "activation"],
+    "size_threshold": "l",
+    "budget_window": { "tokens": 6000000, "hours": 24 },
+    "pr": true
+  },
+  "history": []
+}
+```
+
+- `goal` is the whole program; `contexts` are its parts. A context has a stable `id`, its own `goal`, the `scope` globs it owns, the `depends_on` ids it waits for, a `size` (`s`, `m`, `l`, `xl`), and where it got to: `status` (`pending`, `active`, `done`, `parked`) plus `feature_id`, `pr`, `parked_reason` and `slice_index`. An empty `scope` is rejected.
+- `policy`: `always_stop` lists the gate classes that always wait for a person; a context whose `size` is at or above `size_threshold` is planned one entry of `slices` at a time; `budget_window` caps the tokens spent in a rolling number of hours; `pr` sends each context's work out as a pull request.
+- `history` is append-only: `{ "at", "context", "action", "result" }`, with optional `feature_id`, `commits` and `tokens`.
+- Validation names the field it rejects: a duplicate context `id`, a `depends_on` that names no context, a dependency cycle, or an unknown key; the command prints the field and exits 1.
+
+| Command | Description |
+| :--- | :--- |
+| `softfactory program init "<goal>"` | Write the skeleton above with the goal and an empty `contexts` array; refuses to overwrite an existing `program.json` |
+| `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and the readiness reason (`pending`, `waits on api`, `done`, `parked: <reason>`) |
+| `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
+| `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
+
+`program` is dispatched before any provider or flag parsing, so its words are never read as a requirement and no Factory is needed. A bare `softfactory program` prints `not implemented yet`.
+
 ## A whole agent as the worker
 
 `--cloud-provider=claude-code`, `gemini-cli` or `muse` hands each task to that agent in print mode inside the task's worktree, with the same prompt the tool loop gets: the task, its acceptance command, its review questions, the lessons, and the handoff file to write. The agent brings its own loop, tools and permission system, so softfactory's command policy does not apply to what it runs. Two placements, chosen by the sandbox mode:
