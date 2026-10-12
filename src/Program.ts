@@ -144,8 +144,8 @@ export type Deps = {
   archived(featureId: string): Promise<{ status?: string; pr?: number | null } | null | undefined>;
   /** The GitHub state of a context's pull request. */
   prState(number: number): Promise<'OPEN' | 'MERGED' | 'CLOSED'>;
-  /** Open gates from `.softfactory/gates.md`; stubbed to `[]` until that lands. */
-  openGates(): Promise<Array<{ class: string; scope: string[] }>>;
+  /** Open gates from `.softfactory/gates.md` (see Gates.openGates). */
+  openGates(): Promise<Array<{ id?: string; class: string; scope: string[] }>>;
 };
 
 /** The empty skeleton `program init` and a missing file both produce. */
@@ -327,7 +327,7 @@ async function computeReadiness(program: Program, deps: Deps): Promise<Array<{ i
 
     const gate = stoppingGates.find(candidate => gateCovers(candidate.scope, context.scope));
     if (gate) {
-      results.push({ id: context.id, ready: false, reason: `open gate ${gate.class} covers scope` });
+      results.push({ id: context.id, ready: false, reason: `open ${gate.class} gate${gate.id ? ` ${gate.id}` : ''} covers scope` });
       continue;
     }
 

@@ -13,6 +13,7 @@ import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
 import { loadProgram, saveProgram, readiness, nextRequirement, stopProgram, resumeProgram, PROGRAM_FILE, type Context } from './Program.js';
+import { readGates, openGates, decideGate, answered, GATES_FILE } from './Gates.js';
 import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
@@ -24,7 +25,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program next | program stop ["reason"] | program resume';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program next | program gate <class> "<scope>" "<question>" "<choice>" "<reason>" | program stop ["reason"] | program resume';
 
 let globalFactory: Factory | null = null;
 
@@ -134,12 +135,13 @@ async function programCommand(baseDir: string, args: string[]): Promise<void> {
     }
     const program = await loadProgram(baseDir);
     // The reasons come from Program.readiness; GitHub supplies the PR state and
-    // gates are stubbed to [] until .softfactory/gates.md lands (#66).
+    // .softfactory/gates.md the open always-stop gates.
     const github = new GitHub(baseDir);
+    const stopping = await openGates(baseDir, program.policy.always_stop);
     const verdicts = await readiness(program, {
       archived: featureId => readArchived(baseDir, featureId),
       prState: number => github.prState(number),
-      openGates: async () => [],
+      openGates: async () => stopping,
     });
     if (subcommand === 'next') {
       // What the next advance would run, without running it.
@@ -157,6 +159,31 @@ async function programCommand(baseDir: string, args: string[]): Promise<void> {
     if (program.contexts.length === 0) console.log(`No contexts yet: add them to ${PROGRAM_FILE}.`);
     const verdictById = new Map(verdicts.map(verdict => [verdict.id, verdict]));
     for (const context of program.contexts) console.log(`  ${statusLine(context, verdictById.get(context.id))}`);
+    if (stopping.length) {
+      console.log(`Open gates waiting for a person (${GATES_FILE}):`);
+      for (const gate of stopping) console.log(`  ${gate.id}  ${gate.class}  ${gate.scope.join(', ') || '-'}  ${gate.question}`);
+    }
+    const { skipped } = await readGates(baseDir);
+    for (const line of skipped) console.log(`  (unreadable gate row, ${line})`);
+    process.exit(0);
+  }
+
+  if (subcommand === 'gate') {
+    // softfactory program gate <class> "<scope>" "<question>" "<choice>" "<reason>"
+    const [klass, scope, question, choice, reason] = args.slice(1);
+    if (!klass || scope === undefined || !question) {
+      console.error('Error: program gate needs <class> "<scope>" "<question>" ["<choice>" "<reason>"].');
+      process.exit(1);
+    }
+    const program = await loadProgram(baseDir);
+    const stops = program.policy.always_stop.map(c => c.toLowerCase()).includes(klass.toLowerCase());
+    if (!stops && !(await answered(baseDir, question)) && (!choice?.trim() || !reason?.trim())) {
+      console.error(`Error: a ${klass} gate is decided by the driver, so it needs a choice and a reason.`);
+      process.exit(1);
+    }
+    const decision = await decideGate(baseDir, { class: klass, scope, question, choice: choice ?? '', reason: reason ?? '' }, program.policy.always_stop);
+    if (decision.stop) console.log(`open ${decision.gate.id}: waits for a person`);
+    else console.log(`${decision.cited ? 'already decided' : 'decided'} ${decision.gate.id}: ${decision.gate.chosen_by}`);
     process.exit(0);
   }
 

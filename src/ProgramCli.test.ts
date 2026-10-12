@@ -222,3 +222,31 @@ describe('softfactory program next', () => {
     assert.match(none.stdout, /No context is ready:\n  api: parked: blocked task\n  web: waits on api/);
   });
 });
+
+describe('softfactory program gate', () => {
+  it('decides an engineering gate, opens a contract gate, and status lists the open one', async () => {
+    const repo = await makeRepo();
+    const program = defaultProgram('Ship the rates service');
+    program.contexts = [
+      { id: 'api', goal: 'API', scope: ['api/**'], depends_on: [], size: 'm', slices: [], status: 'pending', feature_id: null, pr: null, parked_reason: null, slice_index: 0 },
+    ];
+    await saveProgram(repo, program);
+
+    const missing = await softfactory(repo, ['program', 'gate', 'engineering', 'app/**', 'httpx or requests?']);
+    assert.equal(missing.exitCode, 1);
+    assert.match(missing.stderr, /needs a choice and a reason/);
+
+    const decided = await softfactory(repo, ['program', 'gate', 'engineering', 'app/**', 'httpx or requests?', 'httpx', 'async client']);
+    assert.equal(decided.exitCode, 0, decided.stderr);
+    assert.match(decided.stdout, /^decided G1: driver: httpx, async client/);
+
+    const opened = await softfactory(repo, ['program', 'gate', 'contract', 'api/**', 'Version the /rates response?']);
+    assert.equal(opened.exitCode, 0, opened.stderr);
+    assert.match(opened.stdout, /^open G2: waits for a person/);
+
+    const status = await softfactory(repo, ['program', 'status']);
+    assert.equal(status.exitCode, 0, status.stderr);
+    assert.match(status.stdout, /  api  pending  m  \[-\]  open contract gate G2 covers scope/);
+    assert.match(status.stdout, /Open gates waiting for a person \(\.softfactory\/gates\.md\):\n  G2  contract  api\/\*\*  Version the \/rates response\?/);
+  });
+});

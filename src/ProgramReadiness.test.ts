@@ -222,7 +222,7 @@ describe('program readiness and always-stop gates', () => {
       openGates: async () => [{ class: 'cutover', scope: ['ops/**'] }],
     }));
     assert.equal(blocked.ready, false);
-    assert.equal(blocked.reason, 'open gate cutover covers scope');
+    assert.equal(blocked.reason, 'open cutover gate covers scope');
   });
 
   it('is ready when the open gate class is not in always_stop', async () => {
