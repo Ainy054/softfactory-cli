@@ -341,6 +341,9 @@ describe('the read budget before the first edit scales with the task\'s files', 
     assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['big.ts']), { warn: 12, abort: 25 });
     assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['big.ts', 'big.ts', 'missing.ts']), { warn: 15, abort: 30 });
     assert.deepEqual(await ToolLoopWorker.progressLimits(dir, []), { warn: 6, abort: 12 });
+    // #75: a task whose only files are still to be created starts at 20.
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['src/New.ts'], ['src/New.ts']), { warn: 10, abort: 20 });
+    assert.deepEqual(await ToolLoopWorker.progressLimits(dir, ['small.ts'], ['small.ts']), { warn: 6, abort: 13 }, 'an existing file is an edit, not a create');
   });
 });
 
