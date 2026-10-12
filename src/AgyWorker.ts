@@ -126,8 +126,10 @@ A claim whose cited line does not exist rejects the task.
     const proc = execa('agy', args, {
       cwd: worktreePath,
       stdio: ['ignore', 'pipe', useStreaming ? 'pipe' : 'inherit'],
-      timeout: 600000,
-      ...(options?.signal ? { cancelSignal: options.signal } : {}),
+      // The orchestrator's attempt budget (--attempt-timeout) ends the process.
+      // A fixed cap here would cut it short: a 10-minute kill once ended an
+      // agy task inside a 15-minute attempt and was reported as "no file changes".
+      ...(options?.signal ? { cancelSignal: options.signal } : { timeout: 600000 }),
     });
 
     const relay = new AgyStreamRelay(
@@ -175,10 +177,11 @@ A claim whose cited line does not exist rejects the task.
     }, 12000);
 
     let exitCode: number | null | undefined = null;
+    let killedBy = null as string | null;
     try {
       proc.catch(() => {}); // Silence the floating execa promise to prevent Node crash
       exitCode = await new Promise<number | null>((resolve, reject) => {
-        proc.on('exit', (code) => resolve(code));
+        proc.on('exit', (code, signal) => { killedBy = signal; resolve(code); });
         proc.on('error', (err) => reject(err));
       });
       if (proc.stdout) proc.stdout.destroy();
@@ -193,7 +196,9 @@ A claim whose cited line does not exist rejects the task.
     const affirmed = affirmsLiveStackUntouched(output);
 
     // Try reading handoff immediately with retries for filesystem flush
-    for (let i = 0; i < 5; i++) {
+    // A stopped process will not flush a handoff later; only wait for a clean exit.
+    const tries = options.signal?.aborted || killedBy ? 1 : 5;
+    for (let i = 0; i < tries; i++) {
       try {
         const content = await fs.readFile(handoffPath, 'utf-8');
         const json = JSON.parse(content);
@@ -202,6 +207,13 @@ A claim whose cited line does not exist rejects the task.
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
+
+    // A stopped process left no handoff because it was stopped, not because
+    // it finished: say so, so the attempt is not judged as a completed one.
+    if (options.signal?.aborted) {
+      return { task_id: task.id, status: 'failure', files_changed: [], summary: `agy was stopped by the attempt timeout before writing its handoff` };
+    }
+    if (killedBy) throw new Error(`agy was killed by ${killedBy} before writing its handoff`);
 
     // If handoff was not written but files were modified, construct fallback handoff
     return {

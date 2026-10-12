@@ -71,9 +71,9 @@ export function buildCodexExecOptions(worktreePath: string, signal?: AbortSignal
   return {
     cwd: worktreePath,
     stdin: 'ignore' as const,
-    timeout: 600000,
     all: true,
-    // The orchestrator's attempt budget ends the process, not just the wait for it.
-    ...(signal ? { cancelSignal: signal } : {}),
+    // The orchestrator's attempt budget ends the process, not just the wait for
+    // it; the fixed cap applies only when there is no budget to defer to.
+    ...(signal ? { cancelSignal: signal } : { timeout: 600000 }),
   };
 }
