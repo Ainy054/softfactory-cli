@@ -21,11 +21,11 @@ const KNOWN_FLAGS = [
   '--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider',
   '--planner-provider', '--planner-model', '--mark-done', '--sandbox',
   '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--pr',
-  '--queue', '--next', '--backlog', '--promote', '--isolation', '--approve-design', '--design-review'
+  '--queue', '--next', '--backlog', '--promote', '--isolation', '--approve-design', '--design-review', '--checklist'
 ];
-const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design'];
+const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design', '--checklist'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program next | program gate <class> "<scope>" "<question>" "<choice>" "<reason>" | program stop ["reason"] | program resume';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id]] [--checklist <program-context-id>] <requirement> | program init "<goal>" | program status | program next | program gate <class> "<scope>" "<question>" "<choice>" "<reason>" | program stop ["reason"] | program resume';
 
 let globalFactory: Factory | null = null;
 
@@ -380,7 +380,9 @@ async function main() {
   const backlogMode = args.some(a => a === '--backlog' || a.startsWith('--backlog='));
   // Queue/next are dispatch-only: they never need the plan-approval TUI, so
   // they always take the plain-stdout path.
-  const noTui = args.includes('--no-tui') || queueMode || nextMode || !process.stdout.isTTY;
+  // --checklist runs one program context unattended: the plan checklist approves instead of a person.
+  const checklistId = getFlagValue(args, '--checklist');
+  const noTui = args.includes('--no-tui') || queueMode || nextMode || !!checklistId || !process.stdout.isTTY;
   const noDocker = args.includes('--no-docker');
   const markDoneId = getFlagValue(args, '--mark-done');
   const promoteId = getFlagValue(args, '--promote');
@@ -592,7 +594,15 @@ async function main() {
   const interactive = isInteractive(args);
   const askForApproval = interactive && !resumeMode && !planMode;
   if (noTui) {
-    if (askForApproval) factory.approvePlan = terminalApprover();
+    if (checklistId) {
+      const { checklistApprover, programChecklistContext } = await import('./PlanChecklist.js');
+      try {
+        factory.approvePlan = checklistApprover(process.cwd(), await programChecklistContext(process.cwd(), checklistId, maxTokensArg));
+      } catch (error: any) {
+        console.error(`[SoftFactory] ${error?.issues ? `.softfactory/program.json: ${error.issues.map((i: any) => `${i.path.join('.')}: ${i.message}`).join('; ')}` : error?.message}`);
+        process.exit(1);
+      }
+    } else if (askForApproval) factory.approvePlan = terminalApprover();
     // Past 80% of the planned token budget a person is asked; unattended runs halt.
     if (interactive) factory.confirmOverBudget = terminalBudgetConfirm();
     factory.on('worker:output', (event: { taskId: string; line: string }) => console.log(`[${event.taskId}] ${String(event.line).slice(0, 240)}`));

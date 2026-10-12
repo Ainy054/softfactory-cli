@@ -205,7 +205,7 @@ function isLarge(program: Program, context: Context): boolean {
 }
 
 /** True when an always-stop gate's scope glob overlaps the context's scope glob. */
-function gateCovers(gateScope: string[], contextScope: string[]): boolean {
+export function gateCovers(gateScope: string[], contextScope: string[]): boolean {
   const gates = gateScope.map(scope => scope.trim()).filter(scope => scope.length > 0);
   const contexts = contextScope.map(scope => scope.trim()).filter(scope => scope.length > 0);
   return gates.some(gate => contexts.some(context => scopesOverlap(gate, context)));
