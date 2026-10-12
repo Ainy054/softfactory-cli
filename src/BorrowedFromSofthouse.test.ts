@@ -208,6 +208,7 @@ describe('4. fork freshness and the wiring census', () => {
     await git('commit', '-q', '-m', 'lib');
     await factory.wiringGate();
     assert.equal(factory.state.status, 'failed');
+    assert.equal(factory.state.failure_reason, 'final gate: new exports nothing calls: unreachable (src/lib.ts)', 'a program advance parks with this reason');
     assert.ok(logs.some(l => /added library code that nothing calls: unreachable \(src\/lib\.ts\)/.test(l)), logs.join('\n'));
   });
 
