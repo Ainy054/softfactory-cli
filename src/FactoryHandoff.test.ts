@@ -86,6 +86,22 @@ describe('test-writer acceptance evidence', () => {
     const factory: any = new Factory('/tmp', '', { strategy: 'local' });
     assert.equal(factory.validateTestWriterEvidence({ agent_role: 'test_writer' }, '+it("works", () => expect(true).toBe(true));'), null);
   });
+
+  it('accepts pytest, Rust and JUnit tests', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    for (const diff of [
+      '+def test_schema_creation(cache):\n+    assert cache',
+      '+    async def test_latest(client):',
+      '+class TestParser:\n+    def check(self): ...',
+      '+#[test]\n+fn parses() {}',
+      '+  @Test\n+  void parses() {}',
+    ]) assert.equal(factory.validateTestWriterEvidence({ agent_role: 'test_writer' }, diff), null, diff);
+  });
+
+  it('still rejects a Python file with no tests', () => {
+    const factory: any = new Factory('/tmp', '', { strategy: 'local' });
+    assert.match(factory.validateTestWriterEvidence({ agent_role: 'test_writer' }, '+import pytest\n+def helper(x):\n+    return x'), /no test cases/);
+  });
 });
 
 describe('automatic re-plan scope', () => {
