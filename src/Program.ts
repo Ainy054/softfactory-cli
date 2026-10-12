@@ -134,6 +134,19 @@ export type Policy = z.infer<typeof PolicySchema>;
 export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
 export type Program = z.infer<typeof ProgramSchema>;
 
+/**
+ * Injectable side effects for {@link readiness}. Tests can supply stubs so
+ * deciding what to work on next never needs GitHub or the archive directory.
+ */
+export type Deps = {
+  /** The archived feature record for a context's feature, or null/undefined when absent. */
+  archived(featureId: string): Promise<{ status?: string; pr?: number | null } | null | undefined>;
+  /** The GitHub state of a context's pull request. */
+  prState(number: number): Promise<'OPEN' | 'MERGED' | 'CLOSED'>;
+  /** Open gates from `.softfactory/gates.md`; stubbed to `[]` until that lands. */
+  openGates(): Promise<Array<{ class: string; scope: string[] }>>;
+};
+
 /** The empty skeleton `program init` and a missing file both produce. */
 export function defaultProgram(goal = ''): Program {
   return { goal, contexts: [], policy: defaultPolicy(), history: [] };
@@ -192,6 +205,127 @@ function readinessReason(program: Program, context: Context): string {
   const waiting = context.depends_on.filter(id => byId.get(id)?.status !== 'done');
   if (waiting.length) return `waits on ${waiting.join(', ')}`;
   return 'pending';
+}
+
+const SIZE_RANK: Record<Context['size'], number> = { s: 0, m: 1, l: 2, xl: 3 };
+
+function isLarge(program: Program, context: Context): boolean {
+  return SIZE_RANK[context.size] >= SIZE_RANK[program.policy.size_threshold];
+}
+
+/** Strip the glob suffix so `app/**` and `app/**\/*` compare as the path `app`. */
+function scopePrefix(scope: string): string {
+  return scope.replace(/\/\*\*?$/, '').replace(/\/+$/, '');
+}
+
+/** True when an always-stop gate's scope overlaps the context's scope. */
+function gateCovers(gateScope: string[], contextScope: string[]): boolean {
+  const gates = gateScope.map(scopePrefix).filter(scope => scope.length > 0);
+  const contexts = contextScope.map(scopePrefix).filter(scope => scope.length > 0);
+  return gates.some(gate => contexts.some(context =>
+    context === gate || context.startsWith(`${gate}/`) || gate.startsWith(`${context}/`),
+  ));
+}
+
+/** Returns a blocker reason for one dependency, or null when it is done. */
+async function dependencyReason(program: Program, dependency: Context, deps: Deps): Promise<string | null> {
+  if (dependency.pr != null) {
+    const state = await deps.prState(dependency.pr);
+    if (state === 'MERGED') return null;
+    if (state === 'OPEN') return `waits on ${dependency.id} (PR #${dependency.pr} open)`;
+    if (state === 'CLOSED') return `waits on ${dependency.id} (PR #${dependency.pr} closed)`;
+    return `waits on ${dependency.id}`;
+  }
+  if (program.policy.pr === false && dependency.feature_id != null) {
+    const archived = await deps.archived(dependency.feature_id);
+    if (archived?.status === 'completed' && archived.pr == null) return null;
+  }
+  return `waits on ${dependency.id}`;
+}
+
+/**
+ * Which contexts the driver may work on next. A context is ready when its
+ * status allows a run (`pending`, or `active` with no run in progress), every
+ * dependency is done, no open always-stop gate covers its scope, and a large
+ * context has at least one slice to plan.
+ */
+export function readiness(program: Program, deps: Deps): Promise<Array<{ id: string; ready: boolean; reason: string }>> {
+  return computeReadiness(program, deps);
+}
+
+async function computeReadiness(program: Program, deps: Deps): Promise<Array<{ id: string; ready: boolean; reason: string }>> {
+  const byId = new Map(program.contexts.map(context => [context.id, context]));
+  const gates = await deps.openGates();
+  const stoppingGates = gates.filter(gate => program.policy.always_stop.includes(gate.class));
+  const results: Array<{ id: string; ready: boolean; reason: string }> = [];
+  for (const context of program.contexts) {
+    if (context.status === 'done') {
+      results.push({ id: context.id, ready: false, reason: 'done' });
+      continue;
+    }
+    if (context.status === 'parked') {
+      results.push({ id: context.id, ready: false, reason: `parked: ${context.parked_reason ?? ''}`.trim() });
+      continue;
+    }
+    if (context.status !== 'pending' && context.status !== 'active') {
+      results.push({ id: context.id, ready: false, reason: context.status });
+      continue;
+    }
+
+    const depReason: string | null = await (async () => {
+      for (const id of context.depends_on) {
+        const dependency = byId.get(id);
+        if (!dependency) continue;
+        const reason = await dependencyReason(program, dependency, deps);
+        if (reason) return reason;
+      }
+      return null;
+    })();
+    if (depReason) {
+      results.push({ id: context.id, ready: false, reason: depReason });
+      continue;
+    }
+
+    const gate = stoppingGates.find(candidate => gateCovers(candidate.scope, context.scope));
+    if (gate) {
+      results.push({ id: context.id, ready: false, reason: `open gate ${gate.class} covers scope` });
+      continue;
+    }
+
+    if (isLarge(program, context) && context.slices.length === 0) {
+      results.push({
+        id: context.id,
+        ready: false,
+        reason: `needs slices (size ${context.size} ≥ threshold ${program.policy.size_threshold})`,
+      });
+      continue;
+    }
+
+    results.push({ id: context.id, ready: true, reason: 'ready' });
+  }
+  return results;
+}
+
+/**
+ * The requirement text for the next run of a context: the program goal, the
+ * context goal, its scope paths, and (when sliced) the current slice with its
+ * position and the note that earlier slices are already merged.
+ */
+export function nextRequirement(program: Program, contextId: string): string {
+  const context = program.contexts.find(candidate => candidate.id === contextId);
+  if (!context) return '';
+  const lines = [
+    program.goal,
+    context.goal,
+    `change only files under: ${context.scope.join(', ')}`,
+  ];
+  if (context.slices.length > 0) {
+    lines.push(
+      context.slices[context.slice_index] ?? '',
+      `this is slice ${context.slice_index + 1} of ${context.slices.length}; earlier slices are merged`,
+    );
+  }
+  return lines.join('\n\n');
 }
 
 /**
