@@ -70,6 +70,26 @@ describe('opening and updating the pull request', () => {
   });
 });
 
+describe('reading a pull request state', () => {
+  for (const state of ['OPEN', 'MERGED', 'CLOSED'] as const) {
+    it(`returns ${state} from gh pr view`, async () => {
+      const { exec, calls } = fakeExec({ 'gh pr view': { stdout: `${state}\n` } });
+      assert.equal(await new GitHub('/repo', exec).prState(12), state);
+      assert.deepEqual(calls[0].args, ['pr', 'view', '12', '--json', 'state', '-q', '.state']);
+    });
+  }
+
+  it('fails plainly when gh exits non-zero', async () => {
+    const { exec } = fakeExec({ 'gh pr view': { stderr: 'no pull requests found for branch', exitCode: 1 } });
+    await assert.rejects(() => new GitHub('/repo', exec).prState(12), /Could not read PR #12: no pull requests found for branch/);
+  });
+
+  it('fails plainly on an unexpected state', async () => {
+    const { exec } = fakeExec({ 'gh pr view': { stdout: 'DRAFT\n' } });
+    await assert.rejects(() => new GitHub('/repo', exec).prState(12), /Unexpected state for PR #12: DRAFT/);
+  });
+});
+
 describe('the pull request body', () => {
   it('states what was asked, what merged, how each task was checked, and where the record is', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-prbody-'));

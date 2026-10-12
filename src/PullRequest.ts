@@ -81,6 +81,15 @@ export class GitHub {
   async markReady(number: number): Promise<void> {
     await this.exec('gh', ['pr', 'ready', String(number)], { cwd: this.baseDir });
   }
+
+  /** The PR's state, for deciding whether a dependency is done (merged) or still waiting. */
+  async prState(number: number): Promise<'OPEN' | 'MERGED' | 'CLOSED'> {
+    const result = await this.exec('gh', ['pr', 'view', String(number), '--json', 'state', '-q', '.state'], { cwd: this.baseDir });
+    if (result.exitCode !== 0) throw new Error(`Could not read PR #${number}: ${(result.stderr || result.stdout).trim()}`);
+    const state = result.stdout.trim();
+    if (state !== 'OPEN' && state !== 'MERGED' && state !== 'CLOSED') throw new Error(`Unexpected state for PR #${number}: ${state || '(empty)'}`);
+    return state;
+  }
 }
 
 /** Issue templates leave HTML comments behind; they are instructions to the author, not the requirement. */

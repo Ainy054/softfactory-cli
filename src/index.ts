@@ -12,7 +12,7 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
-import { loadProgram, saveProgram, formatStatus, stopProgram, resumeProgram, PROGRAM_FILE } from './Program.js';
+import { loadProgram, saveProgram, readiness, nextRequirement, stopProgram, resumeProgram, PROGRAM_FILE, type Context } from './Program.js';
 import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
@@ -24,7 +24,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program stop ["reason"] | program resume';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program next | program stop ["reason"] | program resume';
 
 let globalFactory: Factory | null = null;
 
@@ -86,6 +86,24 @@ async function designReviewRef(root: string, featureId?: string): Promise<string
   return result.stdout.trim() || 'HEAD';
 }
 
+/** The archived feature record for a context's `feature_id`, or null when none is archived. */
+async function readArchived(baseDir: string, featureId: string): Promise<{ status?: string; pr?: number | null } | null> {
+  try {
+    const raw = await fs.readFile(path.join(baseDir, '.softfactory', 'archive', `${featureId}.json`), 'utf8');
+    const data = JSON.parse(raw) as { status?: unknown; pr?: unknown };
+    return { status: typeof data.status === 'string' ? data.status : undefined, pr: typeof data.pr === 'number' ? data.pr : null };
+  } catch {
+    return null;
+  }
+}
+
+/** One status line: id, status, size, depends_on and the readiness verdict (check or reason). */
+function statusLine(context: Context, verdict: { ready: boolean; reason: string } | undefined): string {
+  const deps = context.depends_on.length ? context.depends_on.join(', ') : '-';
+  const readinessText = verdict ? (verdict.ready ? '✓ ready' : verdict.reason) : 'unknown';
+  return `${context.id}  ${context.status}  ${context.size}  [${deps}]  ${readinessText}`;
+}
+
 /** `softfactory program <subcommand>`: args start after the word "program". */
 async function programCommand(baseDir: string, args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -109,15 +127,36 @@ async function programCommand(baseDir: string, args: string[]): Promise<void> {
     process.exit(0);
   }
 
-  if (subcommand === 'status') {
+  if (subcommand === 'status' || subcommand === 'next') {
     if (!await fs.access(path.join(baseDir, PROGRAM_FILE)).then(() => true).catch(() => false)) {
       console.log(`No program: run 'softfactory program init "<goal>"' to start one.`);
       process.exit(0);
     }
     const program = await loadProgram(baseDir);
+    // The reasons come from Program.readiness; GitHub supplies the PR state and
+    // gates are stubbed to [] until .softfactory/gates.md lands (#66).
+    const github = new GitHub(baseDir);
+    const verdicts = await readiness(program, {
+      archived: featureId => readArchived(baseDir, featureId),
+      prState: number => github.prState(number),
+      openGates: async () => [],
+    });
+    if (subcommand === 'next') {
+      // What the next advance would run, without running it.
+      const ready = verdicts.find(verdict => verdict.ready);
+      if (!ready) {
+        console.log('No context is ready:');
+        for (const verdict of verdicts) console.log(`  ${verdict.id}: ${verdict.reason}`);
+        process.exit(0);
+      }
+      console.log(`Next: ${ready.id}\n`);
+      console.log(nextRequirement(program, ready.id));
+      process.exit(0);
+    }
     console.log(`Program: ${program.goal}`);
     if (program.contexts.length === 0) console.log(`No contexts yet: add them to ${PROGRAM_FILE}.`);
-    for (const line of formatStatus(program)) console.log(`  ${line}`);
+    const verdictById = new Map(verdicts.map(verdict => [verdict.id, verdict]));
+    for (const context of program.contexts) console.log(`  ${statusLine(context, verdictById.get(context.id))}`);
     process.exit(0);
   }
 

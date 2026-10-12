@@ -112,13 +112,68 @@ describe('softfactory program status', () => {
     const result = await softfactory(repo, ['program', 'status']);
 
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.deepEqual(result.stdout.split('\n').filter(Boolean), [
+    const lines = result.stdout.split('\n').filter(Boolean);
+    // A ready context prints the readiness check.
+    assert.match(lines.find(line => line.startsWith('  api ')) ?? '', /✓ ready/);
+    // A blocked dependency prints the exact reason from Program.readiness.
+    assert.match(lines.find(line => line.startsWith('  web ')) ?? '', /waits on api/);
+    assert.deepEqual(lines, [
       'Program: Ship the rates service',
-      '  api  pending  m  [-]  pending',
+      '  api  pending  m  [-]  ✓ ready',
       '  web  pending  l  [api]  waits on api',
       '  worker  done  s  [api]  done',
       '  cutover  parked  xl  [web, worker]  parked: needs approval',
     ]);
+  });
+
+  it('reads the archive to decide a dependency is done when policy.pr is false', async () => {
+    const repo = await makeRepo();
+    const program = defaultProgram('Ship the rates service');
+    program.policy.pr = false;
+    program.contexts = [
+      {
+        id: 'worker',
+        goal: 'Background jobs',
+        scope: ['jobs/**'],
+        depends_on: [],
+        size: 'm',
+        slices: [],
+        // Its run finished but the program was not updated yet: the archive decides.
+        status: 'active',
+        feature_id: 'f-1',
+        pr: null,
+        parked_reason: null,
+        slice_index: 0,
+      },
+      {
+        id: 'web',
+        goal: 'Dashboard for the rates',
+        scope: ['web/**'],
+        depends_on: ['worker'],
+        size: 'm',
+        slices: [],
+        status: 'pending',
+        feature_id: null,
+        pr: null,
+        parked_reason: null,
+        slice_index: 0,
+      },
+    ];
+    await saveProgram(repo, program);
+    const archive = path.join(repo, '.softfactory', 'archive');
+    await fs.mkdir(archive, { recursive: true });
+
+    // A failed archive is not done: the dependency still blocks with its reason.
+    await fs.writeFile(path.join(archive, 'f-1.json'), JSON.stringify({ status: 'failed', pr: null }));
+    const blocked = await softfactory(repo, ['program', 'status']);
+    assert.equal(blocked.exitCode, 0, blocked.stderr);
+    assert.match(blocked.stdout.split('\n').find(line => line.startsWith('  web ')) ?? '', /waits on worker/);
+
+    // A completed archive with no PR is done: the dependent context is ready.
+    await fs.writeFile(path.join(archive, 'f-1.json'), JSON.stringify({ status: 'completed', pr: null }));
+    const ready = await softfactory(repo, ['program', 'status']);
+    assert.equal(ready.exitCode, 0, ready.stderr);
+    assert.match(ready.stdout.split('\n').find(line => line.startsWith('  web ')) ?? '', /✓ ready/);
   });
 
   it('says how to start when there is no program file', async () => {
@@ -139,5 +194,31 @@ describe('softfactory program status', () => {
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /program\.json: contexts\.0\.depends_on: unknown depends_on id "api"/);
     assert.doesNotMatch(result.stderr, /at .*\.ts:\d+/);
+  });
+});
+
+describe('softfactory program next', () => {
+  it('prints the requirement the next advance would run, or why nothing is ready', async () => {
+    const repo = await makeRepo();
+    const program = defaultProgram('Ship the rates service');
+    program.contexts = [
+      { id: 'api', goal: 'FastAPI app with /rates', scope: ['app/**', 'tests/**'], depends_on: [], size: 'xl', slices: ['models and storage', 'routes'], status: 'pending', feature_id: null, pr: null, parked_reason: null, slice_index: 1 },
+      { id: 'web', goal: 'Dashboard', scope: ['web/**'], depends_on: ['api'], size: 'm', slices: [], status: 'pending', feature_id: null, pr: null, parked_reason: null, slice_index: 0 },
+    ];
+    await saveProgram(repo, program);
+
+    const next = await softfactory(repo, ['program', 'next']);
+    assert.equal(next.exitCode, 0, next.stderr);
+    assert.match(next.stdout, /^Next: api/);
+    assert.match(next.stdout, /change only files under: app\/\*\*, tests\/\*\*/);
+    assert.match(next.stdout, /routes/);
+    assert.match(next.stdout, /this is slice 2 of 2; earlier slices are merged/);
+
+    program.contexts[0].status = 'parked';
+    program.contexts[0].parked_reason = 'blocked task';
+    await saveProgram(repo, program);
+    const none = await softfactory(repo, ['program', 'next']);
+    assert.equal(none.exitCode, 0, none.stderr);
+    assert.match(none.stdout, /No context is ready:\n  api: parked: blocked task\n  web: waits on api/);
   });
 });
