@@ -114,7 +114,7 @@ describe('isSecretPath', () => {
     assert.equal(isSecretPath('certs/server.pem'), true);
     assert.equal(isSecretPath('keys/service.key'), true);
     assert.equal(isSecretPath('keys/id_rsa'), true);
-    assert.equal(isSecretPath('keys/id_rsa.pub'), true);
+    assert.equal(isSecretPath('keys/id_rsa.pub'), false, 'a public key is meant to be shared');
     assert.equal(isSecretPath('bundle.p12'), true);
     assert.equal(isSecretPath('credentials.json'), true);
     assert.equal(isSecretPath('src/config.ts'), false);

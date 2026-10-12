@@ -35,9 +35,11 @@ interface SecretPattern {
   pattern: RegExp;
   kind: string;
   /**
-   * Only the generic `key = value` / `key: value` assignments are allowed to
-   * be dropped when their value is an obvious placeholder. Provider-prefixed
-   * patterns stay strict so a fixture-looking token still fails the gate.
+   * Name-based patterns (`password = ...`, `"token": "..."`) match code that
+   * merely handles a credential: `token: string`, `api_key =
+   * os.environ["API_KEY"]`. They count only when the value is a hard-coded
+   * literal that is not a placeholder. Provider-prefixed patterns stay strict
+   * so a fixture-looking token still fails the gate.
    */
   placeholderFilter?: boolean;
 }
@@ -53,9 +55,12 @@ const SECRET_PATTERNS: SecretPattern[] = [
   { pattern: PATTERNS[7], kind: 'Google API key' },
   { pattern: PATTERNS[8], kind: 'JWT' },
   { pattern: PATTERNS[9], kind: 'URL credential' },
-  { pattern: PATTERNS[10], kind: 'JSON key assignment' },
+  { pattern: PATTERNS[10], kind: 'JSON key assignment', placeholderFilter: true },
   { pattern: PATTERNS[11], kind: 'Generic assignment', placeholderFilter: true },
   { pattern: PATTERNS[12], kind: 'Generic assignment', placeholderFilter: true },
+  // PATTERNS[12] stops at a quote, so a quoted literal assigned to a password
+  // or token name in code never matched it; the gate needs the quoted form too.
+  { pattern: /\b\w*(?:api[_-]?key|apikey|password|passwd|secret|secret[_-]?key|token|private[_-]?key|access[_-]?key)\s*[:=]\s*["'`][^"'`\n]+["'`]/gi, kind: 'Generic assignment', placeholderFilter: true },
 ];
 
 const PLACEHOLDER_VALUES = new Set(['xxx', 'your-api-key', 'changeme', 'example']);
@@ -75,16 +80,28 @@ function isPlaceholderValue(raw: string): boolean {
   return false;
 }
 
-/** Pulls the value out of a generic `key = value` / `key: value` match. */
-function assignmentValue(match: string): string {
-  const eq = match.indexOf('=');
-  const colon = match.indexOf(':');
-  let at = -1;
-  if (eq !== -1 && colon !== -1) at = Math.min(eq, colon);
-  else if (eq !== -1) at = eq;
-  else if (colon !== -1) at = colon;
-  if (at === -1) return match;
-  return match.slice(at + 1).replace(/^Bearer\s+/i, '').trim();
+/**
+ * The hard-coded value an assignment holds, or undefined when it holds an
+ * expression. `rest` is the line from the match onward. A quoted literal
+ * counts anywhere; a bare value (`TOKEN=abc123`) only where bare values are
+ * literals (env, shell, YAML, INI files), since in code it is an identifier
+ * or a type (`token: string`).
+ */
+function literalValue(rest: string, bareValues: boolean): string | undefined {
+  const at = rest.search(/[=:]/);
+  if (at === -1) return undefined;
+  const value = rest.slice(at + 1).trim().replace(/^Bearer\s+/i, '');
+  const quoted = /^(['"`])([^'"`]*)\1/.exec(value);
+  if (quoted) return quoted[2].includes('${') ? undefined : quoted[2];
+  if (!bareValues) return undefined;
+  const bare = /^[^\s,;'"`]+/.exec(value)?.[0];
+  if (!bare || /[()[\]{}$]/.test(bare) || /^(?:process\.env|os\.environ|env\.|getenv)/i.test(bare)) return undefined;
+  return bare;
+}
+
+/** A literal that could be a real credential: long enough, one token, not a placeholder. */
+function couldBeCredential(value: string): boolean {
+  return value.length >= 8 && !/\s/.test(value) && !isPlaceholderValue(value);
 }
 
 /** Returns the full line (without the trailing `\n`) that contains `index`. */
@@ -104,7 +121,7 @@ function lineForIndex(text: string, index: number): string {
  */
 export function findSecrets(
   text: string,
-  options: { allowedPatterns?: RegExp[] } = {},
+  options: { allowedPatterns?: RegExp[]; bareValues?: boolean } = {},
 ): Array<{ kind: string; match: string }> {
   const input = String(text ?? '');
   const allowedPatterns = (options.allowedPatterns ?? []).map((raw) => {
@@ -131,7 +148,10 @@ export function findSecrets(
         if (matched.length === 0) pattern.lastIndex++;
         continue;
       }
-      if (placeholderFilter && isPlaceholderValue(assignmentValue(matched))) {
+      const lineStart = input.lastIndexOf('\n', match.index - 1) + 1;
+      const rest = line.slice(match.index - lineStart);
+      const literal = placeholderFilter ? literalValue(rest, options.bareValues ?? true) : undefined;
+      if (placeholderFilter && (literal === undefined || !couldBeCredential(literal))) {
         if (matched.length === 0) pattern.lastIndex++;
         continue;
       }

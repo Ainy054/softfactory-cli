@@ -62,6 +62,27 @@ describe('findSecrets locates credentials without redacting them away', () => {
     assert.ok(hits.some((h) => h.kind === 'PEM private key' && h.match.includes('MIIEow')));
   });
 
+  it('counts a name-based match only when the value is a hard-coded literal', () => {
+    // Code that merely handles a credential once made the gate reject nearly
+    // every auth change, including the environment read it asks for.
+    for (const code of [
+      'const token = await getToken();',
+      '  token: string;',
+      'password: z.string().min(8),',
+      'API_KEY = os.environ["API_KEY"]',
+      'const api_key = process.env.API_KEY;',
+      "throw new Error('password: must be at least 8 characters');",
+      "const tokenizer = 'whitespace-tokenizer';",
+      'const token = `${prefix}-${id}`;',
+    ]) assert.deepEqual(findSecrets(code, { bareValues: false }), [], code);
+    for (const leak of ['const password = "hunter2hunter2";', 'SECRET_KEY = "django-insecure-8f3k2j1h"', '"api_key": "live_9f8e7d6c5b4a"']) {
+      assert.ok(findSecrets(leak, { bareValues: false }).length > 0, leak);
+    }
+    // Bare values are literals only where the file format says so (env, shell, YAML).
+    assert.deepEqual(findSecrets('token: string', { bareValues: false }), []);
+    assert.ok(findSecrets('password: s3cr3tPassw0rd', { bareValues: true }).length > 0);
+  });
+
   it('ignores obvious placeholder values', () => {
     const text = [
       'API_KEY=xxx',

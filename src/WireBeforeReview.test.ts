@@ -80,6 +80,18 @@ describe('wire before review', () => {
     assert.ok(logs.some(l => /REJECTED: T1 — wiring_patch may change only orchestrator-owned files; it also changes other\.ts/.test(l)), logs.join('\n'));
   });
 
+  it('scans the wiring patch with the rest of the diff: a credential in it never reaches the base branch', async () => {
+    const token = `ghp_${'Zx81Qw4R'.repeat(4)}wxyz`;
+    const leaky = `--- a/routes.ts\n+++ b/routes.ts\n@@ -1 +1,2 @@\n-export const routes = ['health'];\n+export const routes = ['health', 'users'];\n+export const deployKey = "${token}";\n`;
+    const { factory, logs, git } = await run({ wiring_patch: leaky });
+    const text = logs.join('\n');
+    assert.match(text, /REJECTED: T1 — diff adds a credential \(routes\.ts:2, GitHub token\)/);
+    assert.notEqual(factory.state.tasks[0].status, 'done', text);
+    const { stdout } = await git('show', 'main:routes.ts');
+    assert.ok(!stdout.includes(token), 'the base branch never got the key');
+    assert.ok(!text.includes(token), 'the log never carries the key');
+  });
+
   it('refuses a worker write to an owned file and tells it to send a patch', async () => {
     const { toolResults } = await run({ wiring_patch: patchFor('routes.ts') }, [call('bad', 'write_file', { filepath: 'routes.ts', content: WIRED })]);
     assert.ok(toolResults.some(r => /routes\.ts is orchestrator-owned: do not edit it\. Put the exact change in finish_task's wiring_patch/.test(r)), toolResults.join('\n'));

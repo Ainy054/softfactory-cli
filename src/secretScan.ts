@@ -91,7 +91,7 @@ export function isSecretPath(filePath: string, content?: string): boolean {
   if (base.startsWith('.env.')) return !ALLOWED_ENV_EXAMPLES.has(base);
   if (base.endsWith('.pem')) return true;
   if (base.endsWith('.key')) return true;
-  if (base.startsWith('id_rsa')) return true;
+  if (base.startsWith('id_rsa')) return !base.endsWith('.pub');
   if (base.endsWith('.p12')) return true;
   if (base === 'credentials.json') return true;
   if (base === '.npmrc' || base === '.pypirc') return content !== undefined && hasAuthToken(content);
@@ -173,14 +173,24 @@ function matchesAny(patterns: RegExp[], value: string): boolean {
  */
 function isTestFixturePath(filePath: string): boolean {
   const normalized = normalizePath(filePath).toLowerCase();
-  return normalized.includes('test') || normalized.includes('__fixtures__') || normalized.includes('.fixture.');
+  return /(?:^|\/)(?:tests?|__tests__|spec|fixtures?|__fixtures__|testdata)\//.test(normalized)
+    || /(?:\.|_)(?:test|spec|fixture)\.[a-z0-9]+$/.test(normalized)
+    || /(?:^|\/)test_[^/]*$/.test(normalized);
+}
+
+/** Files where `KEY=value` with an unquoted value is a literal, not code. */
+function bareValuesAreLiterals(filePath: string): boolean {
+  const base = baseName(filePath).toLowerCase();
+  return base.startsWith('.env') || base === 'dockerfile' || base.endsWith('.dockerfile')
+    || /\.(?:env|ini|cfg|conf|properties|toml|ya?ml|sh|bash|zsh|npmrc|pypirc)$/.test(base);
 }
 
 /**
  * Scans a unified diff and returns only redacted facts about each hit: the
  * file path, new-file line number, and the credential kind. Secret-file paths
  * are rejected outright unless allowlisted; every added line is also scanned
- * with the credential patterns shared with `redactSecrets`.
+ * with the credential patterns shared with `redactSecrets`. `secretScanAllow`
+ * entries are matched against each path (exempting the file) and each line.
  */
 export async function scanDiff(diff: string, baseDir: string): Promise<SecretHit[]> {
   const allow = await loadSecretScanAllow(baseDir);
@@ -203,11 +213,18 @@ export async function scanDiff(diff: string, baseDir: string): Promise<SecretHit
       continue;
     }
 
+    // An allow entry that matches the path exempts the whole file, so a
+    // project can keep fake tokens in the tests of its own redaction code.
+    if (pathAllowed) continue;
     const fixture = isTestFixturePath(filePath);
+    const bareValues = bareValuesAreLiterals(filePath);
     for (const added of lines) {
-      const secrets = findSecrets(added.content, { allowedPatterns: allow });
+      const secrets = findSecrets(added.content, { allowedPatterns: allow, bareValues });
+      const kinds = new Set<string>();
       for (const secret of secrets) {
-        if (fixture && secret.kind === 'Generic assignment') continue;
+        if (fixture && (secret.kind === 'Generic assignment' || secret.kind === 'JSON key assignment')) continue;
+        if (kinds.has(secret.kind)) continue;
+        kinds.add(secret.kind);
         hits.push({ path: filePath, lineNumber: added.lineNumber, kind: secret.kind });
       }
     }

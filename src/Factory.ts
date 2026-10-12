@@ -31,7 +31,7 @@ import { appendRunMetrics, computeRunMetrics, measureCoverage, readRecentMetrics
 import { estimateTokens, overEstimate } from './TokenEstimate.js';
 import { commitRecordsEnabled, writeRunRecords, RECORDS_DIR } from './RunRecords.js';
 import { redactSecrets } from './redact.js';
-import { scanDiff } from './secretScan.js';
+import { scanDiff, type SecretHit } from './secretScan.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
 import { parseCommand } from './commandPolicy.js';
 import type { PlanApprover } from './PlanApproval.js';
@@ -822,6 +822,11 @@ export class Factory extends EventEmitter {
         await this.sandbox.close().catch(() => undefined);
         await this.finalizePullRequest();
     }
+    /** Credentials the branch adds over its base, as redacted facts. */
+    async branchSecrets(base: string, branch: string): Promise<SecretHit[]> {
+        const { stdout } = await execa('git', ['diff', `${base}...${branch}`], { cwd: this.baseDir, maxBuffer: 256 * 1024 * 1024 });
+        return scanDiff(stdout, this.baseDir);
+    }
     async finalizePullRequest(): Promise<void> {
         const branch = this.state?.integration_branch;
         if (!branch || this.prFinalized) return;
@@ -837,8 +842,16 @@ export class Factory extends EventEmitter {
                 this.log(`PR: ${availability.reason}. The work is on local branch ${branch}; push it and open the pull request by hand.`);
                 return;
             }
-            await this.github.pushBranch(branch);
             const base = this.state.base_branch || this.defaultBranch;
+            // The backstop: a push is the step that cannot be undone, and work
+            // can reach the branch without a worker diff (--mark-done, a
+            // resumed run from an older version, a hand edit).
+            const leaks = await this.branchSecrets(base, branch);
+            if (leaks.length) {
+                this.log(`PR: not pushed — ${branch} adds credentials: ${leaks.map(h => `${h.path}:${h.lineNumber} (${h.kind})`).join(', ')}. Remove them from the branch history, then push by hand.`);
+                return;
+            }
+            await this.github.pushBranch(branch);
             const journal = await RunJournal.verify(this.baseDir, this.state.feature_id);
             const mockups = await this.changedMockups(base, branch);
             const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, mockups, generator: `softfactory ${SOFTFACTORY_VERSION}` });
