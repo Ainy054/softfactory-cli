@@ -138,7 +138,8 @@ describe('softfactory program status', () => {
         depends_on: [],
         size: 'm',
         slices: [],
-        status: 'done',
+        // Its run finished but the program was not updated yet: the archive decides.
+        status: 'active',
         feature_id: 'f-1',
         pr: null,
         parked_reason: null,

@@ -188,9 +188,11 @@ A requirement too big for one plan is a *program*: several bounded contexts with
 | Command | Description |
 | :--- | :--- |
 | `softfactory program init "<goal>"` | Write the skeleton above with the goal and an empty `contexts` array; refuses to overwrite an existing `program.json` |
-| `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and the readiness reason (`pending`, `waits on api`, `done`, `parked: <reason>`) |
+| `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and `✓ ready` or the reason it is not |
 | `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
 | `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
+
+A context is **ready** when its status is `pending` (or `active`), every `depends_on` context is done, no open gate of an `always_stop` class covers its scope, and, at or above `size_threshold`, it has `slices`. A dependency is done when it is marked `done`, when its `pr` is merged on GitHub, or (with `pr: false`) when its archived run completed. `program status` prints `✓ ready` or the reason, such as `waits on api (PR #12 open)` or `needs slices (size xl ≥ threshold l)`; when GitHub cannot be asked it says `state unknown` rather than failing.
 
 `program` is dispatched before any provider or flag parsing, so its words are never read as a requirement and no Factory is needed. A bare `softfactory program` prints `not implemented yet`.
 

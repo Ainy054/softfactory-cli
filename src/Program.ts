@@ -197,16 +197,6 @@ export async function saveProgram(baseDir: string, program: Program): Promise<vo
   }
 }
 
-function readinessReason(program: Program, context: Context): string {
-  if (context.status === 'done') return 'done';
-  if (context.status === 'active') return 'active';
-  if (context.status === 'parked') return `parked: ${context.parked_reason ?? ''}`.trim();
-  const byId = new Map(program.contexts.map(candidate => [candidate.id, candidate]));
-  const waiting = context.depends_on.filter(id => byId.get(id)?.status !== 'done');
-  if (waiting.length) return `waits on ${waiting.join(', ')}`;
-  return 'pending';
-}
-
 const SIZE_RANK: Record<Context['size'], number> = { s: 0, m: 1, l: 2, xl: 3 };
 
 function isLarge(program: Program, context: Context): boolean {
@@ -230,12 +220,20 @@ function gateCovers(gateScope: string[], contextScope: string[]): boolean {
 /** Returns a blocker reason for one dependency, or null when it is done. */
 async function dependencyReason(program: Program, dependency: Context, deps: Deps): Promise<string | null> {
   if (dependency.pr != null) {
-    const state = await deps.prState(dependency.pr);
+    let state: string;
+    try {
+      state = await deps.prState(dependency.pr);
+    } catch (error: any) {
+      // Offline or gh not signed in: the dependency is not known to be done.
+      return `waits on ${dependency.id} (PR #${dependency.pr} state unknown: ${String(error?.message ?? error).split('\n')[0].slice(0, 120)})`;
+    }
     if (state === 'MERGED') return null;
     if (state === 'OPEN') return `waits on ${dependency.id} (PR #${dependency.pr} open)`;
     if (state === 'CLOSED') return `waits on ${dependency.id} (PR #${dependency.pr} closed)`;
     return `waits on ${dependency.id}`;
   }
+  // Marked done by hand (or by a non-PR advance): done.
+  if (dependency.status === 'done') return null;
   if (program.policy.pr === false && dependency.feature_id != null) {
     const archived = await deps.archived(dependency.feature_id);
     if (archived?.status === 'completed' && archived.pr == null) return null;
@@ -326,17 +324,6 @@ export function nextRequirement(program: Program, contextId: string): string {
     );
   }
   return lines.join('\n\n');
-}
-
-/**
- * One line per context: id, status, size, depends_on and the readiness reason
- * (`pending`, `waits on <id>`, `done`, `parked: <reason>` or `active`).
- */
-export function formatStatus(program: Program): string[] {
-  return program.contexts.map(context => {
-    const deps = context.depends_on.length ? context.depends_on.join(', ') : '-';
-    return `${context.id}  ${context.status}  ${context.size}  [${deps}]  ${readinessReason(program, context)}`;
-  });
 }
 
 async function appendHistory(baseDir: string, program: Program, entry: HistoryEntry): Promise<Program> {

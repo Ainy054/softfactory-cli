@@ -89,6 +89,25 @@ describe('program readiness waits for dependency PRs', () => {
 });
 
 describe('program readiness and archived dependencies', () => {
+  it('counts a dependency marked done by hand without a PR', async () => {
+    const program = makeProgram('Goal', [
+      { id: 'api', scope: ['app/**'], status: 'done' },
+      { id: 'web', scope: ['web/**'], depends_on: ['api'] },
+    ]);
+    const entry = await entryFor(program, 'web', fakeDeps());
+    assert.equal(entry.ready, true, entry.reason);
+  });
+
+  it('waits with "state unknown" when GitHub cannot be asked, instead of throwing', async () => {
+    const program = makeProgram('Goal', [
+      { id: 'api', scope: ['app/**'], pr: 7 },
+      { id: 'web', scope: ['web/**'], depends_on: ['api'] },
+    ]);
+    const entry = await entryFor(program, 'web', fakeDeps({ prState: async () => { throw new Error('gh: not logged in'); } }));
+    assert.equal(entry.ready, false);
+    assert.equal(entry.reason, 'waits on api (PR #7 state unknown: gh: not logged in)');
+  });
+
   it('counts an archived completed dependency when policy.pr is false', async () => {
     const baseDir = await makeDir();
     await saveProgram(baseDir, makeProgram('Ship the rates service', [
