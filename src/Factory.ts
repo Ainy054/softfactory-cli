@@ -31,6 +31,7 @@ import { appendRunMetrics, computeRunMetrics, measureCoverage, readRecentMetrics
 import { estimateTokens, overEstimate } from './TokenEstimate.js';
 import { commitRecordsEnabled, writeRunRecords, RECORDS_DIR } from './RunRecords.js';
 import { redactSecrets } from './redact.js';
+import { scanDiff, type SecretHit } from './secretScan.js';
 import { SandboxManager, type SandboxMode } from './Sandbox.js';
 import { parseCommand } from './commandPolicy.js';
 import type { PlanApprover } from './PlanApproval.js';
@@ -821,6 +822,11 @@ export class Factory extends EventEmitter {
         await this.sandbox.close().catch(() => undefined);
         await this.finalizePullRequest();
     }
+    /** Credentials the branch adds over its base, as redacted facts. */
+    async branchSecrets(base: string, branch: string): Promise<SecretHit[]> {
+        const { stdout } = await execa('git', ['diff', `${base}...${branch}`], { cwd: this.baseDir, maxBuffer: 256 * 1024 * 1024 });
+        return scanDiff(stdout, this.baseDir);
+    }
     async finalizePullRequest(): Promise<void> {
         const branch = this.state?.integration_branch;
         if (!branch || this.prFinalized) return;
@@ -836,8 +842,16 @@ export class Factory extends EventEmitter {
                 this.log(`PR: ${availability.reason}. The work is on local branch ${branch}; push it and open the pull request by hand.`);
                 return;
             }
-            await this.github.pushBranch(branch);
             const base = this.state.base_branch || this.defaultBranch;
+            // The backstop: a push is the step that cannot be undone, and work
+            // can reach the branch without a worker diff (--mark-done, a
+            // resumed run from an older version, a hand edit).
+            const leaks = await this.branchSecrets(base, branch);
+            if (leaks.length) {
+                this.log(`PR: not pushed — ${branch} adds credentials: ${leaks.map(h => `${h.path}:${h.lineNumber} (${h.kind})`).join(', ')}. Remove them from the branch history, then push by hand.`);
+                return;
+            }
+            await this.github.pushBranch(branch);
             const journal = await RunJournal.verify(this.baseDir, this.state.feature_id);
             const mockups = await this.changedMockups(base, branch);
             const body = await buildPullRequestBody({ state: this.state, baseDir: this.baseDir, baseBranch: base, sandbox: this.sandbox.describe(), journal, metrics: this.lastMetrics, mockups, generator: `softfactory ${SOFTFACTORY_VERSION}` });
@@ -1487,6 +1501,21 @@ export class Factory extends EventEmitter {
                 this.log(`REJECTED: ${task.id} — ${designProblem.split('.')[0]}`);
                 processFailure(designProblem);
                 await this.recordAttempt(task, 'designer_scope', designProblem);
+                return null;
+            }
+            // A committed credential is not un-leaked by removing it later, so
+            // the diff's added lines and secret-file paths are scanned before
+            // any reviewer sees them. scanDiff returns only redacted facts
+            // (path, line number and credential kind) so the value never reaches
+            // a log, journal or metric.
+            const secretHits = await scanDiff(diff, this.baseDir);
+            if (secretHits.length > 0) {
+                const listed = secretHits.map(hit => `- ${hit.path}:${hit.lineNumber}: ${hit.kind}`).join('\n');
+                for (const hit of secretHits) {
+                    this.log(`REJECTED: ${task.id} — diff adds a credential (${hit.path}:${hit.lineNumber}, ${hit.kind})`);
+                }
+                processFailure(`This diff adds credentials, which must never be committed. Remove them and read the value from an environment variable instead:\n${listed}`);
+                await this.recordAttempt(task, 'secret_in_diff', listed);
                 return null;
             }
             // Project rules no test catches: read once per run, then scanned
@@ -2804,6 +2833,7 @@ export class Factory extends EventEmitter {
         fabricated_claim: 'Do not cite a file line you have not read; cite real lines or mark the claim UNVERIFIED.',
         reported_not_done: 'Do not report the acceptance work as unfinished; finish it before calling finish_task.',
         no_safety_affirmation: 'End by affirming "live stack untouched": set live_stack_untouched to true when you finish.',
+        secret_in_diff: 'Do not include credentials in code. Read the value from an environment variable instead.',
         stale_fork: 'Do not assume the files are as they were: re-read them, they changed after your last attempt.',
         attempt_timeout: 'Do not run the whole suite or long commands; run the focused test only, and finish sooner.',
         worker_error: 'Do not repeat the step that crashed the previous attempt.',

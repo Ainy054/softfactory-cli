@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { redactSecrets } from './redact.js';
+import { findSecrets, redactSecrets } from './redact.js';
 import { LessonManager } from './LessonManager.js';
 
 describe('credential shapes are redacted', () => {
@@ -37,6 +37,98 @@ describe('credential shapes are redacted', () => {
     for (const text of ['npm test failed: expected 2 to be 3', 'the token parser in src/lex.ts', 'password reset page renders']) {
       assert.equal(redactSecrets(text), text);
     }
+  });
+});
+
+describe('findSecrets locates credentials without redacting them away', () => {
+  it('detects each provider pattern, a PEM block and a generic assignment', () => {
+    const text = [
+      'token ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+      'aws key AKIAIOSFODNN7EXAMPLE in config',
+      'slack xoxb-123456789012-abcdefghijkl',
+      'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLXNpZ25hdHVyZQ',
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----',
+      'API_KEY=real_secret_123',
+    ].join('\n');
+
+    const hits = findSecrets(text);
+    const kinds = hits.map((h) => h.kind);
+    assert.ok(kinds.includes('GitHub token'), `expected GitHub token, got ${kinds.join(', ')}`);
+    assert.ok(kinds.includes('AWS access key'));
+    assert.ok(kinds.includes('Slack token'));
+    assert.ok(kinds.includes('JWT'));
+    assert.ok(kinds.includes('PEM private key'));
+    assert.ok(kinds.includes('Generic assignment'));
+    assert.ok(hits.some((h) => h.kind === 'PEM private key' && h.match.includes('MIIEow')));
+  });
+
+  it('counts a name-based match only when the value is a hard-coded literal', () => {
+    // Code that merely handles a credential once made the gate reject nearly
+    // every auth change, including the environment read it asks for.
+    for (const code of [
+      'const token = await getToken();',
+      '  token: string;',
+      'password: z.string().min(8),',
+      'API_KEY = os.environ["API_KEY"]',
+      'const api_key = process.env.API_KEY;',
+      "throw new Error('password: must be at least 8 characters');",
+      "const tokenizer = 'whitespace-tokenizer';",
+      'const token = `${prefix}-${id}`;',
+    ]) assert.deepEqual(findSecrets(code, { bareValues: false }), [], code);
+    for (const leak of ['const password = "hunter2hunter2";', 'SECRET_KEY = "django-insecure-8f3k2j1h"', '"api_key": "live_9f8e7d6c5b4a"']) {
+      assert.ok(findSecrets(leak, { bareValues: false }).length > 0, leak);
+    }
+    // Bare values are literals only where the file format says so (env, shell, YAML).
+    assert.deepEqual(findSecrets('token: string', { bareValues: false }), []);
+    assert.ok(findSecrets('password: s3cr3tPassw0rd', { bareValues: true }).length > 0);
+  });
+
+  it('ignores obvious placeholder values', () => {
+    const text = [
+      'API_KEY=xxx',
+      'API_KEY=your-api-key',
+      'API_KEY=<your-token>',
+      'API_KEY=changeme',
+      'API_KEY=example',
+      'API_KEY=aaaa',
+    ].join('\n');
+
+    const hits = findSecrets(text);
+    assert.deepEqual(hits.filter((h) => h.kind === 'Generic assignment'), []);
+  });
+
+  it('does not flag .env.example-style placeholder content', () => {
+    const text = [
+      '# .env.example',
+      'GITHUB_TOKEN=your-api-key',
+      'AWS_ACCESS_KEY_ID=xxx',
+      'SLACK_TOKEN=changeme',
+      'JWT_SECRET=example',
+      'DATABASE_PASSWORD=AAAAAAAA',
+    ].join('\n');
+
+    assert.deepEqual(findSecrets(text), []);
+  });
+
+  it('honors secretScanAllow patterns by skipping the matching line', () => {
+    const text = [
+      'API_KEY=real_secret_123',
+      'skip_me=ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+    ].join('\n');
+
+    const hits = findSecrets(text, { allowedPatterns: [/SKIP_ME/] });
+    assert.ok(hits.some((h) => h.kind === 'Generic assignment' && h.match.includes('real_secret_123')));
+    assert.ok(!hits.some((h) => h.kind === 'GitHub token' || h.match.includes('skip_me')), JSON.stringify(hits));
+  });
+
+  it('keeps provider-prefixed patterns strict for placeholder-like and fixture-like values', () => {
+    const fixture = 'token ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const fixtureHits = findSecrets(fixture);
+    assert.ok(fixtureHits.some((h) => h.kind === 'GitHub token' && h.match === 'ghp_abcdefghijklmnopqrstuvwxyz0123456789'));
+
+    const repeatedAwsValue = `AWS_ACCESS_KEY_ID=AKIA${'A'.repeat(16)}`;
+    const awsHits = findSecrets(repeatedAwsValue);
+    assert.ok(awsHits.some((h) => h.kind === 'AWS access key' && h.match === `AKIA${'A'.repeat(16)}`));
   });
 });
 
