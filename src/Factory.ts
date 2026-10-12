@@ -1670,7 +1670,10 @@ export class Factory extends EventEmitter {
     validateTestWriterEvidence(task: { agent_role?: string }, diff: string): string | null {
         if (task.agent_role !== 'test_writer') return null;
         const added = diff.split('\n').filter(line => line.startsWith('+') && !line.startsWith('+++')).join('\n');
-        const looksLikeTest = /(?:\b(?:describe|it|test|pytest|unittest)\s*\(|\bfunc\s+Test[A-Z]|\bTest\s*\()/m.test(added);
+        // pytest functions and classes (def test_x, class TestX), Rust #[test]
+        // and JUnit @Test count too: a 225-line pytest file was once rejected
+        // as a placeholder because only JS and Go spellings were recognised.
+        const looksLikeTest = /(?:\b(?:describe|it|test|pytest|unittest)\s*\(|\bfunc\s+Test[A-Z]|\bTest\s*\(|\bdef\s+test\w*\s*\(|\bclass\s+Test\w*|#\[(?:tokio::)?test\]|@Test\b)/m.test(added);
         return looksLikeTest ? null : 'Test-writer changes contain no test cases. Add executable assertions instead of a placeholder file.';
     }
 
