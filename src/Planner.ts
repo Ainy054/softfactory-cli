@@ -298,8 +298,23 @@ abstract class BasePlanner implements IPlanner {
     return this.planWithRepair(buildRefinementPrompt(fitted), input.refinement, validationInput);
   }
 
+  /**
+   * One planning call. A reply that is not JSON (most often cut off at the
+   * model's output limit) gets one retry asking for the whole object with
+   * shorter descriptions: #67's run ended on a plan truncated mid-description.
+   */
+  private async runParsed(prompt: string): Promise<any> {
+    try {
+      return await this.run(prompt);
+    } catch (error: any) {
+      if (!/Failed to parse JSON|cut off at the output limit/.test(String(error?.message))) throw error;
+      this.log?.('Planner reply was not valid JSON (it may have been cut off); asking once more for the complete object with shorter descriptions.');
+      return this.run(`${prompt}\n\nYOUR PREVIOUS REPLY WAS NOT VALID JSON; it was probably cut off before the end. Reply with the complete JSON object only. Keep each task description under 800 characters: name the files and the behaviour, not the code.`);
+    }
+  }
+
   private async planWithRepair(prompt: string, requirement: string, validationInput: PlanningInput): Promise<Blueprint> {
-    let draft = await this.run(prompt);
+    let draft = await this.runParsed(prompt);
     // Each round used to see only its own errors, so a repair fixed one rule
     // and broke another: coverage, then a shell operator, then npx (#41's run).
     const earlier: string[] = [];
@@ -310,7 +325,7 @@ abstract class BasePlanner implements IPlanner {
         const reasons = String(error?.message ?? error).split('\n').filter(l => l.startsWith('- '));
         this.log?.(`Planner draft rejected${round < REPAIR_ROUNDS ? ` (repair round ${round + 1} of ${REPAIR_ROUNDS})` : ' (no repair rounds left)'}:${reasons.length ? '\n  ' + reasons.join('\n  ') : ' ' + String(error?.message ?? error).replace(/\s+/g, ' ').slice(0, 300)}`);
         if (round === REPAIR_ROUNDS) throw error;
-        draft = await this.run(repairPrompt(error, requirement, draft, earlier));
+        draft = await this.runParsed(repairPrompt(error, requirement, draft, earlier));
         for (const reason of reasons) if (!earlier.includes(reason)) earlier.push(reason);
       }
     }
