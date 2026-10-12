@@ -190,10 +190,24 @@ A requirement too big for one plan is a *program*: several bounded contexts with
 | `softfactory program init "<goal>"` | Write the skeleton above with the goal and an empty `contexts` array; refuses to overwrite an existing `program.json` |
 | `softfactory program status` | The goal, then one line per context: id, status, size, `depends_on`, and `✓ ready` or the reason it is not |
 | `softfactory program next` | The requirement text the next advance would run for the first ready context (goal, scope, current slice), or why no context is ready |
+| `softfactory program gate <class> "<scope>" "<question>" ["<choice>" "<reason>"]` | Record a gate: decided with the choice and reason, or `open` when the class always stops |
 | `softfactory program stop ["reason"]` | Write `.softfactory/STOPPED` with the reason and time, and append a history entry |
 | `softfactory program resume` | Remove `.softfactory/STOPPED` and append a history entry |
 
-A context is **ready** when its status is `pending` (or `active`), every `depends_on` context is done, no open gate of an `always_stop` class covers its scope, and, at or above `size_threshold`, it has `slices`. A dependency is done when it is marked `done`, when its `pr` is merged on GitHub, or (with `pr: false`) when its archived run completed. `program status` prints `✓ ready` or the reason, such as `waits on api (PR #12 open)` or `needs slices (size xl ≥ threshold l)`; when GitHub cannot be asked it says `state unknown` rather than failing.
+A context is **ready** when its status is `pending` (or `active`), every `depends_on` context is done, no open gate of an `always_stop` class in `.softfactory/gates.md` covers its scope, and, at or above `size_threshold`, it has `slices`. A dependency is done when it is marked `done`, when its `pr` is merged on GitHub, or (with `pr: false`) when its archived run completed. `program status` prints `✓ ready` or the reason, such as `waits on api (PR #12 open)` or `needs slices (size xl ≥ threshold l)`; when GitHub cannot be asked it says `state unknown` rather than failing.
+
+### Gate register
+
+Decisions a program meets live in `.softfactory/gates.md`, a table people edit by hand:
+
+```markdown
+| id | class | status | scope | question | chosen by | date |
+| --- | --- | --- | --- | --- | --- | --- |
+| G1 | contract | open | api/** | Do we version the /rates response? | | |
+| G2 | engineering | decided | app/db/** | SQLite or Postgres for the cache? | driver: SQLite, single-node deploy | 2026-10-12 |
+```
+
+A gate whose class is in the program's `always_stop` (by default `cutover`, `contract`, `regulatory`, `activation`) waits for a person: while it is `open`, every context whose scope overlaps its scope (comma-separated globs) is not ready. Any other class the driver decides, recording its choice and reason. A question already decided is cited, not asked again. To decide one, set its status to `decided` and fill in `chosen by`. `softfactory program gate <class> "<scope>" "<question>" "<choice>" "<reason>"` records a gate from the command line, and `program status` lists the open always-stop gates, plus any row it could not read.
 
 `program` is dispatched before any provider or flag parsing, so its words are never read as a requirement and no Factory is needed. A bare `softfactory program` prints `not implemented yet`.
 
