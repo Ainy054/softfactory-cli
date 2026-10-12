@@ -2028,23 +2028,40 @@ export class Factory extends EventEmitter {
                 this.log(`AUTO-REPLAN: ${task.id} — requesting smaller tasks after repeated fit/progress failure`);
                 const context = await this.getRepoContext(`${task.title}\n${task.description}`);
                 const memoryPatterns = await this.lessons.getForPlanning();
-                const blueprint = await this.planner.generateBlueprint({
+                const input = {
                     requirement: `Re-plan blocked task ${task.id}: ${task.title}\n${task.description}\nFailure: ${task.last_feedback || ''}`,
                     codebaseContext: context,
                     memoryPatterns,
                     featureHistory: '',
                     repositoryFiles: new Set(await this.getRepositoryFiles()),
-                    workerCapability: 'local',
-                });
-                const replacements = blueprint.tasks.map((replacement, index) => TaskSchema.parse({
+                    workerCapability: 'local' as const,
+                };
+                const replacementsFor = (blueprint: Awaited<ReturnType<IPlanner['generateBlueprint']>>) => blueprint.tasks.map((replacement, index) => TaskSchema.parse({
                     ...replacement,
                     id: `${task.id}.${index + 1}`,
                     dependencies: [...new Set([...(task.dependencies || []), ...(replacement.dependencies || [])])].filter(id => id !== task.id),
                     blockedBy: [], status: 'pending', attempts: 0, escalation_level: 0, error_history: [],
                 }));
+                let replacements = replacementsFor(await this.planner.generateBlueprint(input));
                 if (replacements.length === 0 || replacements.length >= 8) throw new Error('planner returned an unusable replacement set');
                 this.validateAutoReplanScope(task, replacements);
                 this.annotateTasks(replacements);
+                // Replacements get the planning-time probe too: a split whose
+                // every acceptance was a bare `tsc` (exit 127) once spent four
+                // attempts per subtask on a command no worker could fix.
+                let unrunnable = await this.probeAcceptance(replacements);
+                if (unrunnable.length > 0) {
+                    this.log(`AUTO-REPLAN: ${task.id} replacements have acceptance commands that cannot run here; re-planning once with the reason.`);
+                    replacements = replacementsFor(await this.planner.generateBlueprint({
+                        ...input,
+                        requirement: `${input.requirement}\n\nPLANNER FEEDBACK: these acceptance commands cannot run in this environment:\n- ${unrunnable.join('\n- ')}\nUse commands that run here, such as the project's own test script on the task's test file.`,
+                    }));
+                    if (replacements.length === 0 || replacements.length >= 8) throw new Error('planner returned an unusable replacement set');
+                    this.validateAutoReplanScope(task, replacements);
+                    this.annotateTasks(replacements);
+                    unrunnable = await this.probeAcceptance(replacements);
+                    if (unrunnable.length > 0) throw new Error(`replacement acceptance commands cannot run here: ${unrunnable.join('; ')}`);
+                }
                 this.state.tasks = this.state.tasks.filter(existing => existing.id !== task.id).concat(replacements);
                 await this.saveState();
                 this.emitEvent({ type: 'state:update', state: this.state });
@@ -2160,6 +2177,15 @@ export class Factory extends EventEmitter {
             for (const problem of structural) this.log(`Planning check: ${problem}`);
             throw new Error(`Plan rejected: the plan's file lists do not match the repository:\n- ${structural.join('\n- ')}`);
         }
+        const unrunnable = await this.probeAcceptance(tasks);
+        if (unrunnable.length > 0) {
+            throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
+        }
+        return tasks;
+    }
+
+    /** Runs each agent task's acceptance command once on the base branch, records the baseline, and returns the ones that cannot run here. */
+    private async probeAcceptance(tasks: Task[]): Promise<string[]> {
         const unrunnable: string[] = [];
         for (const task of tasks) {
             if (!task.verification_command || task.executor !== 'agent') continue;
@@ -2178,10 +2204,7 @@ export class Factory extends EventEmitter {
             this.log(`Planning-time acceptance ${task.id}: ${task.verification_command} → ${summary}`);
             if (probe.unrunnable || probe.timedOut) unrunnable.push(`${task.id}: ${task.verification_command} (${summary})`);
         }
-        if (unrunnable.length > 0) {
-            throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
-        }
-        return tasks;
+        return unrunnable;
     }
 
     /**

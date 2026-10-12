@@ -164,3 +164,44 @@ describe('the plan is checked for runnable acceptance commands', () => {
     assert.deepEqual(prepared.acceptance_baseline, { exit_code: 1, summary: 'red (exit 1)' });
   });
 });
+
+describe('auto-replan replacements pass the planning-time acceptance probe', () => {
+  async function replanFactory(commands: string[]) {
+    const factory: any = new Factory(await fs.mkdtemp(path.join(os.tmpdir(), 'sf-replan-')), '', { strategy: 'local' });
+    const blocked = task({ id: 'T1', status: 'blocked', files_hint: ['src/Gates.ts'], replan_reason: 'escalation_fit_failure', last_feedback: 'no progress' } as any);
+    factory.state = { feature_id: 'f-1', feature: 'gates', status: 'active', tasks: [blocked], usage: { input_tokens: 0, output_tokens: 0 } };
+    factory.saveState = async () => {};
+    factory.getRepoContext = async () => '';
+    factory.getRepositoryFiles = async () => ['src/Gates.ts'];
+    factory.lessons = { getForPlanning: async () => '' };
+    const requirements: string[] = [];
+    factory.planner = {
+      provider: 'local',
+      generateBlueprint: async (input: { requirement: string }) => {
+        requirements.push(input.requirement);
+        const verification_command = commands[Math.min(requirements.length - 1, commands.length - 1)];
+        return { feature: 'gates', tasks: [{ id: 'T1', title: 'Gates types', description: 'Define the gate types in src/Gates.ts.', agent_role: 'coder', phase: 1, files_hint: ['src/Gates.ts'], acceptance_criteria: ['compiles'], verification: [verification_command], verification_command }] };
+      },
+    };
+    factory.taskVerifier.runAcceptance = async (_dir: string, t: Task) => t.verification_command!.startsWith('tsc')
+      ? { ran: true, passed: false, exitCode: 127, output: 'tsc: command not found', command: t.verification_command, unrunnable: true }
+      : { ran: true, passed: false, exitCode: 1, output: '1 failed', command: t.verification_command, unrunnable: false };
+    return { factory, requirements };
+  }
+
+  it('re-plans once when a replacement acceptance cannot run, and keeps the runnable set with its red baseline', async () => {
+    const { factory, requirements } = await replanFactory(['tsc --noEmit src/Gates.ts', 'npm test -- src/Gates.test.ts']);
+    await factory.autoReplanBlockedTasks();
+    assert.equal(requirements.length, 2);
+    assert.match(requirements[1], /cannot run in this environment:\n- T1\.1: tsc --noEmit src\/Gates\.ts/);
+    assert.deepEqual(factory.state.tasks.map((t: Task) => [t.id, t.verification_command, t.acceptance_baseline?.summary]), [['T1.1', 'npm test -- src/Gates.test.ts', 'red (exit 1)']]);
+  });
+
+  it('leaves the task blocked with the reason when the second set cannot run either', async () => {
+    const { factory, requirements } = await replanFactory(['tsc --noEmit src/Gates.ts']);
+    await factory.autoReplanBlockedTasks();
+    assert.equal(requirements.length, 2);
+    assert.deepEqual(factory.state.tasks.map((t: Task) => [t.id, t.status]), [['T1', 'blocked']]);
+    assert.match(factory.state.tasks[0].last_feedback, /Automatic re-plan failed: replacement acceptance commands cannot run here/);
+  });
+});
