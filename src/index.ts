@@ -12,6 +12,7 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
+import { loadProgram, saveProgram, formatStatus, stopProgram, resumeProgram, PROGRAM_FILE } from './Program.js';
 import { execa } from 'execa';
 
 const KNOWN_FLAGS = [
@@ -23,7 +24,7 @@ const KNOWN_FLAGS = [
 ];
 const VALUE_FLAGS = ['--strategy', '--local-model', '--cloud-model', '--frontier-model', '--cloud-provider', '--planner-provider', '--planner-model', '--mark-done', '--sandbox', '--second-reviewer', '--attempt-timeout', '--run-budget', '--max-tokens', '--verify-run', '--issue', '--backlog', '--promote', '--isolation', '--approve-design'];
 
-const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>';
+const USAGE = 'Usage: softfactory [--strategy=hybrid|local|cloud] [--sandbox=auto|docker|none] [--isolation=worktree|shared] [--cloud-provider=agy|openai|openai-api|anthropic|deepseek|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-provider=openai|agy|local|deepseek|anthropic|openai-api|qwen|openai-compat|claude-code|gemini-cli|muse] [--planner-model=model] [--local-model=model] [--cloud-model=model] [--frontier-model=model] [--no-tui] [--no-docker] [--no-uat] [--init] [--adopt] [--abandon] [--yes] [--plan] [--resume [feature-id]] [--retry-blocked] [--refine] [--mark-done <task-id[,task-id...]> ["note"]] [--second-reviewer provider/model] [--attempt-timeout minutes] [--run-budget minutes] [--max-tokens n] [--verify-run [feature-id]] [--issue <n>] [--pr] [--history] [--queue <requirement>] [--next] [--backlog [<id> keep|drop|promote]] [--promote <feature-id> now|later|no ["note"]] [--approve-design <task-id> approve|revise|skip ["notes"]] [--design-review [feature-id] <requirement>] | program init "<goal>" | program status | program stop ["reason"] | program resume';
 
 let globalFactory: Factory | null = null;
 
@@ -100,6 +101,54 @@ async function main() {
     const { initProject } = await import('./Init.js');
     for (const { file, written } of await initProject(process.cwd())) console.log(`${written ? 'wrote  ' : 'exists '} ${file}`);
     console.log('Edit worker-context.md; rename uat.example.json to uat.json once its commands are real.');
+    process.exit(0);
+  }
+
+  // The 6.3 program driver: a dispatch-only command, handled before any
+  // provider or flag parsing so "program" can never be requirement text and a
+  // bare checkout needs no Factory.
+  if (args[0] === 'program') {
+    const baseDir = process.cwd();
+    const subcommand = args[1];
+
+    if (subcommand === 'init') {
+      const goal = args.slice(2).join(' ').trim();
+      if (!goal) {
+        console.error('Error: program init requires a goal.');
+        console.error('Example: softfactory program init "Ship the rates service"');
+        process.exit(1);
+      }
+      const programFile = path.join(baseDir, PROGRAM_FILE);
+      if (await fs.access(programFile).then(() => true).catch(() => false)) {
+        console.error(`Error: ${PROGRAM_FILE} already exists; refusing to overwrite it.`);
+        process.exit(1);
+      }
+      const program = await loadProgram(baseDir);
+      program.goal = goal;
+      await saveProgram(baseDir, program);
+      console.log(`wrote   ${PROGRAM_FILE}`);
+      process.exit(0);
+    }
+
+    if (subcommand === 'status') {
+      for (const line of formatStatus(await loadProgram(baseDir))) console.log(line);
+      process.exit(0);
+    }
+
+    if (subcommand === 'stop') {
+      const reason = args.slice(2).join(' ').trim() || undefined;
+      await stopProgram(baseDir, reason);
+      console.log(`[SoftFactory] Program stopped${reason ? `: ${reason}` : ''}. Run 'softfactory program resume' to continue.`);
+      process.exit(0);
+    }
+
+    if (subcommand === 'resume') {
+      await resumeProgram(baseDir);
+      console.log('[SoftFactory] Program resumed.');
+      process.exit(0);
+    }
+
+    console.log('not implemented yet');
     process.exit(0);
   }
 
