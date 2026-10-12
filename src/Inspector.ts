@@ -68,6 +68,21 @@ export function normalizePostmortem(text: string): string {
     .join('\n\n');
 }
 
+/** Backends that start a CLI agent session before they answer. */
+const CLI_PROVIDERS = new Set(['agy', 'openai', 'claude-code', 'gemini-cli', 'muse']);
+
+/**
+ * How long a review may take. A CLI backend spends minutes starting a session
+ * and reading a large diff (agy timed out at 2 minutes on a 492-line file, which
+ * halted the run), so it gets at least 8. SOFTFACTORY_INSPECTOR_TIMEOUT_MS
+ * overrides both.
+ */
+export function reviewTimeoutMs(provider: string, apiDefault: number, env: NodeJS.ProcessEnv = process.env): number {
+  const override = Number(env.SOFTFACTORY_INSPECTOR_TIMEOUT_MS);
+  if (Number.isFinite(override) && override > 0) return override;
+  return CLI_PROVIDERS.has(provider) ? Math.max(apiDefault, 8 * 60_000) : apiDefault;
+}
+
 /**
  * The merge gate's reviewer, plus the two non-gating syntheses that use the
  * same model. It runs on exactly the model it was given: when that model is
@@ -116,7 +131,7 @@ CRITICAL: Return ONLY a valid JSON object:
 `;
     let raw: string;
     try {
-      raw = await this.textModel.complete(prompt, { timeoutMs: 120000, json: true });
+      raw = await this.textModel.complete(prompt, { timeoutMs: reviewTimeoutMs(this.provider, 120_000), json: true });
     } catch (error: any) {
       // The inspector is a merge gate. Nothing may pass because the reviewer
       // was unavailable, and nothing else may review in its place.
@@ -194,7 +209,7 @@ CRITICAL: Return ONLY a valid JSON object:
 `;
     let raw: string;
     try {
-      raw = await this.textModel.complete(prompt, { timeoutMs: 240000, json: true });
+      raw = await this.textModel.complete(prompt, { timeoutMs: reviewTimeoutMs(this.provider, 240_000), json: true });
     } catch (error: any) {
       throw new WorkerEnvironmentError(`Independent reviewer (${this.provider}/${this.model}) is unavailable: ${error?.message || 'inference failed'}. No protected diff was reviewed, so nothing was merged.`);
     }

@@ -1280,6 +1280,12 @@ export class Factory extends EventEmitter {
             }
             const commitResult = await this.worktreeManager.commitWorktree(task.id);
             if (!commitResult.committed) {
+                if (attempt.signal.aborted) {
+                    this.log(`TIMEOUT: ${task.id} — attempt exceeded ${attemptMinutes} minutes with no file changes`);
+                    processFailure(`The previous attempt ran out of its ${attemptMinutes}-minute budget before writing any file. Write the files early and finish sooner.`);
+                    await this.recordAttempt(task, 'attempt_timeout', `exceeded ${attemptMinutes} minutes with no file changes`);
+                    return null;
+                }
                 if (handoff.status === 'failure') {
                     this.log(`EMPTY: ${task.id} — worker reported failure and produced no file changes`);
                     processFailure(`Worker reported failure and produced no file changes: ${handoff.summary}`);
