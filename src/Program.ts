@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { z } from 'zod';
+import { ProtectedPaths } from './ProtectedPaths.js';
 
 /**
  * The 6.3 program driver's file: `.softfactory/program.json`. A goal too big
@@ -203,18 +204,58 @@ function isLarge(program: Program, context: Context): boolean {
   return SIZE_RANK[context.size] >= SIZE_RANK[program.policy.size_threshold];
 }
 
-/** Strip the glob suffix so `app/**` and `app/**\/*` compare as the path `app`. */
-function scopePrefix(scope: string): string {
-  return scope.replace(/\/\*\*?$/, '').replace(/\/+$/, '');
+/** True when an always-stop gate's scope glob overlaps the context's scope glob. */
+function gateCovers(gateScope: string[], contextScope: string[]): boolean {
+  const gates = gateScope.map(scope => scope.trim()).filter(scope => scope.length > 0);
+  const contexts = contextScope.map(scope => scope.trim()).filter(scope => scope.length > 0);
+  return gates.some(gate => contexts.some(context => scopesOverlap(gate, context)));
 }
 
-/** True when an always-stop gate's scope overlaps the context's scope. */
-function gateCovers(gateScope: string[], contextScope: string[]): boolean {
-  const gates = gateScope.map(scopePrefix).filter(scope => scope.length > 0);
-  const contexts = contextScope.map(scopePrefix).filter(scope => scope.length > 0);
-  return gates.some(gate => contexts.some(context =>
-    context === gate || context.startsWith(`${gate}/`) || gate.startsWith(`${context}/`),
-  ));
+/** True when two path globs can match the same file path. */
+function scopesOverlap(a: string, b: string): boolean {
+  const aRegex = ProtectedPaths.toRegex(a);
+  const bRegex = ProtectedPaths.toRegex(b);
+  return expandGlob(a).some(candidate => bRegex.test(candidate))
+    || expandGlob(b).some(candidate => aRegex.test(candidate));
+}
+
+/**
+ * Concrete paths a scope glob matches. `**` expands to a few directory depths
+ * (including zero), `*` to an empty or single segment character, and `?` to one
+ * character, so overlap between two globs can be checked with
+ * {@link ProtectedPaths.toRegex} on each candidate.
+ */
+function expandGlob(glob: string): string[] {
+  return expandGlobAt(glob, 0);
+}
+
+function expandGlobAt(glob: string, index: number): string[] {
+  if (index >= glob.length) return [''];
+  const ch = glob[index];
+  if (ch === '*') {
+    if (glob[index + 1] === '*') {
+      if (glob[index + 2] === '/') {
+        const rest = expandGlobAt(glob, index + 3);
+        return rest.flatMap(suffix => [
+          suffix,
+          `x/${suffix}`,
+          `x/y/${suffix}`,
+        ]);
+      }
+      const rest = expandGlobAt(glob, index + 2);
+      return rest.flatMap(suffix => [
+        suffix,
+        `x/${suffix}`,
+        `x${suffix}`,
+      ]);
+    }
+    const rest = expandGlobAt(glob, index + 1);
+    return rest.flatMap(suffix => [suffix, `x${suffix}`]);
+  }
+  if (ch === '?') {
+    return expandGlobAt(glob, index + 1).map(suffix => `x${suffix}`);
+  }
+  return expandGlobAt(glob, index + 1).map(suffix => ch + suffix);
 }
 
 /** Returns a blocker reason for one dependency, or null when it is done. */
