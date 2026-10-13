@@ -135,6 +135,8 @@ export const FactoryStateSchema = z.object({
    * later runs. `uat.json`, when present, still wins over this.
    */
   planned_uat: PlannedUatSchema.optional(),
+  /** What the run assumed but never checked, most serious first (#86). */
+  unverified: z.array(z.string()).optional(),
   /**
    * Work marked promotion "test" that reached TEST and passed UAT there.
    * Production is a person's decision (--promote); no run deploys it.
@@ -202,6 +204,8 @@ export const FeatureHistoryEntrySchema = z.object({
   completed_at: z.string().optional(),
   task_count: z.number(),
   tasks_done: z.number(),
+  /** How many unverified assumptions the run ended with. */
+  unverified: z.number().optional(),
 });
 
 export type FeatureHistoryEntry = z.infer<typeof FeatureHistoryEntrySchema>;
