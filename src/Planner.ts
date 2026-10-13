@@ -60,6 +60,8 @@ export const ExternalSourceSchema = z.object({
   purpose: z.string().default(''),
 });
 
+export type ExternalSource = z.infer<typeof ExternalSourceSchema>;
+
 export const BlueprintSchema = z.object({
   feature: z.string().min(4),
   requirements_covered: z.array(z.string()).default([]),

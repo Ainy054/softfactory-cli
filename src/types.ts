@@ -145,6 +145,9 @@ export const FactoryStateSchema = z.object({
     contentType: z.string().optional(),
     bytes: z.number().optional(),
     path: z.string().optional(),
+    method: z.string().optional(),
+    /** Why the probe was not ok; a source named only in the requirement may fail without rejecting the plan. */
+    problem: z.string().optional(),
   })).optional(),
   /** Set once a person agreed to run past the estimate; it is not asked again. */
   over_estimate_accepted: z.boolean().optional(),
