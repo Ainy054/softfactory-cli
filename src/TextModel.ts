@@ -130,9 +130,14 @@ export class OllamaTextModel implements ITextModel {
   }
 }
 
-/** Antigravity's defaults; agy retired Gemini 3.1 Pro and 3.7 Flash in October 2026. */
+/**
+ * Antigravity's defaults: Gemini for every role. agy retired Gemini 3.1 Pro and
+ * 3.7 Flash in October 2026, and its Claude models draw on a small separate
+ * quota (a planning run exhausted it), so Gemini 3.8 Flash is both the worker
+ * and the frontier model until agy offers a stronger Gemini.
+ */
 export const AGY_WORKER_MODEL = 'Gemini 3.8 Flash (High)';
-export const AGY_FRONTIER_MODEL = 'Claude Opus 5.5 (High)';
+export const AGY_FRONTIER_MODEL = 'Gemini 3.8 Flash (High)';
 
 /**
  * agy's own words when it fails. Its stderr says what went wrong ("invalid
