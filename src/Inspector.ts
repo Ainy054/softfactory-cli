@@ -97,7 +97,14 @@ export class Inspector {
 
   isAvailable(): Promise<boolean> { return this.textModel.isAvailable(); }
 
-  async inspect(task: Task, diff: string, handoffSummary: string, verifierOutput?: string): Promise<InspectionResult> {
+  async inspect(task: Task, diff: string, handoffSummary: string, verifierOutput?: string, swallowed?: Array<{ file: string; line: number; snippet: string }>): Promise<InspectionResult> {
+    const swallowedHits = swallowed ?? [];
+    const swallowedSection = swallowedHits.length
+      ? `\nErrors swallowed into empty results (file:line):\n${swallowedHits.map(hit => `- ${hit.file}:${hit.line}: ${hit.snippet}`).join('\n')}\n`
+      : '';
+    const swallowedRule = swallowedHits.length
+      ? '\n5. Errors swallowed into empty results: for every hit listed in "Errors swallowed into empty results (file:line):", the diff must make the failure visible — logged, counted, returned as an error status, or surfaced to the caller. If it does not, FAIL with fix_kind "logic". An outside call (network, file, subprocess, database) that fails must never look like an empty success.'
+      : '';
     const prompt = `
 You are the SoftFactory Quality Inspector.
 Your task is to review a code diff against a task description, the worker's handoff summary, and local test execution output.
@@ -110,12 +117,13 @@ ${verifierOutput ? `\nLocal Automated Test & Verification Output:\n${verifierOut
 
 Code Diff:
 ${diff}
-
+${swallowedSection}
 Verdict Rules:
 1. Does the code fulfill the task requirements and acceptance criteria?
 2. Are there obvious bugs, syntax errors, or architectural violations?
 3. If the task role is "test_writer" (TDD): It is EXPECTED and NORMAL for newly written test assertions to fail against not-yet-implemented business logic. You must NOT fail a "test_writer" task simply because the tests fail against unimplemented code, as long as the test code compiles and validly tests the required behavior.
 4. For implementation roles ("coder", etc.): Ensure automated tests compile and pass.
+5. Errors swallowed into empty results: for every hit listed in "Errors swallowed into empty results (file:line):", the diff must make the failure visible — logged, counted, returned as an error status, or surfaced to the caller. If it does not, FAIL with fix_kind "logic". An outside call (network, file, subprocess, database) that fails must never look like an empty success.
 
 
 If the verdict is FAIL, classify the fix:

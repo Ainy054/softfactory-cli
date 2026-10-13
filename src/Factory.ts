@@ -16,6 +16,7 @@ import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
+import { swallowedErrors } from './SwallowedErrors.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, fallbackUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
 import { loadEnvironment, changedRoutes, orchestratorOwned, type Environment } from './Environment.js';
@@ -1586,6 +1587,13 @@ export class Factory extends EventEmitter {
             // merged with its acceptance criteria unmet.
             this.log(`Inspection: Reviewing ${task.id}`);
             this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Quality Inspector reviewing diff...` });
+            // Failures that disappear into an empty success: the inspector is
+            // told about them explicitly, and each one leaves a run note so the
+            // report can list the ones that still merged.
+            const swallowed = swallowedErrors(diff);
+            for (const hit of swallowed) {
+                this.addRunNote(task.id, `error swallowed into an empty result: ${hit.file}:${hit.line} — ${hit.snippet}`);
+            }
             // Protection is decided by what the diff touched, not only by what
             // the plan expected it to touch.
             const protectedHits = this.protectedPaths.touched(this.filesInDiff(diff));
@@ -1607,7 +1615,7 @@ export class Factory extends EventEmitter {
             const mechanicalOnly = reviewers.length === 0;
             if (blind) this.emitEvent({ type: 'worker:output', taskId: task.id, line: `Independent review (${reviewers.map(r => `${r.provider}/${r.model}`).join(' + ')}) of protected diff...` });
             const blindReview = () => this.frontierInspector.inspectBlind(task, diff, reviewEvidence, handoff.review_answers);
-            const verdicts = mechanicalOnly ? [] : await Promise.all(reviewers.map(r => blind ? r.inspectBlind(task, diff, reviewEvidence, handoff.review_answers) : r.inspect(task, diff, handoff.summary, reviewEvidence)));
+            const verdicts = mechanicalOnly ? [] : await Promise.all(reviewers.map(r => blind ? r.inspectBlind(task, diff, reviewEvidence, handoff.review_answers) : r.inspect(task, diff, handoff.summary, reviewEvidence, swallowed)));
             const decision = mechanicalOnly
                 ? { review: { verdict: 'PASS' as const, feedback: 'Mechanical gates only: automated verification and diff checks passed; no model reviewed this diff.', provider: 'none', model: 'mechanical-only' }, inspection: 'mechanical-only' as const }
                 : await this.combineVerdicts(verdicts, blind, blindReview);
