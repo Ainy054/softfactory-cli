@@ -132,6 +132,20 @@ export const FactoryStateSchema = z.object({
   token_estimate: z.object({ tokens: z.number(), runs: z.number() }).optional(),
   /** Why a run whose tasks all merged still ended failed (final gate, wiring, UAT). */
   failure_reason: z.string().optional(),
+  /**
+   * Outside URLs the plan depends on, probed when the plan was prepared.
+   * Optional so older states without a probe still load. The body is not kept
+   * here; `path` points at the saved evidence fixture.
+   */
+  external_sources: z.array(z.object({
+    name: z.string(),
+    url: z.string(),
+    ok: z.boolean(),
+    status: z.number(),
+    contentType: z.string().optional(),
+    bytes: z.number().optional(),
+    path: z.string().optional(),
+  })).optional(),
   /** Set once a person agreed to run past the estimate; it is not asked again. */
   over_estimate_accepted: z.boolean().optional(),
   base_branch: z.string().optional(),
