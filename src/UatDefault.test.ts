@@ -312,3 +312,18 @@ describe('a planner live check with an empty expect', () => {
     assert.throws(() => BlueprintUatSchema.parse({ probes: [{ name: 'p', run: '' }] }));
   });
 });
+
+describe('a probe that only runs the test suite is recognised in its usual forms', () => {
+  it('matches runners wherever they sit in the command, and leaves real probes alone', async () => {
+    const { isTestRunnerProbe } = await import('./Factory.js');
+    for (const run of [
+      'npm test -- src/SwallowedErrors.test.ts', 'node --import tsx --test src/x.test.ts', 'npm --prefix web test',
+      'npm run test:unit', 'yarn run test', 'python3 -m pytest -q', 'cd app && pytest', 'make test', 'bun test',
+      'go test ./...', 'npx vitest run',
+    ]) assert.equal(isTestRunnerProbe(run), true, run);
+    for (const run of [
+      "curl -fsS 'http://localhost:8000/rates/latest'", 'node dist/index.js --history', 'python3 -m app.backfill --from 2026-01-01',
+      'npm run build && node dist/server.js --port 3000', 'cat out/report.json', 'grep -q currency out.json',
+    ]) assert.equal(isTestRunnerProbe(run), false, run);
+  });
+});

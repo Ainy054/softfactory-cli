@@ -49,31 +49,24 @@ class AttemptTimeoutError extends Error {
  * Commands that run a project's test suite. A planner's "live check" that
  * invokes one of these is not a live check at all: the gates already ran the
  * suite, and node's `# pass N` output would not match a probe's `expect`.
+ * Matched per shell segment (`cd app && npm test` counts) with flags allowed
+ * in between (`node --import tsx --test`, `npm --prefix web test`).
  */
-const TEST_RUNNER_PREFIXES = [
-  'npm test',
-  'npm run test',
-  'pnpm test',
-  'yarn test',
-  'node --test',
-  'npx vitest',
-  'npx jest',
-  'vitest',
-  'jest',
-  'pytest',
-  'python -m pytest',
-  'go test',
-  'cargo test',
-];
+const TEST_RUNNER = new RegExp([
+  String.raw`^(?:npm|pnpm|yarn|bun)(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:run\s+)?test(?::\S+)?(?:\s|$)`,
+  String.raw`^(?:bun|deno|go|cargo|dotnet|mix|make)\s+(?:\S+\s+)*?test(?:\s|$)`,
+  String.raw`^node(?:\s+\S+)*\s+--test(?:\s|$)`,
+  String.raw`^(?:npx\s+)?(?:vitest|jest|mocha|ava|tap|pytest|tox|rspec|phpunit)(?:\s|$)`,
+  String.raw`^python3?\s+-m\s+(?:pytest|unittest)(?:\s|$)`,
+].join('|'));
 
 /**
- * True when `run` starts with a known test-runner command, ignoring leading
- * whitespace and extra arguments (`npm test -- src/x` still counts). Called by
- * adoptPlannerUat to drop probes that would only re-run the test suite.
+ * True when any segment of `run` (split on &&, ||, ; and |) starts with a test
+ * runner. Called by adoptPlannerUat to drop probes that would only re-run the
+ * test suite.
  */
 export function isTestRunnerProbe(run: string): boolean {
-  const normalized = run.trim().replace(/\s+/g, ' ').toLowerCase();
-  return TEST_RUNNER_PREFIXES.some(prefix => normalized === prefix || normalized.startsWith(`${prefix} `));
+  return run.split(/&&|\|\||;|\|/).some(segment => TEST_RUNNER.test(segment.trim().replace(/\s+/g, ' ').toLowerCase()));
 }
 
 export interface FactoryOptions {
