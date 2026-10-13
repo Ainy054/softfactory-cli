@@ -79,6 +79,22 @@ export type Task = z.infer<typeof TaskSchema>;
  */
 export const CURRENT_SCHEMA_VERSION = 2;
 
+/**
+ * The live check the planner proposed for a run, kept in the run state so it
+ * belongs to that run instead of persisting in .softfactory/uat.json. Mirrors
+ * BlueprintUatSchema (src/Planner.ts) but is defined here so types.ts does not
+ * import from Planner.ts (which would create a dependency cycle). Optional:
+ * states written before this field exist must keep parsing.
+ */
+export const PlannedUatSchema = z.object({
+  /** Brings the stack up (backgrounding a server, waiting for its port) before the probes. */
+  setup: z.array(z.string()).default([]),
+  /** Reachability commands with the real route; an unmatched expect is a FAIL. */
+  probes: z.array(z.object({ name: z.string(), run: z.string().min(1), expect: z.string().optional() })).default([]),
+});
+
+export type PlannedUat = z.infer<typeof PlannedUatSchema>;
+
 export const FactoryStateSchema = z.object({
   schema_version: z.number().int().positive().default(1),
   feature_id: z.string().default(''),
@@ -113,6 +129,12 @@ export const FactoryStateSchema = z.object({
   uat_result: z.enum(['passed', 'failed', 'skipped', 'none']).optional(),
   /** True once a live check (UAT) passed; false when a completed run had no live check. Absent until the gate records it. */
   verified: z.boolean().optional(),
+  /**
+   * The live check the planner proposed when this run was planned, kept with the
+   * run rather than written to .softfactory/uat.json, so it does not leak into
+   * later runs. `uat.json`, when present, still wins over this.
+   */
+  planned_uat: PlannedUatSchema.optional(),
   /**
    * Work marked promotion "test" that reached TEST and passed UAT there.
    * Production is a person's decision (--promote); no run deploys it.
