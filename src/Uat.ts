@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { execa } from 'execa';
 import { z } from 'zod';
@@ -84,11 +85,36 @@ export function fallbackUat(env: Environment, changedFiles: string[]): UatConfig
   return config;
 }
 
-export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string }>;
+export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string; pid?: number }>;
 
 const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
-  const result = await execa('sh', ['-c', command], { cwd, env: { ...process.env, ...env }, timeout: timeoutMs, reject: false, all: true });
-  return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: String(result.all ?? '') };
+  // Output goes to a file, never to a pipe. `execa` resolves once the output
+  // pipes close, and a command that backgrounds a server (`uvicorn app.main:app &`)
+  // leaves the child holding them, so the UAT would hang until its timeout even
+  // though `sh` exited at once. A file descriptor is inherited and copied into
+  // by the child, and nobody waits for it to close.
+  const outputFile = path.join(os.tmpdir(), `softfactory-uat-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+  const handle = await fs.open(outputFile, 'w+');
+  try {
+    const subprocess = execa('sh', ['-c', command], {
+      cwd,
+      env: { ...process.env, ...env },
+      timeout: timeoutMs,
+      reject: false,
+      stdio: ['ignore', handle.fd, handle.fd],
+      // Each command gets its own process group. A non-interactive `sh` has no
+      // job control, so a child started with `&` stays in this group, and the
+      // group id (the shell's pid) lets `runUat` stop everything setup left.
+      // The pid lives on the subprocess, not on the awaited result.
+      detached: true,
+    });
+    const pid = subprocess.pid;
+    const result = await subprocess;
+    return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: await fs.readFile(outputFile, 'utf8'), pid };
+  } finally {
+    await handle.close().catch(() => {});
+    await fs.rm(outputFile, { force: true }).catch(() => {});
+  }
 };
 
 const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
@@ -130,10 +156,12 @@ export async function runUat(
   const timeoutMs = config.timeout_seconds * 1000;
   const steps: UatStep[] = [];
   const transcript: string[] = [];
+  /** Process groups the setup steps started, by shell pid; stopped in the finally below. */
+  const setupGroups: number[] = [];
   const run = async (name: string, command: string) => {
-    const { exitCode, output } = await shell(command, { cwd: baseDir, env, timeoutMs });
+    const { exitCode, output, pid } = await shell(command, { cwd: baseDir, env, timeoutMs });
     transcript.push(`$ ${command}  # ${name}`, output.trimEnd(), `exit_code: ${exitCode}`, '');
-    return { exitCode, output };
+    return { exitCode, output, pid };
   };
   const substitute = (text: string) => text.replace(/\$SOFTFACTORY_RUN_ID|\$\{SOFTFACTORY_RUN_ID\}/g, options.runId);
 
@@ -176,7 +204,10 @@ export async function runUat(
       failed = true;
     }
     for (const [index, command] of (failed ? [] : config.setup).entries()) {
-      const { exitCode, output } = await run(`setup ${index + 1}`, command);
+      const { exitCode, output, pid } = await run(`setup ${index + 1}`, command);
+      // Remember every setup step that ran: mongolbank-rates' `uvicorn app.main:app
+      // --port 8000 &` was still holding port 8000 three hours after the run.
+      if (pid !== undefined) setupGroups.push(pid);
       steps.push({ name: `setup ${index + 1}`, command, passed: exitCode === 0, detail: exitCode === 0 ? 'ok' : `exit ${exitCode}: ${tail(output)}` });
       if (exitCode !== 0) { failed = true; break; }
     }
@@ -217,6 +248,11 @@ export async function runUat(
       const { exitCode } = await run(`teardown ${index + 1}`, command).catch(() => ({ exitCode: 1 }));
       if (exitCode !== 0) log(`UAT teardown ${index + 1} exited ${exitCode}: ${command}`);
     }
+    // mongolbank-rates (f-20261013073810): setup ended with `uvicorn app.main:app
+    // --port 8000 &` and there was no teardown, so the server outlived the run and
+    // held port 8000. Whatever setup started and nothing stopped is stopped here.
+    const stopped = await stopProcessGroups(setupGroups);
+    if (stopped) log(`UAT: stopped ${stopped} background process group(s) left by setup`);
   }
 
   let evidencePath: string | undefined;
@@ -237,6 +273,47 @@ export async function runUat(
     ].join('\n'), 'utf8');
   }
   return { configured: true, passed: !failed, steps, evidencePath };
+}
+
+/**
+ * Stops the process groups setup left running, on POSIX. Each id is the pid of
+ * the shell that ran the step (`detached: true`), which is also the group id a
+ * backgrounded child inherited. SIGTERM first, five seconds for the group to
+ * go, then SIGKILL for the survivors. A group that is already gone — teardown
+ * stopped it, or it exited on its own — is ignored (ESRCH), and does not count.
+ * Returns how many groups actually had to be stopped.
+ */
+async function stopProcessGroups(pids: number[]): Promise<number> {
+  // Windows has no process groups to signal this way.
+  if (process.platform === 'win32') return 0;
+  let stopped = 0;
+  for (const pid of pids) {
+    try { process.kill(-pid, 'SIGTERM'); }
+    catch (error) { if (errnoCode(error) === 'ESRCH') continue; throw error; }
+    const deadline = Date.now() + 5_000;
+    let gone = false;
+    while (Date.now() < deadline) {
+      try { process.kill(-pid, 0); }
+      catch (error) { if (errnoCode(error) === 'ESRCH') { gone = true; break; } throw error; }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (!gone) {
+      try { process.kill(-pid, 'SIGKILL'); }
+      catch (error) { if (errnoCode(error) !== 'ESRCH') throw error; }
+      const killDeadline = Date.now() + 2_000;
+      while (Date.now() < killDeadline) {
+        try { process.kill(-pid, 0); }
+        catch (error) { if (errnoCode(error) === 'ESRCH') break; throw error; }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    stopped++;
+  }
+  return stopped;
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
 }
 
 function tail(output: string, chars = 240): string {
