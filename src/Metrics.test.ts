@@ -76,6 +76,14 @@ describe('one metrics line per run, computed from the journals', () => {
 
     const unknown = await computeRunMetrics(baseDir, state());
     assert.equal(unknown.verified, undefined, 'an older state without the field records no verdict');
+
+    // The verdict has to survive into the machine-readable line the next plan reads.
+    await appendRunMetrics(baseDir, none);
+    await appendRunMetrics(baseDir, { ...passed, run_id: 'f-2' });
+    const recorded = await readRecentMetrics(baseDir, 5);
+    assert.deepEqual(recorded.map(r => r.verified), [false, true]);
+    const firstLine = (await fs.readFile(path.join(baseDir, '.softfactory', 'metrics.jsonl'), 'utf8')).split('\n')[0];
+    assert.equal(JSON.parse(firstLine).verified, false, 'the run line carries the boolean, not a drop-out key');
   });
 });
 

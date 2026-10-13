@@ -174,7 +174,9 @@ describe('program advance', () => {
     const program = await loadProgram(dir);
     assert.equal(program.contexts[0].status, 'done', 'an unverified run still completes the context');
     assert.match(program.history.at(-1)!.result, /unverified/i);
+    assert.equal(program.history.at(-1)!.result, 'completed (unverified)');
     assert.equal(program.history.at(-1)!.action, 'done');
+    assert.equal(program.history.at(-1)!.commits, 2, 'the run still counts as merged work');
   });
 
   it('does not note a verified completed run as unverified', async () => {
