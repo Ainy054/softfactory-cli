@@ -1,3 +1,4 @@
+import { AGY_WORKER_MODEL, AGY_FRONTIER_MODEL } from './TextModel.js';
 import { Task } from './types.js';
 import { IWorker } from './IWorker.js';
 import { AgyWorker } from './AgyWorker.js';
@@ -28,8 +29,8 @@ export class WorkerRegistry {
   constructor(
     strategy: WorkerStrategy = 'hybrid',
     localModel: string = 'auto',
-    cloudModel: string = 'Gemini 3.7 Flash (High)',
-    frontierModel: string = 'Gemini 3.1 Pro (High)',
+    cloudModel: string = AGY_WORKER_MODEL,
+    frontierModel: string = AGY_FRONTIER_MODEL,
     lightLocalModel: string = 'qwen2.5-coder:7b',
     heavyLocalModel: string = 'qwen2.5-coder:14b',
     cloudProvider: CloudProvider = 'agy'
@@ -175,7 +176,7 @@ export class WorkerRegistry {
       return { worker: this.cloudWorker, model: this.cloudModel, provider: this.cloudProvider, escalated: true };
     }
 
-    // Escalation 2: Escalate to Fast Cloud Model (Gemini 3.7 Flash)
+    // Escalation 2: the cloud model
     if (escalation === 2) {
       const cloudAvailable = await this.cloudWorker.isAvailable();
       if (cloudAvailable) {
@@ -184,7 +185,7 @@ export class WorkerRegistry {
       return { worker: this.localWorker, model: this.heavyLocalModel, provider: 'ollama', escalated: true };
     }
 
-    // Escalation 3+: Escalate to Frontier Cloud Model (Gemini 3.1 Pro)
+    // Escalation 3+: the frontier model
     const cloudAvailable = await this.cloudWorker.isAvailable();
     if (cloudAvailable) {
       return { worker: this.cloudWorker, model: this.frontierModel, provider: this.cloudProvider, escalated: true };
