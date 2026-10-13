@@ -127,6 +127,9 @@ export async function buildPullRequestBody(input: PullRequestBodyInput): Promise
   if (state.verified === false) {
     lines.push('**Live check:** UNVERIFIED — no live check ran; the tests are the only evidence.', '');
   }
+  if (state.unverified?.length) {
+    lines.push('### Unverified assumptions', '', ...state.unverified.map(item => `- ${item}`), '');
+  }
   if (state.status !== 'completed') {
     const open = state.tasks.filter(t => t.status !== 'done');
     lines.push(`Unfinished: ${open.map(t => `${t.id} (${t.status}${t.executor !== 'agent' ? `, ${t.executor}` : ''})`).join(', ')}.`, '');

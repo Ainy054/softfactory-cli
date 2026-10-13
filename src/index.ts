@@ -407,7 +407,7 @@ async function main() {
       console.log('-'.repeat(80));
       for (const f of features) {
         const done = `${f.tasks_done}/${f.task_count}`;
-        console.log(`  ${f.feature_id.padEnd(20)} ${f.status.padEnd(10)} ${done.padEnd(6)} ${f.feature}`);
+        console.log(`  ${f.feature_id.padEnd(20)} ${f.status.padEnd(10)} ${done.padEnd(6)} ${f.feature}${f.unverified ? ` (${f.unverified} unverified)` : ''}`);
       }
     }
     process.exit(0);

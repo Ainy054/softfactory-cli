@@ -18,6 +18,7 @@ import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { swallowedErrors } from './SwallowedErrors.js';
 import { inventedFixtures } from './FixtureProvenance.js';
+import { unverifiedAssumptions } from './Unverified.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, fallbackUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
 import { loadEnvironment, changedRoutes, orchestratorOwned, type Environment } from './Environment.js';
@@ -440,8 +441,10 @@ export class Factory extends EventEmitter {
                 // is re-run here, and the run ends properly (pull request
                 // marked ready) instead of a status flip nobody acts on.
                 await this.finalGate();
+                if (this.state.status === 'completed') await this.recordUnverified();
                 await this.saveState();
                 await this.updateHistory(this.state.status);
+                if (this.state.status === 'completed') this.logUnverified();
                 if (this.state.status === 'completed' && this.state.verified !== true) this.log('COMPLETED — UNVERIFIED: no live check ran; the tests are the only evidence.');
                 await this.endRun();
                 this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
@@ -1202,6 +1205,7 @@ export class Factory extends EventEmitter {
             await this.runDockerVerification();
             if (this.state.status === 'completed') await this.synthesizeMemory();
         }
+        if (this.state.status === 'completed') await this.recordUnverified();
         await this.writeRunMetrics();
         await this.commitRunRecords();
         await this.endRun();
@@ -1213,12 +1217,45 @@ export class Factory extends EventEmitter {
             }
         }
         else if (this.state.status === 'completed' && this.state.verified !== true) {
+            this.logUnverified();
             this.log('COMPLETED — UNVERIFIED: no live check ran; the tests are the only evidence.');
+        }
+        else if (this.state.status === 'completed' && this.state.unverified?.length) {
+            this.logUnverified();
+            this.log(`Build completed: ${this.state.feature}`);
         }
         else {
             this.log(`Build completed: ${this.state.feature}`);
         }
     }
+    /**
+     * #86: what the completed run assumed but never checked: outside URLs
+     * its code calls that no plan probe fetched, a missing live check, and the
+     * unverified claims, unprobed fixtures and swallowed errors noted on the
+     * way. Kept in the state for the pull request and the history.
+     */
+    async recordUnverified(): Promise<void> {
+        const base = this.buildStartCommit || this.state.base_branch;
+        let mergedDiff = '';
+        if (base) {
+            const diff = await execa('git', ['diff', `${base}...${this.mergeTarget()}`], { cwd: this.baseDir, reject: false, maxBuffer: 256 * 1024 * 1024 });
+            mergedDiff = diff.exitCode === 0 ? diff.stdout : '';
+        }
+        const unverified = unverifiedAssumptions({ state: this.state, runNotes: this.runNotes, mergedDiff });
+        this.state.unverified = unverified.length ? unverified : undefined;
+        await this.saveState();
+        await this.updateHistory(this.state.status);
+        if (unverified.length) await this.journal()?.append('run:unverified', { count: unverified.length, items: unverified }).catch(() => undefined);
+    }
+
+    /** The UNVERIFIED ASSUMPTIONS block, printed right before the final status line. */
+    private logUnverified(): void {
+        const items = this.state.unverified ?? [];
+        if (!items.length) return;
+        this.log(`UNVERIFIED ASSUMPTIONS (${items.length}):`);
+        for (const item of items) this.log(`  - ${item}`);
+    }
+
     async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<{ task: Task; branchName: string; followUps: string[] } | null> {
         task.error_history = task.error_history || [];
         task.escalation_level = task.escalation_level || 0;
@@ -2669,6 +2706,7 @@ export class Factory extends EventEmitter {
             completed_at: (status === 'completed' || status === 'failed') ? new Date().toISOString() : undefined,
             task_count: this.state.tasks.length,
             tasks_done: this.state.tasks.filter(t => t.status === 'done').length,
+            ...(this.state.unverified?.length ? { unverified: this.state.unverified.length } : {}),
         };
         const idx = features.findIndex(f => f.feature_id === featureId);
         if (idx >= 0) {
