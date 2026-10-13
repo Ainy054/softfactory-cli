@@ -3341,6 +3341,8 @@ export class Factory extends EventEmitter {
             runId: `${this.state.feature_id}-${label}-${Date.now().toString(36)}`, featureId: this.state.feature_id,
             evidenceDir: path.join(this.baseDir, '.softfactory', 'evidence', this.state.feature_id), log: line => this.log(line),
             env: targetEnv, shell: this.uatShell,
+            // One environment per project, reused across runs and bisection worktrees.
+            venvDir: path.join(this.baseDir, '.softfactory', 'uat-venv'),
         });
     }
 

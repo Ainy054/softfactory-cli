@@ -91,10 +91,38 @@ const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
   return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: String(result.all ?? '') };
 };
 
+const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * A Python project's live check runs in its own virtual environment. The host
+ * python3 is often managed (uv, Homebrew, the OS) and refuses installs, and a
+ * `uvicorn` on PATH may belong to another tool's environment, so the
+ * mongolbank-rates check would have failed on `No module named 'requests'`
+ * with correct code. Returns the command that creates the environment and
+ * installs the project's dependencies (uv when present, else venv + pip), and
+ * the variables that put it first on PATH; undefined for a non-Python project.
+ */
+export async function pythonEnvironment(projectDir: string, venvDir: string): Promise<{ command: string; env: Record<string, string> } | undefined> {
+  const has = (file: string) => fs.access(path.join(projectDir, file)).then(() => true, () => false);
+  const requirements = await has('requirements.txt');
+  const pyproject = !requirements && await has('pyproject.toml');
+  if (!requirements && !pyproject) return undefined;
+  const venv = shellQuote(venvDir);
+  const python = shellQuote(path.join(venvDir, 'bin', 'python'));
+  const uvSource = requirements ? '-r requirements.txt' : '-r pyproject.toml';
+  const pipSource = requirements ? '-r requirements.txt' : '-e .';
+  const command = [
+    `if [ ! -x ${python} ]; then if command -v uv >/dev/null 2>&1; then uv venv --quiet ${venv}; else python3 -m venv ${venv}; fi; fi`,
+    `printf '*\\n' > ${shellQuote(path.join(venvDir, '.gitignore'))}`,
+    `if command -v uv >/dev/null 2>&1; then uv pip install --quiet --python ${python} ${uvSource}; else ${python} -m pip install --quiet ${pipSource}; fi`,
+  ].join(' && ');
+  return { command, env: { PATH: `${path.join(venvDir, 'bin')}${path.delimiter}${process.env.PATH ?? ''}`, VIRTUAL_ENV: venvDir } };
+}
+
 export async function runUat(
   baseDir: string,
   config: UatConfig,
-  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner; env?: Record<string, string> },
+  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner; env?: Record<string, string>; venvDir?: string },
 ): Promise<UatResult> {
   const shell = options.shell ?? hostShell;
   const log = options.log ?? (() => {});
@@ -111,7 +139,14 @@ export async function runUat(
 
   let failed = false;
   try {
-    if (config.build) {
+    const python = await pythonEnvironment(baseDir, options.venvDir ?? path.join(baseDir, '.softfactory', 'uat-venv'));
+    if (python) {
+      const { exitCode, output } = await run('python environment', python.command);
+      steps.push({ name: 'python environment', command: python.command, passed: exitCode === 0, detail: exitCode === 0 ? `dependencies installed in ${python.env.VIRTUAL_ENV}` : `exit ${exitCode}: ${tail(output)}` });
+      if (exitCode === 0) Object.assign(env, python.env);
+      else failed = true;
+    }
+    if (!failed && config.build) {
       const started = Date.now();
       const { exitCode, output } = await run('build', config.build);
       steps.push({ name: 'build', command: config.build, passed: exitCode === 0, detail: exitCode === 0 ? 'built' : `exit ${exitCode}: ${tail(output)}` });
@@ -136,7 +171,7 @@ export async function runUat(
         steps.push(step);
         failed ||= !step.passed;
       }
-    } else if (config.artifacts.length) {
+    } else if (!failed && config.artifacts.length) {
       steps.push({ name: 'binary proof', passed: false, detail: 'artifacts are listed but there is no build command, so nothing proves they are fresh' });
       failed = true;
     }
