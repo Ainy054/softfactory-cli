@@ -112,3 +112,28 @@ describe('preflight requires the reviewer for hybrid and cloud runs', () => {
     assert.equal(factory.environmentFault, undefined);
   });
 });
+
+describe('errors swallowed into empty results reach the reviewer', () => {
+  it('lists each hit under the section and states the FAIL-with-logic rule', async () => {
+    let seen = '';
+    const inspector = new Inspector({ provider: 'deepseek', model: 'deepseek-v4-flash', isAvailable: async () => true,
+      complete: async (prompt: string) => { seen = prompt; return '{"verdict":"FAIL","fix_kind":"logic","feedback":"swallowed"}'; } });
+    const result = await inspector.inspect(makeTask(), 'diff --git a/api.py b/api.py', 'summary', undefined, [
+      { file: 'api.py', line: 4, snippet: 'except Exception:' },
+    ]);
+    assert.equal(result.verdict, 'FAIL');
+    assert.equal(result.fixKind, 'logic');
+    assert.match(seen, /Errors swallowed into empty results \(file:line\):/);
+    assert.match(seen, /api\.py:4: except Exception:/);
+    assert.match(seen, /fix_kind "logic"/);
+    assert.match(seen, /never look like an empty success/i);
+  });
+
+  it('omits the section when there are no swallowed hits', async () => {
+    let seen = '';
+    const inspector = new Inspector({ provider: 'deepseek', model: 'deepseek-v4-flash', isAvailable: async () => true,
+      complete: async (prompt: string) => { seen = prompt; return '{"verdict":"PASS","feedback":"fine"}'; } });
+    await inspector.inspect(makeTask(), 'diff --git a/api.py b/api.py', 'summary');
+    assert.doesNotMatch(seen, /Errors swallowed into empty results \(file:line\):/);
+  });
+});
