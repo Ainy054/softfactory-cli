@@ -1,6 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Task } from './types.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { Factory } from './Factory.js';
+import { Inspector } from './Inspector.js';
+import { swallowedErrors } from './SwallowedErrors.js';
+import { Task, Handoff } from './types.js';
 
 // Mirror the scheduling logic from Factory for unit testing.
 
@@ -325,5 +331,89 @@ describe('WorkerRegistry Escalation Ladder & Tiering', () => {
     const frontier = await registry.resolveWorker(makeTask({ id: 'T012', attempts: 3 }));
     assert.equal(frontier.provider, 'openai');
     assert.equal(frontier.model, 'gpt-pro');
+  });
+});
+
+/**
+ * executeAndInspect with every collaborator but the reviewer stubbed out, so a
+ * test can watch what the inspector is handed and which run notes are written.
+ */
+async function swallowedHarness(diff: string) {
+  const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'softfactory-swallowed-'));
+  const factory: any = new Factory(baseDir, '', { strategy: 'hybrid', cloudProvider: 'deepseek', cloudModel: 'deepseek-v4-flash' });
+  factory.state = { feature_id: 'f-1', feature: 'test', status: 'active', strategy: 'hybrid',
+    cloud_provider: 'deepseek', planner_provider: 'local', created_at: '', last_updated: '', tasks: [], memory_patterns: [] };
+  factory.saveState = async () => {};
+  factory.getProjectContext = async () => '';
+  factory.getDiff = async () => diff;
+  factory.lessons.getRelevant = async () => [];
+  factory.taskVerifier.prepare = async () => ({ ok: true });
+  factory.taskVerifier.verify = async () => ({ executed: true, passed: true, testSummary: 'ok', output: '' });
+  factory.workerRegistry.resolveWorker = async () => ({
+    worker: { id: 'stub', name: 'stub', isAvailable: async () => true,
+      execute: async (): Promise<Handoff> => ({ task_id: 'T1', status: 'success', files_changed: ['api.py'], summary: 'done' }) },
+    model: 'm', provider: 'p',
+  });
+  factory.worktreeManager.commitWorktree = async () => ({ committed: true, filesChanged: 1 });
+  return factory;
+}
+
+function swallowedTask(): Task {
+  return { id: 'T1', title: 'Fetch rates', description: 'Fetch the latest rates', agent_role: 'coder',
+    phase: 1, dependencies: [], blockedBy: [], files_hint: ['api.py'], creates_files: [],
+    acceptance_criteria: [], verification: [], status: 'pending', attempts: 0,
+    escalation_level: 0, error_history: [], worker_type: 'auto' };
+}
+
+/** The mongolbank shape: `except Exception:` whose body sets `parsed = []`. */
+const SWALLOWING_DIFF = [
+  'diff --git a/api.py b/api.py',
+  '--- a/api.py',
+  '+++ b/api.py',
+  '@@ -1,3 +1,6 @@',
+  ' def rates():',
+  '+    try:',
+  '         parsed = parse_latest_rates()',
+  '+    except Exception:',
+  '+        parsed = []',
+  '     return parsed',
+].join('\n');
+
+describe('executeAndInspect surfaces swallowed errors to the inspector', () => {
+  it('passes swallowedErrors(diff) to inspect and records a run note per hit', async () => {
+    const factory = await swallowedHarness(SWALLOWING_DIFF);
+    let captured: Array<{ file: string; line: number; snippet: string }> | undefined;
+    factory.inspector.inspect = async (_task: Task, _diff: string, _summary: string, _verifier: string, swallowed: any) => {
+      captured = swallowed;
+      return { verdict: 'PASS', feedback: 'ok', provider: 'deepseek', model: 'deepseek-v4-flash' };
+    };
+    const notes: string[] = [];
+    const realAddRunNote = factory.addRunNote.bind(factory);
+    factory.addRunNote = (taskId: string, note: string) => { notes.push(note); realAddRunNote(taskId, note); };
+
+    const result = await factory.executeAndInspect(swallowedTask(), '/tmp/wt');
+    assert.ok(result, 'the task merged, so the inspection ran');
+
+    const expected = swallowedErrors(SWALLOWING_DIFF);
+    assert.ok(expected.length >= 1, 'the diff contains a swallowed handler');
+    assert.deepEqual(captured, expected, 'inspect receives swallowedErrors(diff)');
+    for (const hit of expected) {
+      assert.ok(notes.some(n => n.includes(`${hit.file}:${hit.line}`) && n.includes(hit.snippet)),
+        `a run note names ${hit.file}:${hit.line}`);
+    }
+  });
+
+  it('the inspector prompt names the swallowed hit and the FAIL-with-logic rule', async () => {
+    const factory = await swallowedHarness(SWALLOWING_DIFF);
+    let prompt = '';
+    factory.inspector = new Inspector({ provider: 'deepseek', model: 'deepseek-v4-flash', isAvailable: async () => true,
+      complete: async (p: string) => { prompt = p; return '{"verdict":"PASS","feedback":"fine"}'; } });
+
+    const result = await factory.executeAndInspect(swallowedTask(), '/tmp/wt');
+    assert.ok(result, 'the task merged');
+    assert.match(prompt, /Errors swallowed into empty results \(file:line\):/);
+    assert.match(prompt, /api\.py:4/);
+    assert.match(prompt, /fix_kind "logic"/);
+    assert.match(prompt, /never look like an empty success/i);
   });
 });
