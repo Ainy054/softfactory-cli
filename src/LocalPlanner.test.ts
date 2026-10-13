@@ -73,14 +73,15 @@ describe('LocalPlanner', () => {
 
   it('fits the repository context to the model window instead of letting the rules be truncated', async () => {
     const previous = process.env.SOFTFACTORY_LOCAL_NUM_CTX;
-    process.env.SOFTFACTORY_LOCAL_NUM_CTX = '2048';
+    // Large enough for the planning rules, small enough to force truncation.
+    process.env.SOFTFACTORY_LOCAL_NUM_CTX = '3072';
     const ollama = await fakeOllama([goodPlan]);
     try {
       // Ollama drops the FRONT of an oversized prompt, where the rules are.
       const huge = { ...input, codebaseContext: `Tracked Files:\n${'src/file.ts\n'.repeat(5000)}` };
       await new LocalPlanner('m', ollama.host).generateBlueprint(huge as any);
       const p = ollama.prompts[0];
-      assert.ok(p.length <= 2048 * 2.5 + 200, `prompt is ${p.length} chars for a 2048-token window`);
+      assert.ok(p.length <= 3072 * 2.5 + 200, `prompt is ${p.length} chars for a 3072-token window`);
       assert.match(p, /Planning rules:/);
       assert.match(p, /User Requirement:\nAdd a formatCurrency helper/);
       assert.match(p, /repository context truncated/);

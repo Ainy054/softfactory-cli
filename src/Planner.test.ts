@@ -142,6 +142,23 @@ describe('OUTPUT_SCHEMA', () => {
     const task = OUTPUT_SCHEMA.properties.tasks.items;
     assert.deepEqual([...OUTPUT_SCHEMA.required].sort(), Object.keys(OUTPUT_SCHEMA.properties).sort());
     assert.deepEqual([...task.required].sort(), Object.keys(task.properties).sort());
+    const source = OUTPUT_SCHEMA.properties.external_sources.items;
+    assert.deepEqual([...source.required].sort(), Object.keys(source.properties).sort());
+  });
+});
+
+describe('external sources in a blueprint', () => {
+  it('defaults to none, and normalises method and expect', () => {
+    assert.deepEqual(validateBlueprint(structuredClone(valid), input).external_sources, []);
+    const plan = { ...structuredClone(valid), external_sources: [{ name: 'bom-rates', url: 'https://www.mongolbank.mn/en/currency-rates/data?startDate=2026-10-01&endDate=2026-10-12', method: 'post', expect: 'yaml', purpose: 'daily rates' }] };
+    const [source] = validateBlueprint(plan, input).external_sources;
+    assert.equal(source.method, 'POST');
+    assert.equal(source.expect, 'any');
+  });
+
+  it('rejects a source without a usable url', () => {
+    const plan = { ...structuredClone(valid), external_sources: [{ name: 'rates', url: 'mongolbank rates page', method: 'GET', expect: 'html', purpose: '' }] };
+    assert.throws(() => validateBlueprint(plan, input));
   });
 });
 
