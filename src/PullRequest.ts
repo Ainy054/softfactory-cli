@@ -124,6 +124,9 @@ export async function buildPullRequestBody(input: PullRequestBodyInput): Promise
   lines.push(`## ${state.feature}`, '');
   if (state.source?.kind === 'issue') lines.push(`Closes #${state.source.number} (${state.source.url})`, '');
   lines.push(`**Run status:** ${state.status}. ${done.length} of ${state.tasks.length} tasks merged into \`${state.integration_branch}\` on top of \`${input.baseBranch}\`.`, '');
+  if (state.verified === false) {
+    lines.push('**Live check:** UNVERIFIED — no live check ran; the tests are the only evidence.', '');
+  }
   if (state.status !== 'completed') {
     const open = state.tasks.filter(t => t.status !== 'done');
     lines.push(`Unfinished: ${open.map(t => `${t.id} (${t.status}${t.executor !== 'agent' ? `, ${t.executor}` : ''})`).join(', ')}.`, '');

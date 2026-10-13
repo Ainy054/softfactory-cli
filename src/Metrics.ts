@@ -54,6 +54,8 @@ export interface RunMetrics {
   recovered_workers?: number;
   /** Live UAT against the merged code: passed, failed, skipped (--no-uat), or none when no UAT is defined. */
   uat?: 'passed' | 'failed' | 'skipped' | 'none';
+  /** Whether a live check passed; false when a completed run had no live check. Absent when the gate never ran. */
+  verified?: boolean;
   /** Coverage before and after the build, when the project configures a coverageCommand. */
   coverage?: CoverageMetrics;
   /** CX review percentage per task that got one, keyed by task id. */
@@ -141,6 +143,7 @@ export async function computeRunMetrics(
     );
   }
   if (state.uat_result) metrics.uat = state.uat_result;
+  if (typeof state.verified === 'boolean') metrics.verified = state.verified;
   if (Object.keys(cxScores).length) metrics.cx_scores = cxScores;
   const measured = resolveCoverage(coverage);
   if (measured) metrics.coverage = measured;
