@@ -10,7 +10,7 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { isTestFilePath, AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider, type ExternalSource } from './Planner.js';
+import { isTestFilePath, AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider, type ExternalSource, type BlueprintUat } from './Planner.js';
 import { probeSource, sourcesFromRequirement, type SourceProbeResult } from './SourceProbe.js';
 import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
@@ -416,6 +416,7 @@ export class Factory extends EventEmitter {
                 await this.finalGate();
                 await this.saveState();
                 await this.updateHistory(this.state.status);
+                if (this.state.status === 'completed' && this.state.verified !== true) this.log('COMPLETED — UNVERIFIED: no live check ran; the tests are the only evidence.');
                 await this.endRun();
                 this.emitEvent({ type: 'build:complete', status: this.state.status, feature: this.state.feature });
                 return;
@@ -704,6 +705,7 @@ export class Factory extends EventEmitter {
             schema_version: CURRENT_SCHEMA_VERSION,
         };
         await this.planTokenBudget();
+        await this.adoptPlannerUat(blueprint);
         if (this.approvePlan) {
             this.emitEvent({ type: 'state:update', state: this.state });
             const decision = await this.approvePlan(this.state);
@@ -723,6 +725,30 @@ export class Factory extends EventEmitter {
         await this.updateHistory('active');
         this.emitEvent({ type: 'state:update', state: this.state });
         await this.runWorkshopLoop();
+    }
+    /**
+     * The planner's live check (blueprint.uat) is adopted into the
+     * orchestrator-owned .softfactory/uat.json, but only when the project has
+     * none: an existing file is the project's own and is never overwritten.
+     * Workers still cannot write that path, so the check that judges them
+     * stays out of their reach.
+     */
+    async adoptPlannerUat(blueprint: { uat?: BlueprintUat }): Promise<void> {
+        if (!blueprint.uat) return;
+        // loadUat throws on a malformed file; either way the file exists and is
+        // not ours to replace.
+        const existing = await loadUat(this.baseDir).catch(() => 'invalid' as const);
+        if (existing !== undefined) return;
+        const parsed = UatSchema.safeParse(blueprint.uat);
+        if (!parsed.success) {
+            this.log(`UAT: the planner's live check is invalid (${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}); ignoring it.`);
+            return;
+        }
+        if (!parsed.data.probes.length && !parsed.data.setup.length) return;
+        const uatPath = path.join(this.baseDir, UAT_FILE);
+        await fs.mkdir(path.dirname(uatPath), { recursive: true });
+        await fs.writeFile(uatPath, `${JSON.stringify(parsed.data, null, 2)}\n`);
+        this.log(`UAT: adopted the planner's live check (${parsed.data.probes.length} probes).`);
     }
     /** The journal for the current feature; one chain per run id. */
     journal(): RunJournal | null {
@@ -1137,6 +1163,9 @@ export class Factory extends EventEmitter {
             for (const t of failedTasks) {
                 this.log(`  - ${t.id} ${t.title}: ${t.status}${t.last_feedback ? ` (${t.last_feedback.slice(0, 100)})` : ''}`);
             }
+        }
+        else if (this.state.status === 'completed' && this.state.verified !== true) {
+            this.log('COMPLETED — UNVERIFIED: no live check ran; the tests are the only evidence.');
         }
         else {
             this.log(`Build completed: ${this.state.feature}`);
@@ -3388,7 +3417,7 @@ export class Factory extends EventEmitter {
     }
 
     async uatGate(targetEnv?: Record<string, string>): Promise<UatResult | undefined> {
-        if (this.skipUat) { this.state.uat_result = 'skipped'; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
+        if (this.skipUat) { this.state.uat_result = 'skipped'; this.state.verified = false; this.log('UAT: skipped (--no-uat).'); await this.saveState(); return undefined; }
         let defined: { config: UatConfig; liveChecks: number } | undefined;
         try { defined = await this.uatDefinition(); }
         catch (error: any) {
@@ -3402,6 +3431,7 @@ export class Factory extends EventEmitter {
         }
         if (!defined) {
             this.state.uat_result = 'none';
+            this.state.verified = false;
             this.log(`UAT: none defined. Add ${UAT_FILE} (build, artifacts, probes) to verify the running system, not only the tests.`);
             await this.saveState();
             return undefined;
@@ -3413,6 +3443,7 @@ export class Factory extends EventEmitter {
         const result = await this.runUatAt(this.baseDir, config, 'final', targetEnv);
         for (const step of result.steps) this.log(`UAT ${step.passed ? 'PASS' : 'FAIL'} — ${step.name}: ${step.detail}`);
         this.state.uat_result = result.passed ? 'passed' : 'failed';
+        this.state.verified = result.passed;
         await this.saveState();
         await this.journal()?.append('uat:result', { passed: result.passed, steps: result.steps.map(s => ({ name: s.name, passed: s.passed })) }, result.evidencePath ? [result.evidencePath] : []).catch(() => undefined);
         if (!result.passed) {
