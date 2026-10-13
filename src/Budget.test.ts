@@ -104,9 +104,10 @@ describe('a run has token and time budgets', () => {
 
   it('halts when the invocation time budget is spent', async () => {
     const { factory, logs } = await factoryWith({ runBudgetMinutes: 1 }, [task({ id: 'T1' }), task({ id: 'T2', phase: 2, dependencies: ['T1'] })]);
-    factory.runBudgetMs = 1;
     const executed: string[] = [];
-    factory.executeAndInspect = async (t: Task) => { executed.push(t.id); await new Promise(r => setTimeout(r, 5)); return { task: t, branchName: `line/${t.id}` }; };
+    // The budget runs out during the first phase, not before it: a 1 ms
+    // budget set up front was spent by setup alone under a loaded test run.
+    factory.executeAndInspect = async (t: Task) => { executed.push(t.id); factory.runBudgetMs = 1; await new Promise(r => setTimeout(r, 5)); return { task: t, branchName: `line/${t.id}` }; };
     await factory.runWorkshopLoop();
     assert.deepEqual(executed, ['T1'], 'checked between phases, so the first phase ran');
     assert.ok(logs.some(l => /Run budget of 0 minutes is spent/.test(l)), logs.join('\n'));
