@@ -17,6 +17,7 @@ import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
 import { Inspector, normalizePostmortem } from './Inspector.js';
 import { swallowedErrors } from './SwallowedErrors.js';
+import { inventedFixtures } from './FixtureProvenance.js';
 import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, fallbackUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
 import { loadEnvironment, changedRoutes, orchestratorOwned, type Environment } from './Environment.js';
@@ -1573,6 +1574,13 @@ export class Factory extends EventEmitter {
                 await this.recordAttempt(task, 'missing_test_evidence', testEvidence);
                 return null;
             }
+            const fixtureProblem = this.fixtureProvenanceProblem(task, diff);
+            if (fixtureProblem) {
+                this.log(`REJECTED: ${task.id} — ${fixtureProblem}`);
+                processFailure(fixtureProblem);
+                await this.recordAttempt(task, 'invented_fixture', fixtureProblem);
+                return null;
+            }
             // A test writer that edits production code to make its own tests
             // pass is not writing tests. Softhouse tags this
             // `tests-rewrote-source`.
@@ -2506,6 +2514,30 @@ export class Factory extends EventEmitter {
         }
     }
 
+    /**
+     * #83: in a run with probed external sources, fixture data a worker wrote
+     * itself (or edited from a probe) stands in for the source without coming
+     * from it, so the attempt is rejected. In a run with none, a fixture that
+     * looks like a captured response (a URL, or a whole HTML document) is
+     * noted for the final report instead.
+     */
+    fixtureProvenanceProblem(task: Task, diff: string): string | null {
+        const changed = this.filesInDiff(diff);
+        const sources = this.state?.external_sources ?? [];
+        const probePaths = sources.map(source => source.path).filter((p): p is string => Boolean(p));
+        if (sources.length) {
+            const invented = inventedFixtures(changed, diff, probePaths);
+            if (!invented.length) return null;
+            const saved = probePaths.length ? probePaths.join(', ') : 'none saved';
+            return `These files stand in for an external source but were not fetched from it: ${invented.join(', ')}. Use the real responses the orchestrator saved (${saved}), or derive smaller samples from them in test code, not in new fixture files.`;
+        }
+        for (const file of inventedFixtures(changed, diff, [])) {
+            const added = addedText(diff, file);
+            if (/https?:\/\/|<html[\s>]/i.test(added)) this.addRunNote(task.id, `unprobed fixture: ${file}`);
+        }
+        return null;
+    }
+
     filesInDiff(diff: string): string[] {
         return [...new Set([...diff.matchAll(/^\+\+\+ b\/(.+)$/gm)].map(m => m[1].trim()))];
     }
@@ -3033,6 +3065,7 @@ export class Factory extends EventEmitter {
         no_file_changes: 'Do not describe the change: write it to the files.',
         missing_declared_files: 'Do not skip the files the task says to create; create every one.',
         missing_test_evidence: 'Do not leave placeholder tests; write executable assertions.',
+        invented_fixture: 'Do not write fixture data for an external source; test against the responses the orchestrator saved.',
         tests_rewrote_source: 'Do not edit source files; this task may change test files only.',
         verification_sabotage: 'Do not disable, delete or weaken tests or the test script.',
         fabricated_claim: 'Do not cite a file line you have not read; cite real lines or mark the claim UNVERIFIED.',
@@ -3765,4 +3798,17 @@ function fixtureExtension(expect: string | undefined, contentType: string): stri
 
 function hostOf(url: string): string {
     try { return new URL(url).host; } catch { return ''; }
+}
+
+/** The added lines of one file in a unified diff, joined. */
+function addedText(diff: string, file: string): string {
+    const lines: string[] = [];
+    let current = '';
+    for (const line of diff.split('\n')) {
+        const header = line.match(/^\+\+\+ b\/(.+)$/);
+        if (header) { current = header[1].trim(); continue; }
+        if (line.startsWith('diff --git ')) { current = ''; continue; }
+        if (current === file && line.startsWith('+')) lines.push(line.slice(1));
+    }
+    return lines.join('\n');
 }
