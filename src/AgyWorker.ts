@@ -4,6 +4,7 @@ import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
 import { IWorker, WorkerOptions, argvText, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
+import { AGY_WORKER_MODEL } from './TextModel.js';
 
 
 export class AgyWorker implements IWorker {
@@ -11,7 +12,7 @@ export class AgyWorker implements IWorker {
   name = 'Antigravity Cloud Worker';
   private defaultModel: string;
 
-  constructor(defaultModel: string = 'Gemini 3.7 Flash (High)') {
+  constructor(defaultModel: string = AGY_WORKER_MODEL) {
     this.defaultModel = defaultModel;
   }
 

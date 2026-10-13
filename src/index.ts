@@ -12,6 +12,7 @@ import type { SandboxMode } from './Sandbox.js';
 import { startFactoryRun } from './runMode.js';
 import { readPin, writePin, pinCheck } from './VersionPin.js';
 import { SOFTFACTORY_VERSION } from './version.js';
+import { AGY_WORKER_MODEL, AGY_FRONTIER_MODEL } from './TextModel.js';
 import { loadProgram, saveProgram, readiness, nextRequirement, stopProgram, resumeProgram, unparkContext, PROGRAM_FILE, type Context } from './Program.js';
 import { readGates, openGates, decideGate, answered, GATES_FILE } from './Gates.js';
 import { launchdPlist, launchdPlistPath } from './ProgramAdvance.js';
@@ -377,7 +378,7 @@ async function main() {
   // CLI agents (Codex, Claude Code, Gemini CLI) have their own configured default model.
   const agentDefault = cloudProviderArg === 'openai' || AGENT_PROVIDERS.includes(cloudProviderArg);
   const MODEL_DEFAULTS: Record<string, [string, string]> = { deepseek: ['deepseek-v4-flash', 'deepseek-v4-pro'], qwen: ['qwen3-coder-plus', 'qwen3.8-max'], 'openai-compat': ['', ''] };
-  const [defaultCloud, defaultFrontier] = agentDefault ? ['', ''] : MODEL_DEFAULTS[cloudProviderArg] || ['Gemini 3.7 Flash (High)', 'Gemini 3.1 Pro (High)'];
+  const [defaultCloud, defaultFrontier] = agentDefault ? ['', ''] : MODEL_DEFAULTS[cloudProviderArg] || [AGY_WORKER_MODEL, AGY_FRONTIER_MODEL];
   const cloudModelArg = getFlagValue(args, '--cloud-model') || defaultCloud;
   const frontierModelArg = getFlagValue(args, '--frontier-model') || defaultFrontier || cloudModelArg;
   if (cloudProviderArg === 'openai-compat') {

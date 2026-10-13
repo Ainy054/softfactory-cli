@@ -80,7 +80,7 @@ softfactory "add REST API with user CRUD"
 softfactory --strategy=local --planner-provider=local "add unit tests for auth module"
 
 # Cloud only, via the Antigravity CLI
-softfactory --strategy=cloud --cloud-model="Gemini 3.7 Flash (High)" "refactor ledger engine"
+softfactory --strategy=cloud --cloud-model="Gemini 3.8 Flash (High)" "refactor ledger engine"
 
 # Codex CLI with its configured default model
 softfactory --strategy=hybrid --cloud-provider=openai --resume

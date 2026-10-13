@@ -130,6 +130,42 @@ export class OllamaTextModel implements ITextModel {
   }
 }
 
+/** Antigravity's defaults; agy retired Gemini 3.1 Pro and 3.7 Flash in October 2026. */
+export const AGY_WORKER_MODEL = 'Gemini 3.8 Flash (High)';
+export const AGY_FRONTIER_MODEL = 'Claude Opus 5.5 (High)';
+
+/**
+ * agy's own words when it fails. Its stderr says what went wrong ("invalid
+ * model selection ... Available models: ..."); execa's message starts with the
+ * whole command line, so the reason was cut off behind the prompt.
+ */
+export function agyFailure(error: any): string {
+  const said = String(error?.stderr || '').split('\n').map(line => line.trim()).filter(Boolean).join('; ');
+  if (said) return said.slice(0, 600);
+  return String(error?.shortMessage || error?.message || 'unknown error').replace(/\s--print\s[\s\S]*$/, ' --print <prompt>').slice(0, 300);
+}
+
+/**
+ * The configured models agy does not offer, checked once against `agy models`
+ * before a run starts. Null when every model is known, or when the list cannot
+ * be read (an older agy without the subcommand never blocks a run).
+ */
+export async function agyModelProblem(models: string[], run: (args: string[]) => Promise<{ exitCode?: number; stdout: string }> = args => execa('agy', args, { timeout: 30_000, reject: false })): Promise<string | null> {
+  const wanted = [...new Set(models.filter(Boolean))];
+  if (!wanted.length) return null;
+  const listed = await run(['models']).catch(() => undefined);
+  if (!listed || listed.exitCode !== 0) return null;
+  const known: Array<{ id: string; name: string }> = [];
+  for (const line of listed.stdout.split('\n')) {
+    const [id, name] = line.split('\t').map(part => part?.trim());
+    if (id && name) known.push({ id, name });
+  }
+  if (!known.length) return null;
+  const missing = wanted.filter(model => !known.some(k => k.name === model || k.id === model));
+  if (!missing.length) return null;
+  return `Antigravity has no model ${missing.map(m => `"${m}"`).join(', ')}. Available: ${known.map(k => k.name).join(', ')}. Choose with --planner-model, --cloud-model or --frontier-model.`;
+}
+
 export class AgyTextModel implements ITextModel {
   readonly provider = 'agy';
   constructor(readonly model: string) {}
@@ -145,7 +181,7 @@ export class AgyTextModel implements ITextModel {
         { timeout: options.timeoutMs ?? 300000 });
       output = (stdout || stderr || '').trim();
     } catch (error: any) {
-      throw new WorkerEnvironmentError(`Antigravity CLI failed for ${this.model}: ${(error?.shortMessage || error?.message || 'unknown error').slice(0, 300)}`);
+      throw new WorkerEnvironmentError(`Antigravity CLI failed for ${this.model}: ${agyFailure(error)}`);
     }
     if (/quota reached|Individual quota/i.test(output)) throw new WorkerEnvironmentError(`Antigravity quota reached for ${this.model}.`);
     if (!output) throw new Error(`Antigravity returned no output for ${this.model}.`);

@@ -5,7 +5,7 @@ import { execa } from 'execa';
 import { z } from 'zod';
 import { MOCKUP_DIR } from './IWorker.js';
 import { extractJson } from './extractJson.js';
-import { AgyTextModel, DeepSeekTextModel, OllamaTextModel, createTextModel, type ITextModel } from './TextModel.js';
+import { AgyTextModel, AGY_FRONTIER_MODEL, DeepSeekTextModel, OllamaTextModel, createTextModel, type ITextModel } from './TextModel.js';
 import { commandPolicyViolation } from './commandPolicy.js';
 import type { Task } from './types.js';
 
@@ -479,7 +479,7 @@ export class CodexPlanner extends BasePlanner {
 }
 
 export class AgyPlanner extends TextModelPlanner {
-  constructor(model = 'Gemini 3.1 Pro (High)') { super('agy', new AgyTextModel(model)); }
+  constructor(model = AGY_FRONTIER_MODEL) { super('agy', new AgyTextModel(model)); }
 }
 
 /** Offline planner backed directly by Ollama. */

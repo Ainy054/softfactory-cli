@@ -19,7 +19,7 @@ import { Inspector, normalizePostmortem } from './Inspector.js';
 import { swallowedErrors } from './SwallowedErrors.js';
 import { inventedFixtures } from './FixtureProvenance.js';
 import { unverifiedAssumptions } from './Unverified.js';
-import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, type TextModelProvider } from './TextModel.js';
+import { createTextModel, OllamaTextModel, TEXT_MODEL_PROVIDERS, AGY_WORKER_MODEL, AGY_FRONTIER_MODEL, agyModelProblem, type TextModelProvider } from './TextModel.js';
 import { loadUat, runUat, fallbackUat, UAT_FILE, UatSchema, type UatResult, type UatConfig, type ShellRunner } from './Uat.js';
 import { loadEnvironment, changedRoutes, orchestratorOwned, type Environment } from './Environment.js';
 import { appendHandoff, similarHandoffs } from './HandoffIndex.js';
@@ -137,6 +137,12 @@ export class Factory extends EventEmitter {
     runStartedAt = Date.now();
     /** Short facts learned during this run, handed to the tasks that run after. */
     runNotes: Array<{ taskId: string; note: string }> = [];
+    /** Models this run asks Antigravity for; checked against `agy models` before the run starts. */
+    agyModels: string[] = [];
+    // Under node's test runner the real listing (a network call to agy) is
+    // skipped; a test that wants the check injects its own.
+    agyModelCheck: typeof agyModelProblem = models => process.env.NODE_TEST_CONTEXT ? Promise.resolve(null) : agyModelProblem(models);
+    private agyModelsChecked = false;
     /** How external sources are fetched at planning time; tests inject a fake. */
     sourceFetch: typeof fetch = (input, init) => fetch(input, init);
     /** This plan's probed sources, with bodies, until the workshop commits them as fixtures. */
@@ -191,7 +197,7 @@ export class Factory extends EventEmitter {
     constructor(baseDir: string, _apiKey: string, options: FactoryOptions = {}) {
         super();
         this.baseDir = baseDir;
-        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = 'Gemini 3.7 Flash (High)', frontierModel = 'Gemini 3.1 Pro (High)', cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false, approvePlan, confirmOverBudget } = options;
+        const { streamToTerminal = false, useDocker = true, sandbox = 'auto', strategy = 'hybrid', localModel = 'auto', cloudModel = AGY_WORKER_MODEL, frontierModel = AGY_FRONTIER_MODEL, cloudProvider = 'agy', plannerProvider = 'openai', plannerModel = '', secondReviewer, attemptTimeoutMinutes = 45, runBudgetMinutes, maxTokens, prMode = false, issue, skipUat = false, abandon = false, approvePlan, confirmOverBudget } = options;
         this.approvePlan = approvePlan;
         this.confirmOverBudget = confirmOverBudget;
         this.skipUat = skipUat;
@@ -231,7 +237,7 @@ export class Factory extends EventEmitter {
                 ? new ApiPlanner(plannerProvider, plannerModel)
             : plannerProvider === 'claude-code' || plannerProvider === 'gemini-cli' || plannerProvider === 'muse'
                 ? new CliPlanner(plannerProvider, plannerModel, baseDir)
-                : new AgyPlanner(plannerModel || 'Gemini 3.1 Pro (High)');
+                : new AgyPlanner(plannerModel || AGY_FRONTIER_MODEL);
         this.planner.log = line => this.log(line);
         // The reviewer is the configured cloud provider's model, and nothing
         // else. It used to be the Antigravity CLI regardless of provider, with
@@ -256,6 +262,12 @@ export class Factory extends EventEmitter {
             this.secondInspector = new Inspector(createTextModel(provider, model, { cwd: baseDir }));
         }
         this.workerRegistry = new WorkerRegistry(strategy, localModel, cloudModel, frontierModel, pinnedLocal, pinnedLocal, cloudProvider);
+        // Every model this run will ask agy for, checked once before planning.
+        this.agyModels = [
+            ...(this.planner.provider === 'agy' ? [plannerModel || AGY_FRONTIER_MODEL] : []),
+            ...(cloudProvider === 'agy' && strategy !== 'local' ? [cloudModel, frontierModel || cloudModel] : []),
+            ...(secondReviewer?.startsWith('agy/') ? [secondReviewer.slice(4)] : []),
+        ];
         this.runtimeConfig = { strategy: strategy as 'hybrid' | 'local' | 'cloud', local_model: localModel, cloud_provider: cloudProvider, cloud_model: cloudModel, frontier_model: frontierModel };
         this.taskVerifier = new TaskVerifier(this.sandbox);
         this.lessons = new LessonManager(baseDir);
@@ -319,6 +331,7 @@ export class Factory extends EventEmitter {
         return this.state;
     }
     async refine(refinement: string) {
+        await this.checkAgyModels();
         if (!this.state) {
             this.log('No existing build to refine. Run a build first.');
             return;
@@ -383,6 +396,7 @@ export class Factory extends EventEmitter {
         await this.runWorkshopLoop();
     }
     async resume(featureId?: string, retryBlocked = false) {
+        await this.checkAgyModels();
         if (featureId) {
             const archivePath = path.join(this.archiveDir, `${featureId}.json`);
             if (await this.exists(archivePath)) {
@@ -585,6 +599,7 @@ export class Factory extends EventEmitter {
      * queue() parks the very same shape in the queue directory.
      */
     private async planFeatureState(requirement: string): Promise<FactoryState> {
+        await this.checkAgyModels();
         this.log(`Generating plan for: ${requirement}`);
         const codebaseContext = await this.getRepoContext(requirement);
         const repositoryFiles = new Set(await this.getRepositoryFiles());
@@ -686,6 +701,7 @@ export class Factory extends EventEmitter {
         await this.resume();
     }
     async build(requirement: string) {
+        await this.checkAgyModels();
         if (this.state && (this.state.status === 'completed' || this.state.status === 'failed')) {
             await this.archiveCurrentState();
         }
@@ -1254,6 +1270,17 @@ export class Factory extends EventEmitter {
         if (!items.length) return;
         this.log(`UNVERIFIED ASSUMPTIONS (${items.length}):`);
         for (const item of items) this.log(`  - ${item}`);
+    }
+
+    /**
+     * agy retires models; a run configured with one used to fail at planning
+     * with the reason cut off. Checked once, before anything is planned or run.
+     */
+    async checkAgyModels(): Promise<void> {
+        if (this.agyModelsChecked || !this.agyModels.length) return;
+        this.agyModelsChecked = true;
+        const problem = await this.agyModelCheck(this.agyModels);
+        if (problem) throw new WorkerEnvironmentError(problem);
     }
 
     async executeAndInspect(task: Task, preCreatedWorktree?: string): Promise<{ task: Task; branchName: string; followUps: string[] } | null> {
