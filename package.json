@@ -1,6 +1,6 @@
 {
   "name": "softfactory-cli",
-  "version": "6.4.3",
+  "version": "6.4.4",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
