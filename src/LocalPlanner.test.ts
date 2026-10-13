@@ -179,3 +179,15 @@ describe('planning calls get the planner timeout, not the worker turn default', 
     assert.deepEqual(timeouts, [15 * 60_000, 1_200_000]);
   });
 });
+
+describe('the live-check rule as the model reads it', () => {
+  it('keeps the backslashes of the example regex', async () => {
+    const ollama = await fakeOllama([goodPlan]);
+    try {
+      await new LocalPlanner('m', ollama.host).generateBlueprint(input as any);
+      assert.ok(ollama.prompts[0].includes('e.g. \\[\\s*\\{[^\\]]*"currency"'), 'the regex reaches the model intact');
+    } finally {
+      await ollama.close();
+    }
+  });
+});

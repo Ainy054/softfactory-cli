@@ -573,6 +573,7 @@ async function main() {
           pr: state.pull_request?.number,
           commits: done,
           tokens: (state.usage?.input_tokens ?? 0) + (state.usage?.output_tokens ?? 0),
+          verified: state.verified,
           blocked_reason: stuck ? `${stuck.id} ${stuck.status}: ${String(stuck.last_feedback || stuck.title).split('\n').find(Boolean)?.slice(0, 160) ?? ''}` : state.failure_reason,
         };
       },
