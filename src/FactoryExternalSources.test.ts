@@ -122,4 +122,19 @@ describe('external sources are probed when the plan is prepared', () => {
     await f.planTasks(planningInput());
     assert.equal(f.plannedSourceSummaries(), undefined);
   });
+
+  it('does not gate on a requirement URL that only a test task quotes as test data', async () => {
+    const f = factoryOn(await repo());
+    f.sourceFetch = fakeFetch({ 'https://www.mongolbank.mn/en/rates': { type: 'text/html', body: SOFT_404 } });
+    const plan = {
+      feature: 'Report', requirements_covered: [], external_sources: [],
+      tasks: [
+        { id: 'T1', title: 'Report module', description: 'Add the unverified report to src/report.ts', agent_role: 'coder', phase: 1, files_hint: ['src/report.ts', 'src/report.test.ts'], creates_files: ['src/report.ts', 'src/report.test.ts'], verification_command: 'node --test src/report.test.ts' },
+        { id: 'T2', title: 'Report tests', description: 'A diff adding requests.get("https://www.mongolbank.mn/en/rates") gives the never-fetched line', agent_role: 'test_writer', phase: 2, dependencies: ['T1'], files_hint: ['src/report.test.ts'], verification_command: 'node --test src/report.test.ts' },
+      ],
+    };
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => plan };
+    await f.planTasks(planningInput('A diff adding requests.get("https://www.mongolbank.mn/en/rates") with no probes gives the line.'));
+    assert.ok(f.logs.some((l: string) => /requirement-1 GET https:\/\/www\.mongolbank\.mn\/en\/rates → NOT OK.*not gating/.test(l)), f.logs.join('\n'));
+  });
 });
