@@ -749,6 +749,7 @@ export class Factory extends EventEmitter {
         await fs.mkdir(path.dirname(uatPath), { recursive: true });
         await fs.writeFile(uatPath, `${JSON.stringify(parsed.data, null, 2)}\n`);
         this.log(`UAT: adopted the planner's live check (${parsed.data.probes.length} probes).`);
+        for (const probe of parsed.data.probes) this.log(`  uat ${probe.name}: ${probe.run}${probe.expect ? ` (expect /${probe.expect}/)` : ' (no expectation: any output passes)'}`);
     }
     /** The journal for the current feature; one chain per run id. */
     journal(): RunJournal | null {

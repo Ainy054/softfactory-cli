@@ -198,3 +198,11 @@ describe('a completed run with no live check', () => {
     }
   });
 });
+
+describe('a planner live check with an empty expect', () => {
+  it('treats an empty expect from strict output as no expectation, and requires a command', async () => {
+    const { BlueprintUatSchema } = await import('./Planner.js');
+    assert.equal(BlueprintUatSchema.parse({ setup: [], probes: [{ name: 'p', run: 'curl x', expect: '' }] }).probes[0].expect, undefined);
+    assert.throws(() => BlueprintUatSchema.parse({ probes: [{ name: 'p', run: '' }] }));
+  });
+});
