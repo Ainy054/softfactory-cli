@@ -45,6 +45,30 @@ class AttemptTimeoutError extends Error {
   constructor(minutes: number) { super(`Attempt exceeded its ${minutes}-minute budget and the worker did not stop when asked.`); this.name = 'AttemptTimeoutError'; }
 }
 
+/**
+ * Commands that run a project's test suite. A planner's "live check" that
+ * invokes one of these is not a live check at all: the gates already ran the
+ * suite, and node's `# pass N` output would not match a probe's `expect`.
+ * Matched per shell segment (`cd app && npm test` counts) with flags allowed
+ * in between (`node --import tsx --test`, `npm --prefix web test`).
+ */
+const TEST_RUNNER = new RegExp([
+  String.raw`^(?:npm|pnpm|yarn|bun)(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:run\s+)?test(?::\S+)?(?:\s|$)`,
+  String.raw`^(?:bun|deno|go|cargo|dotnet|mix|make)\s+(?:\S+\s+)*?test(?:\s|$)`,
+  String.raw`^node(?:\s+\S+)*\s+--test(?:\s|$)`,
+  String.raw`^(?:npx\s+)?(?:vitest|jest|mocha|ava|tap|pytest|tox|rspec|phpunit)(?:\s|$)`,
+  String.raw`^python3?\s+-m\s+(?:pytest|unittest)(?:\s|$)`,
+].join('|'));
+
+/**
+ * True when any segment of `run` (split on &&, ||, ; and |) starts with a test
+ * runner. Called by adoptPlannerUat to drop probes that would only re-run the
+ * test suite.
+ */
+export function isTestRunnerProbe(run: string): boolean {
+  return run.split(/&&|\|\||;|\|/).some(segment => TEST_RUNNER.test(segment.trim().replace(/\s+/g, ' ').toLowerCase()));
+}
+
 export interface FactoryOptions {
     streamToTerminal?: boolean;
     useDocker?: boolean;
@@ -566,7 +590,7 @@ export class Factory extends EventEmitter {
         this.log(`Planner: ${this.planner.provider}${this.planner.provider === 'openai' ? ' (read-only structured output)' : ''}`);
         const { blueprint, tasks: plannedTasks } = await this.planTasks({ requirement, codebaseContext, memoryPatterns, featureHistory, repositoryFiles, workerCapability: this.strategy === 'cloud' ? 'cloud' : 'local', recurringFailures: await this.recurringFailureCategories() });
         const featureId = this.generateFeatureId();
-        return {
+        const state: FactoryState = {
             feature_id: featureId,
             feature: blueprint.feature,
             status: 'planned',
@@ -587,6 +611,18 @@ export class Factory extends EventEmitter {
             state_revision: 0,
             schema_version: CURRENT_SCHEMA_VERSION,
         };
+        // The plan's live check belongs to this planned state, so --plan and
+        // --queue keep it. adoptPlannerUat writes to this.state, so it is staged
+        // here and the previous run's state (if any) is left where it was.
+        const previousState = this.state;
+        this.state = state;
+        try {
+            await this.adoptPlannerUat(blueprint);
+        }
+        finally {
+            this.state = previousState;
+        }
+        return state;
     }
     /**
      * Plans like plan() and parks the result: the planned state is written to
@@ -728,11 +764,13 @@ export class Factory extends EventEmitter {
         await this.runWorkshopLoop();
     }
     /**
-     * The planner's live check (blueprint.uat) is adopted into the
-     * orchestrator-owned .softfactory/uat.json, but only when the project has
-     * none: an existing file is the project's own and is never overwritten.
-     * Workers still cannot write that path, so the check that judges them
-     * stays out of their reach.
+     * The planner's live check (blueprint.uat) belongs to this run: it is kept
+     * in the run state (`state.planned_uat`), never written to
+     * .softfactory/uat.json, so it cannot leak into later runs. An existing
+     * uat.json is the project's own and always wins, so nothing is adopted when
+     * one is present. Probes that merely re-run the test suite are dropped
+     * (the gates already did that); if none is left, nothing is adopted and the
+     * run ends unverified, which is honest.
      */
     async adoptPlannerUat(blueprint: { uat?: BlueprintUat }): Promise<void> {
         if (!blueprint.uat) return;
@@ -745,12 +783,19 @@ export class Factory extends EventEmitter {
             this.log(`UAT: the planner's live check is invalid (${parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ')}); ignoring it.`);
             return;
         }
-        if (!parsed.data.probes.length && !parsed.data.setup.length) return;
-        const uatPath = path.join(this.baseDir, UAT_FILE);
-        await fs.mkdir(path.dirname(uatPath), { recursive: true });
-        await fs.writeFile(uatPath, `${JSON.stringify(parsed.data, null, 2)}\n`);
-        this.log(`UAT: adopted the planner's live check (${parsed.data.probes.length} probes).`);
-        for (const probe of parsed.data.probes) this.log(`  uat ${probe.name}: ${probe.run}${probe.expect ? ` (expect /${probe.expect}/)` : ' (no expectation: any output passes)'}`);
+        const probes = parsed.data.probes.filter(probe => !isTestRunnerProbe(probe.run));
+        for (const probe of parsed.data.probes) {
+            if (isTestRunnerProbe(probe.run)) this.log(`UAT: dropped probe "${probe.name}": it runs the test suite, which the gates already did.`);
+        }
+        // Without a probe there is no live check; adopting setup alone would
+        // claim a verification that never happened.
+        if (!probes.length) return;
+        // The check lives in the run state, not in .softfactory/uat.json: a run
+        // inherits nothing from the one before it, and no code writes that file.
+        if (!this.state) return;
+        this.state.planned_uat = { setup: parsed.data.setup, probes };
+        this.log(`UAT: adopted the planner's live check (${probes.length} probes).`);
+        for (const probe of probes) this.log(`  uat ${probe.name}: ${probe.run}${probe.expect ? ` (expect /${probe.expect}/)` : ' (no expectation: any output passes)'}`);
     }
     /** The journal for the current feature; one chain per run id. */
     journal(): RunJournal | null {
@@ -3151,10 +3196,19 @@ export class Factory extends EventEmitter {
         const liveChecks = this.state.tasks
             .filter(t => t.status === 'done' && isDeferredAcceptance(t.verification_command))
             .map(t => ({ name: `${t.id} live check`, run: deferredCommand(t.verification_command!) }));
-        // No uat.json: a project with an environment.json still gets a live check built from it.
-        const fallback = config ? undefined : await this.fallbackFromEnvironment();
-        if (!config && !fallback && !liveChecks.length) return undefined;
-        const base = config ?? fallback ?? UatSchema.parse({});
+        // The project's own file wins; otherwise this run's planned check is
+        // used. Only when neither exists does the environment-based fallback.
+        let planned: UatConfig | undefined;
+        if (!config && this.state?.planned_uat) {
+            const parsed = UatSchema.safeParse(this.state.planned_uat);
+            if (parsed.success) {
+                planned = parsed.data;
+                this.log(`UAT: running the plan's live check (${planned.probes.length} probes).`);
+            }
+        }
+        const fallback = config || planned ? undefined : await this.fallbackFromEnvironment();
+        if (!config && !planned && !fallback && !liveChecks.length) return undefined;
+        const base = config ?? planned ?? fallback ?? UatSchema.parse({});
         return { config: { ...base, probes: [...base.probes, ...liveChecks] }, liveChecks: liveChecks.length };
     }
 
