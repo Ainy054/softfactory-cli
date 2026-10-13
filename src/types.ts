@@ -111,6 +111,8 @@ export const FactoryStateSchema = z.object({
   usage_by_model: z.record(z.string(), z.object({ input: z.number().default(0), output: z.number().default(0) })).optional(),
   /** The outcome of live UAT against the merged code, when the run reached that gate. */
   uat_result: z.enum(['passed', 'failed', 'skipped', 'none']).optional(),
+  /** True once a live check (UAT) passed; false when a completed run had no live check. Absent until the gate records it. */
+  verified: z.boolean().optional(),
   /**
    * Work marked promotion "test" that reached TEST and passed UAT there.
    * Production is a person's decision (--promote); no run deploys it.
