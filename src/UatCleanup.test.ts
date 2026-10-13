@@ -148,4 +148,24 @@ describe('a UAT setup that backgrounds a server does not leave it running', () =
       await cleanup(dir, pid);
     }
   });
+  it('fails a step that outlives timeout_seconds with exit 124, and stops it', { skip }, async () => {
+    const dir = await tmpDir();
+    let pid = 0;
+    try {
+      const pidFile = path.join(dir, 'pid');
+      const config = UatSchema.parse({
+        probes: [{ name: 'slow', run: `echo $$ > ${pidFile}; sleep 30` }],
+        timeout_seconds: 1,
+      });
+      const started = Date.now();
+      const result = await runUat(dir, config, { runId: 'r', featureId: 'f' });
+      pid = await readPid(pidFile);
+      assert.ok(Date.now() - started < 10_000, 'the timeout did not end the step');
+      assert.equal(result.passed, false);
+      assert.match(result.steps.find(step => step.name === 'probe: slow')?.detail ?? '', /^exit 124/);
+      assert.equal(await waitGone(pid, 3_000), true, `timed-out step ${pid} is still running`);
+    } finally {
+      await cleanup(dir, pid);
+    }
+  });
 });

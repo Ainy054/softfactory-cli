@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execa } from 'execa';
+import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { changedRoutes, type Environment } from './Environment.js';
 
@@ -88,29 +88,24 @@ export function fallbackUat(env: Environment, changedFiles: string[]): UatConfig
 export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string; pid?: number }>;
 
 const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
-  // Output goes to a file, never to a pipe. `execa` resolves once the output
-  // pipes close, and a command that backgrounds a server (`uvicorn app.main:app &`)
-  // leaves the child holding them, so the UAT would hang until its timeout even
-  // though `sh` exited at once. A file descriptor is inherited and copied into
-  // by the child, and nobody waits for it to close.
+  // Output goes to a file, never to a pipe. A runner that waits for the output
+  // pipes to close (as `execa` does) hangs until its timeout when a command
+  // backgrounds a server (`uvicorn app.main:app &`), because the child inherits
+  // the pipes; a file is inherited too, but nobody waits for it to close.
   const outputFile = path.join(os.tmpdir(), `softfactory-uat-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
   const handle = await fs.open(outputFile, 'w+');
   try {
-    const subprocess = execa('sh', ['-c', command], {
-      cwd,
-      env: { ...process.env, ...env },
-      timeout: timeoutMs,
-      reject: false,
-      stdio: ['ignore', handle.fd, handle.fd],
-      // Each command gets its own process group. A non-interactive `sh` has no
-      // job control, so a child started with `&` stays in this group, and the
-      // group id (the shell's pid) lets `runUat` stop everything setup left.
-      // The pid lives on the subprocess, not on the awaited result.
-      detached: true,
-    });
-    const pid = subprocess.pid;
-    const result = await subprocess;
-    return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: await fs.readFile(outputFile, 'utf8'), pid };
+    // Each command gets its own process group. A non-interactive `sh` has no
+    // job control, so a child started with `&` stays in this group, and the
+    // group id (the shell's pid) lets `runUat` stop everything setup left.
+    const child = spawn('sh', ['-c', command], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', handle.fd, handle.fd], detached: true });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; signalGroup(child.pid, 'SIGTERM'); }, timeoutMs);
+    const exitCode = await new Promise<number>(resolve => {
+      child.once('error', () => resolve(127));
+      child.once('exit', code => resolve(code ?? 1));
+    }).finally(() => clearTimeout(timer));
+    return { exitCode: timedOut ? 124 : exitCode, output: await fs.readFile(outputFile, 'utf8'), pid: child.pid };
   } finally {
     await handle.close().catch(() => {});
     await fs.rm(outputFile, { force: true }).catch(() => {});
@@ -277,43 +272,37 @@ export async function runUat(
 
 /**
  * Stops the process groups setup left running, on POSIX. Each id is the pid of
- * the shell that ran the step (`detached: true`), which is also the group id a
- * backgrounded child inherited. SIGTERM first, five seconds for the group to
- * go, then SIGKILL for the survivors. A group that is already gone — teardown
- * stopped it, or it exited on its own — is ignored (ESRCH), and does not count.
+ * the shell that ran the step (its own group, see `hostShell`), which is also
+ * the group a backgrounded child inherited. SIGTERM first, five seconds for the
+ * group to go, then SIGKILL for the survivors. A group that is already gone
+ * (teardown stopped it, or it exited on its own) does not count. Never throws:
+ * it runs in `runUat`'s finally, and cleanup must not turn a result into a crash.
  * Returns how many groups actually had to be stopped.
  */
 async function stopProcessGroups(pids: number[]): Promise<number> {
-  // Windows has no process groups to signal this way.
-  if (process.platform === 'win32') return 0;
   let stopped = 0;
   for (const pid of pids) {
-    try { process.kill(-pid, 'SIGTERM'); }
-    catch (error) { if (errnoCode(error) === 'ESRCH') continue; throw error; }
-    const deadline = Date.now() + 5_000;
-    let gone = false;
-    while (Date.now() < deadline) {
-      try { process.kill(-pid, 0); }
-      catch (error) { if (errnoCode(error) === 'ESRCH') { gone = true; break; } throw error; }
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    if (!gone) {
-      try { process.kill(-pid, 'SIGKILL'); }
-      catch (error) { if (errnoCode(error) !== 'ESRCH') throw error; }
-      const killDeadline = Date.now() + 2_000;
-      while (Date.now() < killDeadline) {
-        try { process.kill(-pid, 0); }
-        catch (error) { if (errnoCode(error) === 'ESRCH') break; throw error; }
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-    }
+    if (!signalGroup(pid, 'SIGTERM')) continue;
     stopped++;
+    if (await groupGone(pid, 5_000)) continue;
+    signalGroup(pid, 'SIGKILL');
+    await groupGone(pid, 2_000);
   }
   return stopped;
 }
 
-function errnoCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException | undefined)?.code;
+/** Signals a process group; false when it no longer exists or cannot be signalled. Windows has no groups to signal. */
+function signalGroup(pid: number | undefined, signal: NodeJS.Signals | 0): boolean {
+  if (!pid || process.platform === 'win32') return false;
+  try { process.kill(-pid, signal); return true; } catch { return false; }
+}
+
+async function groupGone(pid: number, withinMs: number): Promise<boolean> {
+  for (const deadline = Date.now() + withinMs; Date.now() < deadline;) {
+    if (!signalGroup(pid, 0)) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return !signalGroup(pid, 0);
 }
 
 function tail(output: string, chars = 240): string {
