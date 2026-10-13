@@ -163,6 +163,29 @@ describe('program advance', () => {
     program = await loadProgram(dir);
     assert.equal(program.contexts[0].status, 'done');
   });
+
+  it('treats an unverified completed context as done, and notes it in the history', async () => {
+    const dir = await programDir([{ id: 'A', scope: ['api/**'] }]);
+    const w = world(dir, [{ status: 'completed', verified: false }]);
+
+    const result = await advance(dir, w.deps);
+    assert.deepEqual([result.action, 'context' in result && result.context], ['done', 'A']);
+
+    const program = await loadProgram(dir);
+    assert.equal(program.contexts[0].status, 'done', 'an unverified run still completes the context');
+    assert.match(program.history.at(-1)!.result, /unverified/i);
+    assert.equal(program.history.at(-1)!.action, 'done');
+  });
+
+  it('does not note a verified completed run as unverified', async () => {
+    const dir = await programDir([{ id: 'A', scope: ['api/**'] }]);
+    const w = world(dir, [{ status: 'completed', verified: true }]);
+
+    assert.equal((await advance(dir, w.deps)).action, 'done');
+    const program = await loadProgram(dir);
+    assert.doesNotMatch(program.history.at(-1)!.result, /unverified/i);
+    assert.equal(program.history.at(-1)!.result, 'completed');
+  });
 });
 
 describe('the advance lock', () => {
