@@ -42,7 +42,7 @@ function normalizePath(filePath: string): string {
 }
 
 /** Test files are excluded: an assertion inside a test may legitimately swallow. */
-export function isTestFilePath(filePath: string): boolean {
+function isTestFilePath(filePath: string): boolean {
   const normalized = normalizePath(filePath).toLowerCase();
   if (!normalized) return true;
   if (TEST_DIR.test(normalized)) return true;
@@ -146,6 +146,24 @@ function matchJsHandler(line: string): { rest: string } | undefined {
 
 /** `.catch(() => {})`, `.catch(() => [])` and `.catch(() => null)` on one line. */
 const ARROW_CATCH_DISCARD = /\.catch\s*\(\s*\(\s*\)\s*=>\s*(?:\{\s*\}|\[\s*\]|null|undefined)\s*\)/;
+/**
+ * A one-line `.catch` only hides a failure as data when its value is used:
+ * assigned, returned, or passed on. A bare statement such as
+ * `await journal.append(...).catch(() => undefined)` is a deliberate
+ * best-effort side effect, not an empty success.
+ */
+const VALUE_USED = /(?:^|[^=!<>])=(?!=)|\breturn\b|=>\s*[^{\s]|\(\s*await\b/;
+
+/** A line that is only a comment: `//`, `/*`, ` * ` in JS/TS, `#` in Python. */
+function isCommentLine(line: string, python: boolean): boolean {
+  const trimmed = line.trim();
+  return python ? trimmed.startsWith('#') : /^(?:\/\/|\/\*|\*)/.test(trimmed);
+}
+
+/** JS/TS code before a trailing `//` comment (a `//` inside a string is rare enough to accept). */
+function stripJsComment(line: string): string {
+  return line.replace(/\s\/\/.*$/, '');
+}
 
 /** Lines that are just the closing brace of a handler's block. */
 function isStructural(line: string): boolean {
@@ -192,12 +210,18 @@ export function swallowedErrors(diff: string): SwallowedError[] {
       following.push(added[j]);
     }
 
-    if (ARROW_CATCH_DISCARD.test(current.content)) {
+    // Comments that mention a handler are not one. Python is matched only in
+    // .py files and JS/TS everywhere else, so `#` keeps its own meaning.
+    const isPython = /\.py$/i.test(current.path);
+    const code = isPython ? current.content : stripJsComment(current.content);
+    if (isCommentLine(current.content, isPython)) continue;
+
+    if (!isPython && ARROW_CATCH_DISCARD.test(code) && VALUE_USED.test(code.replace(ARROW_CATCH_DISCARD, ''))) {
       hits.push({ file: current.path, line: current.line, snippet: current.content.trim() });
       continue;
     }
 
-    const python = matchPythonHandler(current.content);
+    const python = isPython ? matchPythonHandler(current.content) : undefined;
     if (python) {
       // The body is the inline remainder plus the indented lines that follow;
       // a line at or below the handler's indentation ends the block.
@@ -215,7 +239,7 @@ export function swallowedErrors(diff: string): SwallowedError[] {
       continue;
     }
 
-    const js = matchJsHandler(current.content);
+    const js = isPython ? undefined : matchJsHandler(code);
     if (js) {
       const body = [js.rest, ...following.map(line => line.content)].join('\n');
       if (RECORDS_ERROR.test(body)) continue;

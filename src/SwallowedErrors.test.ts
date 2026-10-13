@@ -132,6 +132,21 @@ describe('swallowedErrors — JavaScript / TypeScript', () => {
     assert.deepEqual(swallowedErrors(diff), []);
   });
 
+  it('ignores comments that mention a handler', () => {
+    const diff = (file: string, line: string) => `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,0 +1,1 @@\n+${line}\n`;
+    assert.deepEqual(swallowedErrors(diff('src/a.ts', '/** `.catch(() => [])` on one line. */')), []);
+    assert.deepEqual(swallowedErrors(diff('src/a.ts', 'if (n === 0) return true; // `catch {}` discards')), []);
+    assert.deepEqual(swallowedErrors(diff('app/x.py', '# except Exception: pass is what we avoid')), []);
+  });
+
+  it('ignores a best-effort .catch whose value is not used, and flags one that becomes data', () => {
+    const diff = (line: string) => `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,0 +1,1 @@\n+${line}\n`;
+    assert.deepEqual(swallowedErrors(diff('    await this.journal()?.append(\'x\', {}).catch(() => undefined);')), []);
+    assert.deepEqual(swallowedErrors(diff('    execution.catch(() => undefined);')), []);
+    assert.equal(swallowedErrors(diff('    const rows = await fetchRows().catch(() => []);')).length, 1);
+    assert.equal(swallowedErrors(diff('    const page = await get(u).catch(() => undefined);')).length, 1);
+  });
+
   it('flags one-line .catch(() => {}) / [] / null handlers', () => {
     for (const line of ['return fetch(u).catch(() => {})', 'return fetch(u).catch(() => [])', 'return fetch(u).catch(() => null)']) {
       const hits = swallowedErrors(diffFor('app.ts', [line]));

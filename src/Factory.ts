@@ -1592,7 +1592,7 @@ export class Factory extends EventEmitter {
             // report can list the ones that still merged.
             const swallowed = swallowedErrors(diff);
             for (const hit of swallowed) {
-                this.addRunNote(task.id, `error swallowed into an empty result: ${hit.file}:${hit.line} — ${hit.snippet}`);
+                this.addRunNote(task.id, `swallowed error: ${hit.file}:${hit.line} — ${hit.snippet}`);
             }
             // Protection is decided by what the diff touched, not only by what
             // the plan expected it to touch.
