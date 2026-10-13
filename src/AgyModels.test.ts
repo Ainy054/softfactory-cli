@@ -21,8 +21,16 @@ describe('Antigravity models', () => {
     assert.equal(await agyModelProblem(['Anything'], async () => { throw new Error('no agy'); }), null);
   });
 
-  it('defaults to models agy offers now', async () => {
+  it('defaults to Gemini for every role, a model agy offers now', async () => {
     assert.equal(await agyModelProblem([AGY_WORKER_MODEL, AGY_FRONTIER_MODEL], agyModels), null);
+    assert.match(AGY_WORKER_MODEL, /^Gemini /);
+    assert.match(AGY_FRONTIER_MODEL, /^Gemini /);
+  });
+
+  it('shows agy\'s quota message, with when it resets', () => {
+    const error = { shortMessage: "Command failed with exit code 3: agy --model 'Claude Opus 5.5 (High)' --print 'You are...'",
+      stderr: 'error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h18m57s.' };
+    assert.match(agyFailure(error), /Individual quota reached.*Resets in 4h18m57s/);
   });
 
   it("reports agy's own error instead of the echoed command", () => {
