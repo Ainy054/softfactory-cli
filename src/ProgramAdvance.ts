@@ -25,6 +25,8 @@ export interface RunOutcome {
   /** Tasks merged by this run; zero means the advance was fruitless. */
   commits: number;
   tokens: number;
+  /** False when the run completed with no live check (UAT); the history entry notes it as unverified. */
+  verified?: boolean;
   blocked_reason?: string;
 }
 
@@ -197,8 +199,9 @@ async function advanceLocked(baseDir: string, deps: AdvanceDeps): Promise<Advanc
     action = 'parked';
   }
 
-  // 7. History.
-  await record({ context: context.id, action, feature_id: outcome.feature_id || undefined, result: outcome.status, commits: outcome.commits, tokens: outcome.tokens });
+  // 7. History. An unverified completed run is still done, but the note says so.
+  const note = outcome.status === 'completed' && outcome.verified === false ? `${outcome.status} (unverified)` : outcome.status;
+  await record({ context: context.id, action, feature_id: outcome.feature_id || undefined, result: note, commits: outcome.commits, tokens: outcome.tokens });
   const message = `program: ${context.id} ${action}${action === 'parked' ? `: ${context.parked_reason}` : ''} (${outcome.commits} merged, ${outcome.tokens} tokens${outcome.pr ? `, PR #${outcome.pr}` : ''})`;
   deps.log(message);
   return { action, context: context.id, message };

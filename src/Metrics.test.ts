@@ -57,6 +57,34 @@ describe('one metrics line per run, computed from the journals', () => {
     const recent = await readRecentMetrics(baseDir, 5);
     assert.deepEqual(recent.map(r => r.run_id), ['f-1', 'f-2']);
   });
+
+  it('records the live-check verdict: false when a completed run had no UAT, true when it passed', async () => {
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sf-metrics-'));
+    const state = (verified?: boolean) => ({
+      schema_version: CURRENT_SCHEMA_VERSION, feature_id: 'f-1', feature: 'metrics', status: 'completed',
+      created_at: new Date().toISOString(), tasks: [task({ id: 'T1' })],
+      uat_result: 'none',
+      ...(verified === undefined ? {} : { verified }),
+    }) as any;
+
+    const none = await computeRunMetrics(baseDir, state(false));
+    assert.equal(none.verified, false);
+    assert.equal(typeof none.verified, 'boolean');
+
+    const passed = await computeRunMetrics(baseDir, state(true));
+    assert.equal(passed.verified, true);
+
+    const unknown = await computeRunMetrics(baseDir, state());
+    assert.equal(unknown.verified, undefined, 'an older state without the field records no verdict');
+
+    // The verdict has to survive into the machine-readable line the next plan reads.
+    await appendRunMetrics(baseDir, none);
+    await appendRunMetrics(baseDir, { ...passed, run_id: 'f-2' });
+    const recorded = await readRecentMetrics(baseDir, 5);
+    assert.deepEqual(recorded.map(r => r.verified), [false, true]);
+    const firstLine = (await fs.readFile(path.join(baseDir, '.softfactory', 'metrics.jsonl'), 'utf8')).split('\n')[0];
+    assert.equal(JSON.parse(firstLine).verified, false, 'the run line carries the boolean, not a drop-out key');
+  });
 });
 
 describe('a failure category that keeps coming back is escalated to the planner', () => {
