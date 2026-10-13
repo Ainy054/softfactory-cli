@@ -10,7 +10,8 @@ import { TaskVerifier } from './TaskVerifier.js';
 import { DockerVerifier } from './DockerVerifier.js';
 import { LessonManager } from './LessonManager.js';
 import { execa } from 'execa';
-import { isTestFilePath, AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider } from './Planner.js';
+import { isTestFilePath, AgyPlanner, ApiPlanner, CliPlanner, CodexPlanner, LocalPlanner, DeepSeekPlanner, type IPlanner, type PlannerProvider, type ExternalSource } from './Planner.js';
+import { probeSource, sourcesFromRequirement, type SourceProbeResult } from './SourceProbe.js';
 import { AgentContainer } from './AgentContainer.js';
 import { shouldRecommendSplit } from './FailurePolicy.js';
 import { TrainingDataManager } from './TrainingDataManager.js';
@@ -109,6 +110,10 @@ export class Factory extends EventEmitter {
     runStartedAt = Date.now();
     /** Short facts learned during this run, handed to the tasks that run after. */
     runNotes: Array<{ taskId: string; note: string }> = [];
+    /** How external sources are fetched at planning time; tests inject a fake. */
+    sourceFetch: typeof fetch = (input, init) => fetch(input, init);
+    /** This plan's probed sources, with bodies, until the workshop commits them as fixtures. */
+    private plannedSources: Array<{ result: SourceProbeResult; method: string; path?: string }> = [];
     prMode: boolean;
     skipUat = false;
     abandon = false;
@@ -573,6 +578,7 @@ export class Factory extends EventEmitter {
             usage: { input_tokens: 0, output_tokens: 0 },
             requirement,
             brief: blueprint.brief ?? '',
+            external_sources: this.plannedSourceSummaries(),
             source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
             integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
             base_branch: this.prMode ? this.defaultBranch : undefined,
@@ -689,6 +695,7 @@ export class Factory extends EventEmitter {
             usage: { input_tokens: 0, output_tokens: 0 },
             requirement,
             brief: blueprint.brief ?? '',
+            external_sources: this.plannedSourceSummaries(),
             source: this.issue ? { kind: 'issue' as const, number: this.issue.number, url: this.issue.url, title: this.issue.title } : undefined,
             integration_branch: this.prMode ? `softfactory/${featureId}` : undefined,
             coverage_before: this.coverageBefore,
@@ -908,6 +915,7 @@ export class Factory extends EventEmitter {
             this.log(`HALTED: ${branchFault}`);
             return;
         }
+        await this.commitSourceFixtures();
         try {
             this.environment = await loadEnvironment(this.baseDir);
         } catch (error: any) {
@@ -2167,31 +2175,107 @@ export class Factory extends EventEmitter {
     async planTasks(input: Parameters<IPlanner['generateBlueprint']>[0]): Promise<{ blueprint: Awaited<ReturnType<IPlanner['generateBlueprint']>>; tasks: Task[] }> {
         let blueprint = await this.planner.generateBlueprint(input);
         try {
-            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks) };
+            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks, blueprint.external_sources ?? [], input.requirement) };
         } catch (error: any) {
             if (!/^Plan rejected:/.test(String(error?.message))) throw error;
             this.log(`Planner draft rejected at the acceptance probe; re-planning once with the reason.`);
             const feedback = String(error.message).split('\n').filter((line: string) => line.startsWith('- ')).join('\n');
+            const sourceAdvice = /external sources do not answer/.test(String(error.message))
+                ? ' Find the real endpoint; do not guess. If you cannot, list the source anyway and the run will stop for the user.'
+                : '';
             blueprint = await this.planner.generateBlueprint({
                 ...input,
-                requirement: `${input.requirement}\n\nPLANNER FEEDBACK: the previous plan was rejected for these reasons:\n${feedback}\nFix every one. Acceptance commands run only the task's own test file or check, name only files the task or its dependencies change, and finish in well under a minute; a task that renames or removes a symbol lists every file that uses it.`,
+                requirement: `${input.requirement}\n\nPLANNER FEEDBACK: the previous plan was rejected for these reasons:\n${feedback}\nFix every one. Acceptance commands run only the task's own test file or check, name only files the task or its dependencies change, and finish in well under a minute; a task that renames or removes a symbol lists every file that uses it.${sourceAdvice}`,
             });
-            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks) };
+            return { blueprint, tasks: await this.prepareTasks(blueprint.tasks, blueprint.external_sources ?? [], input.requirement) };
         }
     }
 
-    async prepareTasks(blueprintTasks: Array<Record<string, unknown>>): Promise<Task[]> {
+    async prepareTasks(blueprintTasks: Array<Record<string, unknown>>, sources: ExternalSource[] = [], requirement = ''): Promise<Task[]> {
         const tasks = this.annotateTasks(blueprintTasks.map(t => TaskSchema.parse({ ...t, status: 'pending', attempts: 0 })));
         const structural = [...await this.fileListProblems(tasks), ...await this.acceptanceScopeProblems(tasks)];
         if (structural.length) {
             for (const problem of structural) this.log(`Planning check: ${problem}`);
             throw new Error(`Plan rejected: the plan's file lists do not match the repository:\n- ${structural.join('\n- ')}`);
         }
+        await this.probeExternalSources(tasks, sources, requirement);
         const unrunnable = await this.probeAcceptance(tasks);
         if (unrunnable.length > 0) {
             throw new Error(`Plan rejected: these acceptance commands cannot run in this environment, so they could never gate a merge:\n- ${unrunnable.join('\n- ')}\nInstall the missing tool, or re-plan with a runnable verification_command.`);
         }
         return tasks;
+    }
+
+    /**
+     * Fetch every outside address the plan depends on before any worker
+     * runs (#82). A listed source, or a requirement URL a task uses, that does
+     * not answer as assumed rejects the plan. A URL named only in the
+     * requirement (a link in an issue's signature) is probed and reported but
+     * never rejects. Each ok source a task depends on is kept for the workshop
+     * to commit as a fixture, and the tasks that mention it are told where.
+     */
+    async probeExternalSources(tasks: Task[], sources: ExternalSource[], requirement: string): Promise<void> {
+        this.plannedSources = [];
+        const listed = new Set(sources.map(source => source.url));
+        const taskText = tasks.map(t => [t.title, t.description, ...t.acceptance_criteria, ...(t.notes_to_executor || [])].join('\n')).join('\n');
+        const fromRequirement = sourcesFromRequirement(requirement).filter(url => !listed.has(url));
+        const specs = [
+            ...sources.map(source => ({ ...source, gating: true })),
+            ...fromRequirement.map((url, i) => ({ name: `requirement-${i + 1}`, url, method: 'GET' as const, expect: 'any' as const, purpose: 'named in the requirement', gating: taskText.includes(url) })),
+        ];
+        const failures: string[] = [];
+        for (const spec of specs) {
+            const result = await probeSource(spec, this.sourceFetch);
+            const method = spec.method ?? 'GET';
+            if (!result.ok) {
+                this.log(`Source probe: ${spec.name} ${method} ${spec.url} → NOT OK: ${result.problem}${spec.gating ? '' : ' (named only in the requirement; not gating)'}`);
+                if (spec.gating) failures.push(`${spec.name} ${spec.url}: ${result.problem}`);
+                else this.plannedSources.push({ result, method });
+                continue;
+            }
+            this.log(`Source probe: ${spec.name} ${method} ${spec.url} → ${result.status} ${result.contentType || 'no content type'} ${result.bytes}B`);
+            if (!spec.gating) { this.plannedSources.push({ result, method }); continue; }
+            const fixture = `tests/fixtures/sources/${spec.name}.${fixtureExtension(spec.expect, result.contentType)}`;
+            this.plannedSources.push({ result, method, path: fixture });
+            const host = hostOf(spec.url);
+            for (const task of tasks) {
+                const text = [task.title, task.description, ...task.files_hint, ...task.creates_files].join('\n');
+                if (!text.includes(spec.name) && !(host && text.includes(host))) continue;
+                task.notes_to_executor = [...(task.notes_to_executor || []), `Real response of ${spec.name} (${spec.url}), saved by the orchestrator at ${fixture}; build and test against it.`];
+            }
+        }
+        if (failures.length) {
+            this.plannedSources = [];
+            throw new Error(`Plan rejected: these external sources do not answer as the plan assumes:\n- ${failures.join('\n- ')}`);
+        }
+    }
+
+    /** The probed sources as the state records them: no bodies. Undefined when the plan has none. */
+    plannedSourceSummaries(): FactoryState['external_sources'] {
+        if (!this.plannedSources.length) return undefined;
+        return this.plannedSources.map(({ result, method, path: fixture }) => ({
+            name: result.name, url: result.url, ok: result.ok, status: result.status, contentType: result.contentType, bytes: result.bytes, method,
+            ...(fixture ? { path: fixture } : {}), ...(result.problem ? { problem: result.problem } : {}),
+        }));
+    }
+
+    /**
+     * Commit each probed source's real response on the merge target before
+     * the first task, one commit per source, so every worktree builds and
+     * tests against what the source actually returns.
+     */
+    async commitSourceFixtures(): Promise<void> {
+        const pending = this.plannedSources.filter(source => source.result.ok && source.path);
+        this.plannedSources = [];
+        for (const source of pending) {
+            const file = path.join(this.baseDir, source.path!);
+            await fs.mkdir(path.dirname(file), { recursive: true });
+            await fs.writeFile(file, source.result.body);
+            await execa('git', ['add', '--', source.path!], { cwd: this.baseDir });
+            const commit = await execa('git', ['commit', '-q', '-m', `softfactory: probe ${source.result.name}`, '--', source.path!], { cwd: this.baseDir, reject: false });
+            if (commit.exitCode === 0) this.log(`Source fixture: committed ${source.path} (${source.result.bytes}B from ${source.result.url}).`);
+            else this.log(`Source fixture: could not commit ${source.path}: ${(commit.stderr || commit.stdout).trim().slice(0, 200)}`);
+        }
     }
 
     /** Runs each agent task's acceptance command once on the base branch, records the baseline, and returns the ones that cannot run here. */
@@ -3572,4 +3656,19 @@ export function cxScoreProblem(task: { id: string; agent_role?: string }, handof
         return `CX review ${task.id} passes ${passed} of ${applicable} applicable items (${Math.round((passed / applicable) * 100)}%), below the 70% bar: fix the failures or justify them N/A.`;
     }
     return null;
+}
+
+/** The fixture extension for a probed source: what it promised, else what it sent. */
+function fixtureExtension(expect: string | undefined, contentType: string): string {
+    if (expect && expect !== 'any') return expect;
+    const type = contentType.toLowerCase();
+    if (type.includes('json')) return 'json';
+    if (type.includes('html')) return 'html';
+    if (type.includes('xml')) return 'xml';
+    if (type.includes('csv')) return 'csv';
+    return 'txt';
+}
+
+function hostOf(url: string): string {
+    try { return new URL(url).host; } catch { return ''; }
 }

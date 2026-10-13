@@ -12,11 +12,20 @@ export type PlanDecision = 'approve' | 'abort';
 export type PlanApprover = (state: FactoryState) => Promise<PlanDecision>;
 
 /** The plan as a table a person can check in one read. */
-export function formatPlan(state: Pick<FactoryState, 'feature' | 'tasks'> & { token_estimate?: FactoryState['token_estimate'] }): string[] {
+export function formatPlan(state: Pick<FactoryState, 'feature' | 'tasks'> & { token_estimate?: FactoryState['token_estimate']; external_sources?: FactoryState['external_sources'] }): string[] {
   const lines = [`Plan: ${state.feature} (${state.tasks.length} task${state.tasks.length === 1 ? '' : 's'})`, ''];
   if (state.token_estimate) lines.splice(1, 0, `Planned budget: about ${state.token_estimate.tokens} tokens, from ${state.token_estimate.runs} past run(s)`);
+  const sources = state.external_sources ?? [];
+  if (sources.length) {
+    lines.push(...sources.map(formatSource), '');
+  }
   for (const task of state.tasks) lines.push(...formatTask(task), '');
   return lines;
+}
+
+/** One line per outside source the plan depends on, so a wrong address is visible before any task runs. */
+function formatSource(source: NonNullable<FactoryState['external_sources']>[number]): string {
+  return `source ${source.name} ${source.url} → ${source.status} ${source.contentType ?? ''} ${source.bytes ?? 0}B`;
 }
 
 function formatTask(task: Task): string[] {

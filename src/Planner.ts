@@ -45,11 +45,29 @@ const BlueprintTaskSchema = z.object({
   notes_to_executor: z.array(z.string()).default([]),
 });
 
+/**
+ * An outside address a task's code will call. Each one is fetched while the
+ * plan is prepared, so a plan built on an address that does not answer the
+ * way it assumes is rejected before any worker runs.
+ */
+export const ExternalSourceSchema = z.object({
+  name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+  url: z.string().url(),
+  method: z.preprocess(v => (String(v ?? '').toUpperCase() === 'POST' ? 'POST' : 'GET'), z.enum(['GET', 'POST'])),
+  /** GET: query parameters. POST: form fields (put query parameters a POST needs in the url). */
+  params: z.record(z.string(), z.string()).optional(),
+  expect: z.preprocess(v => (['json', 'html', 'xml', 'csv', 'any'].includes(String(v)) ? v : 'any'), z.enum(['json', 'html', 'xml', 'csv', 'any'])),
+  purpose: z.string().default(''),
+});
+
+export type ExternalSource = z.infer<typeof ExternalSourceSchema>;
+
 export const BlueprintSchema = z.object({
   feature: z.string().min(4),
   requirements_covered: z.array(z.string()).default([]),
   /** A spec, value table or rename map shared by several tasks, written once. */
   brief: z.string().max(6000).optional(),
+  external_sources: z.array(ExternalSourceSchema).default([]),
   tasks: z.array(BlueprintTaskSchema).min(1),
 });
 
@@ -89,11 +107,28 @@ export const OUTPUT_SCHEMA = {
   additionalProperties: false,
   // OpenAI strict structured output (Codex --output-schema) requires every
   // property to be listed in `required`; the model returns '' / [] when unused.
-  required: ['feature', 'requirements_covered', 'brief', 'tasks'],
+  required: ['feature', 'requirements_covered', 'brief', 'external_sources', 'tasks'],
   properties: {
     feature: { type: 'string' },
     requirements_covered: { type: 'array', items: { type: 'string' } },
     brief: { type: 'string', maxLength: 6000 },
+    // Strict output cannot express a free-form params map, so a source's
+    // query parameters travel in its url here.
+    external_sources: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'url', 'method', 'expect', 'purpose'],
+        properties: {
+          name: { type: 'string' },
+          url: { type: 'string' },
+          method: { type: 'string', enum: ['GET', 'POST'] },
+          expect: { type: 'string', enum: ['json', 'html', 'xml', 'csv', 'any'] },
+          purpose: { type: 'string' },
+        },
+      },
+    },
     tasks: {
       type: 'array',
       minItems: 1,
@@ -160,6 +195,7 @@ LOCAL WORKER CONSTRAINT — these tasks will be executed by a 7B/14B model, not 
 - executor is a safety boundary: "agent" (default) is repository work a worker verifies in its worktree; "orchestrator" touches the host or a live system (secrets, .env, host config, deploys, restarts, git push, live migrations); "user" is a product decision. Split such work out of agent tasks. promotion "test" stops user-facing or money-moving work at TEST until a person promotes it.
 - window: orchestrator or user tasks with the same window land together in one step (a config change, a secret and a restart); an agent task never has a window.
 - verification_command: ONE command, run verbatim as the merge gate, testing only this task's own file (never the whole suite). No shell operators. Executable: npm, pnpm, yarn, node, go, pytest, python3, cargo, git, tsc, eslint, vitest, make, or a read-only tool (grep, rg, ls, cat, head, tail, wc), optionally piped into another. No npx ("npm test -- --run src/x.test.ts"); a preload may name a package, never a file. A check needing the running system is "orchestrator: <command>".
+- external_sources: list every outside URL or API that any task's code will call (a website, a public API, a data feed), each with its exact url and method, the shape it returns (expect) and its purpose. Each one is fetched before any task runs, and a source that does not answer as listed rejects the plan, so use the real address you know, never a guessed one. Put query parameters in the url. A task may not call an outside URL that is not listed here. An empty list when the code calls nothing outside.
 - review_questions: for a task that touches authentication, authorization, tenancy, payments, ledgers, cryptography or secrets, give 3 to 6 questions an independent reviewer will verify against the diff ("where is the tenant checked before the query, and which test proves the fail-closed path?"). Otherwise an empty list.`;
 
 function escalationBlock(recurring?: string[]): string {
@@ -226,6 +262,7 @@ Return ONLY a JSON object with exactly these keys:
 {
   "feature": "short feature name",
   "requirements_covered": ["each ## or ### heading from the requirement, copied verbatim"],
+  "external_sources": [{"name": "rates-api", "url": "https://example.org/api/rates?date=2026-01-02", "method": "GET", "expect": "json", "purpose": "daily rates the parser reads"}],
   "tasks": [
     {
       "id": "T1",
