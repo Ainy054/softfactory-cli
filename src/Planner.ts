@@ -51,7 +51,8 @@ const BlueprintTaskSchema = z.object({
  * way it assumes is rejected before any worker runs.
  */
 export const ExternalSourceSchema = z.object({
-  name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+  // A name becomes a fixture file name; "mongolbank rates" is slugged, not rejected.
+  name: z.preprocess(v => String(v ?? '').trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+|-+$/g, ''), z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)),
   url: z.string().url(),
   method: z.preprocess(v => (String(v ?? '').toUpperCase() === 'POST' ? 'POST' : 'GET'), z.enum(['GET', 'POST'])),
   /** GET: query parameters. POST: form fields (put query parameters a POST needs in the url). */
