@@ -61,6 +61,15 @@ export interface WorkerOptions {
  * Only a line that is exactly that phrase counts: an agent's output can echo
  * its prompt, which contains the phrase inside the request itself.
  */
+/**
+ * A prompt that travels as a command-line argument. The OS rejects NUL bytes in
+ * argv ("Arguments cannot contain null bytes"), and one binary file read into
+ * the context once ended planning before it started.
+ */
+export function argvText(text: string): string {
+  return text.includes('\0') ? text.replace(/\0/g, '') : text;
+}
+
 export function affirmsLiveStackUntouched(output: string | undefined): boolean {
   return String(output ?? '').split('\n').some(line => /^["'`*\s]*live stack untouched[."'`*\s]*$/i.test(line));
 }

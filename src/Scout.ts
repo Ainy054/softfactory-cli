@@ -103,6 +103,9 @@ export async function scout(baseDir: string, requirement: string, files: string[
         } catch {
             continue;
         }
+        // A binary file (a committed .pyc, an image) is not evidence, and its
+        // NUL bytes would end up in the planner's command line.
+        if (content.includes('\0')) continue;
 
         const lowerPath = file.toLowerCase();
         const lines = content.split('\n');
