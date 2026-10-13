@@ -2308,7 +2308,11 @@ export class Factory extends EventEmitter {
     async probeExternalSources(tasks: Task[], sources: ExternalSource[], requirement: string): Promise<void> {
         this.plannedSources = [];
         const listed = new Set(sources.map(source => source.url));
-        const taskText = tasks.map(t => [t.title, t.description, ...t.acceptance_criteria, ...(t.notes_to_executor || [])].join('\n')).join('\n');
+        // Only work that ships code can depend on a URL. A test writer, or a
+        // task that only touches tests, quotes URLs as test data (#86's issue
+        // used the dead mongolbank URL as an example input).
+        const shipsCode = (t: Task) => t.agent_role !== 'test_writer' && [...t.files_hint, ...t.creates_files].some(file => !isTestFilePath(file));
+        const taskText = tasks.filter(shipsCode).map(t => [t.title, t.description, ...t.acceptance_criteria, ...(t.notes_to_executor || [])].join('\n')).join('\n');
         const fromRequirement = sourcesFromRequirement(requirement).filter(url => !listed.has(url));
         const specs = [
             ...sources.map(source => ({ ...source, gating: true })),
