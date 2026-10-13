@@ -3,7 +3,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { WorkerEnvironmentError } from './IWorker.js';
+import { WorkerEnvironmentError, argvText } from './IWorker.js';
 
 export interface CompletionOptions {
   timeoutMs?: number;
@@ -141,7 +141,7 @@ export class AgyTextModel implements ITextModel {
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     let output: string;
     try {
-      const { stdout, stderr } = await execa('agy', ['--dangerously-skip-permissions', '--model', this.model, '--print', prompt],
+      const { stdout, stderr } = await execa('agy', ['--dangerously-skip-permissions', '--model', this.model, '--print', argvText(prompt)],
         { timeout: options.timeoutMs ?? 300000 });
       output = (stdout || stderr || '').trim();
     } catch (error: any) {
@@ -167,7 +167,7 @@ export class CodexTextModel implements ITextModel {
     try {
       await execa('codex', [
         'exec', '--sandbox', 'read-only', '--ephemeral', '--output-last-message', outputPath,
-        ...(this.model ? ['--model', this.model] : []), prompt,
+        ...(this.model ? ['--model', this.model] : []), argvText(prompt),
       ], { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000, all: true });
       return (await fs.readFile(outputPath, 'utf8')).trim();
     } catch (error: any) {
@@ -191,7 +191,7 @@ export class ClaudeCodeTextModel implements ITextModel {
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     let data: any;
     try {
-      const { stdout } = await execa('claude', ['-p', prompt, '--output-format', 'json', '--bare', '--no-session-persistence', '--max-turns', '1', '--restricted', '--permission-mode', 'dontAsk', ...(this.model ? ['--model', this.model] : [])],
+      const { stdout } = await execa('claude', ['-p', argvText(prompt), '--output-format', 'json', '--bare', '--no-session-persistence', '--max-turns', '1', '--restricted', '--permission-mode', 'dontAsk', ...(this.model ? ['--model', this.model] : [])],
         { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 });
       data = JSON.parse(stdout.slice(stdout.indexOf('{')));
     } catch (error: any) {
@@ -216,7 +216,7 @@ export class GeminiCliTextModel implements ITextModel {
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     let data: any;
     try {
-      const { stdout } = await execa('gemini', ['-p', prompt, '--output-format', 'json', '--approval-mode', 'default', ...(this.model ? ['-m', this.model] : [])],
+      const { stdout } = await execa('gemini', ['-p', argvText(prompt), '--output-format', 'json', '--approval-mode', 'default', ...(this.model ? ['-m', this.model] : [])],
         { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 });
       data = JSON.parse(stdout.slice(stdout.indexOf('{')));
     } catch (error: any) {
@@ -241,7 +241,7 @@ export class MuseTextModel implements ITextModel {
   async complete(prompt: string, options: CompletionOptions = {}): Promise<string> {
     let stdout: string;
     try {
-      ({ stdout } = await execa('muse', ['exec', '--json', '--no-session-log', '--disable-web-tools', '--disable-shell', '--disable-write', '--approval-mode', 'never', '--max-model-steps', '1', ...(this.model ? ['--model', this.model] : []), prompt],
+      ({ stdout } = await execa('muse', ['exec', '--json', '--no-session-log', '--disable-web-tools', '--disable-shell', '--disable-write', '--approval-mode', 'never', '--max-model-steps', '1', ...(this.model ? ['--model', this.model] : []), argvText(prompt)],
         { cwd: this.cwd, stdin: 'ignore', timeout: options.timeoutMs ?? 300000 }));
     } catch (error: any) {
       throw new WorkerEnvironmentError(`Muse failed for ${this.model || 'its default model'}: ${(error?.shortMessage || error?.message || 'unknown error').slice(0, 300)}`);

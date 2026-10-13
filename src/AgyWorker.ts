@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, HandoffSchema, Handoff } from './types.js';
-import { IWorker, WorkerOptions, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
+import { IWorker, WorkerOptions, argvText, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 import { AgyStreamRelay } from './AgyStream.js';
 
 
@@ -118,7 +118,7 @@ A claim whose cited line does not exist rejects the task.
       '--model', selectedModel,
       '--dangerously-skip-permissions',
       '--output-format', 'stream-json',
-      '--print', prompt
+      '--print', argvText(prompt)
     ];
 
     const useStreaming = onOutput && !streamToTerminal;

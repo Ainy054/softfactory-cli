@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, requirementSection, backendRefusal, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, argvText, requirementSection, backendRefusal, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 import os from 'node:os';
 import { npmInstall, type AgentSpec } from './AgentContainer.js';
 
@@ -61,7 +61,7 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
     authFailure: /not logged in|please run \/login|invalid api key|authentication_error|401/i,
     args(prompt, model, placement) {
       // stream-json gives one line per event, so progress reaches the TUI as it happens.
-      const base = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--bare', ...(model ? ['--model', model] : [])];
+      const base = ['-p', argvText(prompt), '--output-format', 'stream-json', '--verbose', '--no-session-persistence', '--bare', ...(model ? ['--model', model] : [])];
       return placement === 'container'
         ? [...base, '--permission-mode', 'bypassPermissions']
         : [...base, '--permission-mode', 'acceptEdits', '--allowedTools', CLAUDE_HOST_TOOLS.join(' ')];
@@ -97,7 +97,7 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
     authFailure: /not authenticated|api key not valid|please set an auth method|401|PERMISSION_DENIED/i,
     args(prompt, model, placement) {
       // auto_edit approves edits only; inside the container the agent may also run commands.
-      return ['-p', prompt, '--output-format', 'json', '--approval-mode', placement === 'container' ? 'yolo' : 'auto_edit', ...(model ? ['-m', model] : [])];
+      return ['-p', argvText(prompt), '--output-format', 'json', '--approval-mode', placement === 'container' ? 'yolo' : 'auto_edit', ...(model ? ['-m', model] : [])];
     },
     parse(stdout) {
       const start = stdout.indexOf('{');
@@ -143,8 +143,8 @@ export const CLI_AGENTS: Record<CliAgentId, CliAgentDefinition> = {
       // --yolo turns its sandbox and approvals off: the container is the boundary.
       const base = ['exec', '--json', '--no-session-log', '--disable-web-tools', ...(model ? ['--model', model] : [])];
       return placement === 'container'
-        ? [...base, '--yolo', prompt]
-        : [...base, '--approval-mode', 'never', prompt];
+        ? [...base, '--yolo', argvText(prompt)]
+        : [...base, '--approval-mode', 'never', argvText(prompt)];
     },
     parse(stdout) {
       let text = '';

@@ -2,7 +2,7 @@ import { execa } from 'execa';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Task, Handoff, HandoffSchema } from './types.js';
-import { IWorker, WorkerOptions, WorkerEnvironmentError, backendRefusal, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
+import { IWorker, WorkerOptions, WorkerEnvironmentError, argvText, backendRefusal, requirementSection, acceptanceLine, briefSection, wiringSection, affirmsLiveStackUntouched } from './IWorker.js';
 
 /** Runs the authenticated Codex CLI directly inside the isolated worktree. */
 export class CodexWorker implements IWorker {
@@ -63,7 +63,7 @@ Before finishing, write ${handoffPath} as JSON with task_id, status, files_chang
 
 /** Build a non-interactive invocation. --approve-for-me already implies workspace-write. */
 export function buildCodexExecArgs(prompt: string, model?: string): string[] {
-  return ['exec', '--approve-for-me', ...(model ? ['--model', model] : []), prompt];
+  return ['exec', '--approve-for-me', ...(model ? ['--model', model] : []), argvText(prompt)];
 }
 
 /** Prevent Codex from waiting for additional input after the prompt argument. */
