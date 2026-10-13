@@ -58,6 +58,14 @@ describe('probeSource classifies an outside source before the plan is built', ()
     assert.match(result.problem ?? '', /success: false/);
   });
 
+  it('accepts JSON whose error field is empty, and rejects one that carries an error', async () => {
+    const respond = (body: unknown) => (async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+    assert.equal((await probeSource({ name: 'a', url: 'https://api.example.org/x', expect: 'json' }, respond({ data: [1], error: null }))).ok, true);
+    const bad = await probeSource({ name: 'a', url: 'https://api.example.org/x', expect: 'json' }, respond({ error: 'quota exceeded' }));
+    assert.equal(bad.ok, false);
+    assert.match(bad.problem ?? '', /error/);
+  });
+
   it('rejects HTML when JSON was expected', async () => {
     const html = '<!doctype html><html><body>' + 'welcome '.repeat(60) + '</body></html>';
     const fetchImpl = (async () => response(html, 200, 'text/html')) as typeof fetch;

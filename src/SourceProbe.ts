@@ -197,7 +197,9 @@ function classify(result: SourceProbeResult, expect: SourceExpect): string | und
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       const record = parsed as Record<string, unknown>;
       if (record.success === false) return 'JSON body reports success: false';
-      if (Object.prototype.hasOwnProperty.call(record, 'error')) return 'JSON body has a top-level "error" key';
+      // Many healthy APIs always send "error": null; only a real error counts.
+      const error = record.error;
+      if (error !== undefined && error !== null && error !== false && error !== '' && !(typeof error === 'object' && Object.keys(error).length === 0)) return 'JSON body has a top-level "error"';
     }
   }
   return undefined;
