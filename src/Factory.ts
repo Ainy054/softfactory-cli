@@ -2272,7 +2272,7 @@ export class Factory extends EventEmitter {
             this.log(`Planner draft rejected at the acceptance probe; re-planning once with the reason.`);
             const feedback = String(error.message).split('\n').filter((line: string) => line.startsWith('- ')).join('\n');
             const sourceAdvice = /external sources do not answer/.test(String(error.message))
-                ? ' Find the real endpoint; do not guess. If you cannot, list the source anyway and the run will stop for the user.'
+                ? ' Find the real endpoint the code calls; do not guess. A URL that is only test data or an example is not a source: remove it from external_sources. If the code really calls it and you cannot find the right address, list it anyway and the run will stop for the user.'
                 : '';
             blueprint = await this.planner.generateBlueprint({
                 ...input,
@@ -2299,31 +2299,27 @@ export class Factory extends EventEmitter {
 
     /**
      * Fetch every outside address the plan depends on before any worker
-     * runs (#82). A listed source, or a requirement URL a task uses, that does
-     * not answer as assumed rejects the plan. A URL named only in the
-     * requirement (a link in an issue's signature) is probed and reported but
-     * never rejects. Each ok source a task depends on is kept for the workshop
+     * runs (#82). A source the plan lists that does not answer as assumed
+     * rejects the plan. A URL written in the requirement is probed and
+     * reported but never rejects: it is as often a signature link or test data
+     * as an address the code calls (#86's issue quoted a dead URL as an
+     * example input, and guessing which it was from task text failed twice). Each ok source a task depends on is kept for the workshop
      * to commit as a fixture, and the tasks that mention it are told where.
      */
     async probeExternalSources(tasks: Task[], sources: ExternalSource[], requirement: string): Promise<void> {
         this.plannedSources = [];
         const listed = new Set(sources.map(source => source.url));
-        // Only work that ships code can depend on a URL. A test writer, or a
-        // task that only touches tests, quotes URLs as test data (#86's issue
-        // used the dead mongolbank URL as an example input).
-        const shipsCode = (t: Task) => t.agent_role !== 'test_writer' && [...t.files_hint, ...t.creates_files].some(file => !isTestFilePath(file));
-        const taskText = tasks.filter(shipsCode).map(t => [t.title, t.description, ...t.acceptance_criteria, ...(t.notes_to_executor || [])].join('\n')).join('\n');
         const fromRequirement = sourcesFromRequirement(requirement).filter(url => !listed.has(url));
         const specs = [
             ...sources.map(source => ({ ...source, gating: true })),
-            ...fromRequirement.map((url, i) => ({ name: `requirement-${i + 1}`, url, method: 'GET' as const, expect: 'any' as const, purpose: 'named in the requirement', gating: taskText.includes(url) })),
+            ...fromRequirement.map((url, i) => ({ name: `requirement-${i + 1}`, url, method: 'GET' as const, expect: 'any' as const, purpose: 'named in the requirement', gating: false })),
         ];
         const failures: string[] = [];
         for (const spec of specs) {
             const result = await probeSource(spec, this.sourceFetch);
             const method = spec.method ?? 'GET';
             if (!result.ok) {
-                this.log(`Source probe: ${spec.name} ${method} ${spec.url} → NOT OK: ${result.problem}${spec.gating ? '' : ' (named only in the requirement; not gating)'}`);
+                this.log(`Source probe: ${spec.name} ${method} ${spec.url} → NOT OK: ${result.problem}${spec.gating ? '' : ' (named in the requirement; not gating)'}`);
                 if (spec.gating) failures.push(`${spec.name} ${spec.url}: ${result.problem}`);
                 else this.plannedSources.push({ result, method });
                 continue;

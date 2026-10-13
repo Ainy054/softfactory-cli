@@ -67,7 +67,7 @@ describe('external sources are probed when the plan is prepared', () => {
     const { tasks } = await f.planTasks(planningInput());
     assert.equal(requirements.length, 2);
     assert.match(requirements[1], /bom-rates https:\/\/www\.mongolbank\.mn\/en\/rates: .*404/i);
-    assert.match(requirements[1], /Find the real endpoint; do not guess/);
+    assert.match(requirements[1], /Find the real endpoint the code calls; do not guess[\s\S]*only test data or an example is not a source/);
     assert.ok(tasks[0].notes_to_executor.some((n: string) => n.includes('tests/fixtures/sources/bom-rates.json')), 'the task that uses the source is told where its real response is');
     assert.ok(!tasks[1].notes_to_executor.some((n: string) => n.includes('bom-rates')), 'an unrelated task is not');
     const [summary] = f.plannedSourceSummaries();
@@ -84,19 +84,23 @@ describe('external sources are probed when the plan is prepared', () => {
     assert.equal(calls, 2);
   });
 
-  it('reports a failing URL named only in the requirement without rejecting, unless a task uses it', async () => {
+  it('reports a failing URL named in the requirement without rejecting, even when a task quotes it', async () => {
     const f = factoryOn(await repo());
     f.sourceFetch = fakeFetch({
       'https://claude.ai/code/session': { status: 403, type: 'text/html', body: 'forbidden' },
       'https://www.mongolbank.mn/en/currency-rates/data': { type: 'application/json', body: RATES },
     });
-    const ok = blueprint('https://www.mongolbank.mn/en/currency-rates/data');
-    f.planner = { provider: 'deepseek', generateBlueprint: async () => ok };
+    const quoted = blueprint('https://www.mongolbank.mn/en/currency-rates/data', 'Read https://claude.ai/code/session_123 and parse it in src/rates.ts');
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => quoted };
     await f.planTasks(planningInput('Serve rates.\n\nhttps://claude.ai/code/session_123'));
     assert.ok(f.logs.some((l: string) => /requirement-1 GET https:\/\/claude\.ai\/code\/session_123 → NOT OK.*not gating/.test(l)), f.logs.join('\n'));
-    const used = blueprint('https://www.mongolbank.mn/en/currency-rates/data', 'Read https://claude.ai/code/session_123 and parse it in src/rates.ts');
-    f.planner = { provider: 'deepseek', generateBlueprint: async () => used };
-    await assert.rejects(f.planTasks(planningInput('Serve rates.\n\nhttps://claude.ai/code/session_123')), /requirement-1 https:\/\/claude\.ai\/code\/session_123/);
+  });
+
+  it('slugs a source name instead of rejecting the plan', async () => {
+    const { validateBlueprint } = await import('./Planner.js');
+    const plan = { feature: 'Rates', requirements_covered: [], external_sources: [{ name: 'mongolbank rates', url: 'https://www.mongolbank.mn/en/currency-rates/data', method: 'POST', expect: 'json', purpose: '' }],
+      tasks: [{ id: 'T1', title: 'Parse rates', description: 'Parse the rates response', agent_role: 'coder', phase: 1, files_hint: ['README.md'], acceptance_criteria: ['parses'], verification: ['npm test'] }] };
+    assert.equal(validateBlueprint(plan, planningInput() as any).external_sources[0].name, 'mongolbank-rates');
   });
 
   it('commits each ok source as a fixture on the merge target before the first task', async () => {
