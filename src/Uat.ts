@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import { execa } from 'execa';
+import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { changedRoutes, type Environment } from './Environment.js';
 
@@ -84,11 +85,31 @@ export function fallbackUat(env: Environment, changedFiles: string[]): UatConfig
   return config;
 }
 
-export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string }>;
+export type ShellRunner = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ exitCode: number; output: string; pid?: number }>;
 
 const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
-  const result = await execa('sh', ['-c', command], { cwd, env: { ...process.env, ...env }, timeout: timeoutMs, reject: false, all: true });
-  return { exitCode: result.exitCode ?? (result.timedOut ? 124 : 1), output: String(result.all ?? '') };
+  // Output goes to a file, never to a pipe. A runner that waits for the output
+  // pipes to close (as `execa` does) hangs until its timeout when a command
+  // backgrounds a server (`uvicorn app.main:app &`), because the child inherits
+  // the pipes; a file is inherited too, but nobody waits for it to close.
+  const outputFile = path.join(os.tmpdir(), `softfactory-uat-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+  const handle = await fs.open(outputFile, 'w+');
+  try {
+    // Each command gets its own process group. A non-interactive `sh` has no
+    // job control, so a child started with `&` stays in this group, and the
+    // group id (the shell's pid) lets `runUat` stop everything setup left.
+    const child = spawn('sh', ['-c', command], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', handle.fd, handle.fd], detached: true });
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; signalGroup(child.pid, 'SIGTERM'); }, timeoutMs);
+    const exitCode = await new Promise<number>(resolve => {
+      child.once('error', () => resolve(127));
+      child.once('exit', code => resolve(code ?? 1));
+    }).finally(() => clearTimeout(timer));
+    return { exitCode: timedOut ? 124 : exitCode, output: await fs.readFile(outputFile, 'utf8'), pid: child.pid };
+  } finally {
+    await handle.close().catch(() => {});
+    await fs.rm(outputFile, { force: true }).catch(() => {});
+  }
 };
 
 const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
@@ -130,10 +151,12 @@ export async function runUat(
   const timeoutMs = config.timeout_seconds * 1000;
   const steps: UatStep[] = [];
   const transcript: string[] = [];
+  /** Process groups the setup steps started, by shell pid; stopped in the finally below. */
+  const setupGroups: number[] = [];
   const run = async (name: string, command: string) => {
-    const { exitCode, output } = await shell(command, { cwd: baseDir, env, timeoutMs });
+    const { exitCode, output, pid } = await shell(command, { cwd: baseDir, env, timeoutMs });
     transcript.push(`$ ${command}  # ${name}`, output.trimEnd(), `exit_code: ${exitCode}`, '');
-    return { exitCode, output };
+    return { exitCode, output, pid };
   };
   const substitute = (text: string) => text.replace(/\$SOFTFACTORY_RUN_ID|\$\{SOFTFACTORY_RUN_ID\}/g, options.runId);
 
@@ -176,7 +199,10 @@ export async function runUat(
       failed = true;
     }
     for (const [index, command] of (failed ? [] : config.setup).entries()) {
-      const { exitCode, output } = await run(`setup ${index + 1}`, command);
+      const { exitCode, output, pid } = await run(`setup ${index + 1}`, command);
+      // Remember every setup step that ran: mongolbank-rates' `uvicorn app.main:app
+      // --port 8000 &` was still holding port 8000 three hours after the run.
+      if (pid !== undefined) setupGroups.push(pid);
       steps.push({ name: `setup ${index + 1}`, command, passed: exitCode === 0, detail: exitCode === 0 ? 'ok' : `exit ${exitCode}: ${tail(output)}` });
       if (exitCode !== 0) { failed = true; break; }
     }
@@ -217,6 +243,11 @@ export async function runUat(
       const { exitCode } = await run(`teardown ${index + 1}`, command).catch(() => ({ exitCode: 1 }));
       if (exitCode !== 0) log(`UAT teardown ${index + 1} exited ${exitCode}: ${command}`);
     }
+    // mongolbank-rates (f-20261013073810): setup ended with `uvicorn app.main:app
+    // --port 8000 &` and there was no teardown, so the server outlived the run and
+    // held port 8000. Whatever setup started and nothing stopped is stopped here.
+    const stopped = await stopProcessGroups(setupGroups);
+    if (stopped) log(`UAT: stopped ${stopped} background process group(s) left by setup`);
   }
 
   let evidencePath: string | undefined;
@@ -237,6 +268,41 @@ export async function runUat(
     ].join('\n'), 'utf8');
   }
   return { configured: true, passed: !failed, steps, evidencePath };
+}
+
+/**
+ * Stops the process groups setup left running, on POSIX. Each id is the pid of
+ * the shell that ran the step (its own group, see `hostShell`), which is also
+ * the group a backgrounded child inherited. SIGTERM first, five seconds for the
+ * group to go, then SIGKILL for the survivors. A group that is already gone
+ * (teardown stopped it, or it exited on its own) does not count. Never throws:
+ * it runs in `runUat`'s finally, and cleanup must not turn a result into a crash.
+ * Returns how many groups actually had to be stopped.
+ */
+async function stopProcessGroups(pids: number[]): Promise<number> {
+  let stopped = 0;
+  for (const pid of pids) {
+    if (!signalGroup(pid, 'SIGTERM')) continue;
+    stopped++;
+    if (await groupGone(pid, 5_000)) continue;
+    signalGroup(pid, 'SIGKILL');
+    await groupGone(pid, 2_000);
+  }
+  return stopped;
+}
+
+/** Signals a process group; false when it no longer exists or cannot be signalled. Windows has no groups to signal. */
+function signalGroup(pid: number | undefined, signal: NodeJS.Signals | 0): boolean {
+  if (!pid || process.platform === 'win32') return false;
+  try { process.kill(-pid, signal); return true; } catch { return false; }
+}
+
+async function groupGone(pid: number, withinMs: number): Promise<boolean> {
+  for (const deadline = Date.now() + withinMs; Date.now() < deadline;) {
+    if (!signalGroup(pid, 0)) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  return !signalGroup(pid, 0);
 }
 
 function tail(output: string, chars = 240): string {
