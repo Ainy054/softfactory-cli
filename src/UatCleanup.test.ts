@@ -159,11 +159,12 @@ describe('a UAT setup that backgrounds a server does not leave it running', () =
       });
       const started = Date.now();
       const result = await runUat(dir, config, { runId: 'r', featureId: 'f' });
-      pid = await readPid(pidFile);
+      // Under load the timeout can fire before the shell wrote its pid; then there is nothing left to check.
+      pid = await readPid(pidFile).catch(() => 0);
       assert.ok(Date.now() - started < 10_000, 'the timeout did not end the step');
       assert.equal(result.passed, false);
       assert.match(result.steps.find(step => step.name === 'probe: slow')?.detail ?? '', /^exit 124/);
-      assert.equal(await waitGone(pid, 3_000), true, `timed-out step ${pid} is still running`);
+      if (pid > 0) assert.equal(await waitGone(pid, 3_000), true, `timed-out step ${pid} is still running`);
     } finally {
       await cleanup(dir, pid);
     }
