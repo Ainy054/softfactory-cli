@@ -206,11 +206,25 @@ export class TaskVerifier {
           output: this.clip(stdout || stderr),
         };
       } catch (e: any) {
+        // pytest exits 5 when it collects no tests. In a new project the first
+        // task (requirements.txt, .gitignore) makes the repo look like Python
+        // before any test exists, so treating 5 as a failure gave the
+        // mongolbank-fastapi demo's T1 a task it could never pass. With no test
+        // files named by the task, "nothing to run yet" is not a failure; a test
+        // file the task names that holds no tests still is.
+        if (e.exitCode === 5 && pythonTests.length === 0) {
+          return {
+            executed: false,
+            passed: true,
+            testSummary: 'pytest collected no tests: the project has none yet',
+            output: this.clip(e.stdout || e.stderr || e.message),
+          };
+        }
         if (e.exitCode !== undefined) {
           return {
             executed: true,
             passed: false,
-            testSummary: 'pytest failure',
+            testSummary: e.exitCode === 5 ? 'pytest collected no tests from the task\'s test files' : 'pytest failure',
             output: this.clip(e.stdout || e.stderr || e.message),
           };
         }
