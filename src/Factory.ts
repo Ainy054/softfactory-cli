@@ -2373,7 +2373,13 @@ export class Factory extends EventEmitter {
     async probeExternalSources(tasks: Task[], sources: ExternalSource[], requirement: string): Promise<void> {
         this.plannedSources = [];
         const listed = new Set(sources.map(source => source.url));
-        const fromRequirement = sourcesFromRequirement(requirement).filter(url => !listed.has(url));
+        // #102: the mongolbank-fastapi requirement wrote the endpoint as
+        // `...data?startDate=YYYY-MM-DD`; probing that as a GET logged a soft 404
+        // for an address the plan already probed correctly. A placeholder or an
+        // address a listed source already covers is not probed again.
+        const listedAddresses = new Set(sources.map(source => addressOf(source.url)).filter(Boolean));
+        const fromRequirement = sourcesFromRequirement(requirement)
+            .filter(url => !listed.has(url) && !URL_PLACEHOLDER.test(url) && !listedAddresses.has(addressOf(url)));
         const specs = [
             ...sources.map(source => ({ ...source, gating: true })),
             ...fromRequirement.map((url, i) => ({ name: `requirement-${i + 1}`, url, method: 'GET' as const, expect: 'any' as const, purpose: 'named in the requirement', gating: false })),
@@ -2402,6 +2408,31 @@ export class Factory extends EventEmitter {
         if (failures.length) {
             this.plannedSources = [];
             throw new Error(`Plan rejected: these external sources do not answer as the plan assumes:\n- ${failures.join('\n- ')}`);
+        }
+        this.dropSourceFixtures(tasks);
+    }
+
+    /**
+     * #102: the mongolbank-fastapi plan told T1 to create
+     * tests/fixtures/mongolbank_sample.json while a probed source made any
+     * worker-written fixture an invented one, so writing it failed
+     * `invented_fixture` and skipping it failed `missing_declared_files`, five
+     * times. Once a source is probed, fixture data comes only from the
+     * orchestrator: such paths leave the plan, and the task is told what to use.
+     */
+    dropSourceFixtures(tasks: Task[]): void {
+        const probePaths = this.plannedSources.map(source => source.path).filter((p): p is string => Boolean(p));
+        if (!probePaths.length) return;
+        const forbidden = (file: string) => inventedFixtures([file], '', probePaths).length > 0;
+        // A saved response may be read (files_hint) but never created or edited.
+        const isProbe = (file: string) => probePaths.includes(file.replace(/\\/g, '/').trim());
+        for (const task of tasks) {
+            const removed = [...new Set([...task.creates_files.filter(forbidden), ...task.files_hint.filter(file => forbidden(file) && !isProbe(file))])];
+            if (!removed.length) continue;
+            task.creates_files = task.creates_files.filter(file => !forbidden(file));
+            task.files_hint = task.files_hint.filter(file => !forbidden(file) || isProbe(file));
+            task.notes_to_executor = [...(task.notes_to_executor || []), `Do not create ${removed.join(', ')}: fixture data for an external source comes only from the orchestrator. Use ${probePaths.join(', ')}, and build variants (an empty result, a null value) inside the test code from that response.`];
+            this.log(`Planning check: ${task.id} declared fixture files for an external source (${removed.join(', ')}); removed, use ${probePaths.join(', ')}`);
         }
     }
 
@@ -3861,6 +3892,13 @@ function fixtureExtension(expect: string | undefined, contentType: string): stri
     if (type.includes('xml')) return 'xml';
     if (type.includes('csv')) return 'csv';
     return 'txt';
+}
+
+const URL_PLACEHOLDER = /YYYY|MM-DD|\{[^}]*\}|<[^>]*>/;
+
+/** Origin plus path: the same endpoint whatever its query string. */
+function addressOf(url: string): string {
+    try { const parsed = new URL(url); return `${parsed.origin}${parsed.pathname}`; } catch { return ''; }
 }
 
 function hostOf(url: string): string {

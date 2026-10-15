@@ -142,3 +142,60 @@ describe('external sources are probed when the plan is prepared', () => {
     assert.ok(f.logs.some((l: string) => /requirement-1 GET https:\/\/www\.mongolbank\.mn\/en\/rates → NOT OK.*not gating/.test(l)), f.logs.join('\n'));
   });
 });
+
+// #102: the mongolbank-fastapi plan told T1 to create
+// tests/fixtures/mongolbank_sample.json beside a probed source, so writing it
+// failed invented_fixture and skipping it failed missing_declared_files.
+describe('a probed source owns its fixture data', () => {
+  const SOURCE = 'https://www.mongolbank.mn/en/currency-rates/data?startDate=2026-10-01&endDate=2026-10-02';
+  const FIXTURES = ['tests/fixtures/mongolbank_sample.json', 'tests/fixtures/mongolbank_empty.json'];
+  const setupPlan = (sources: unknown[]) => ({
+    feature: 'Rates', requirements_covered: [], external_sources: sources,
+    tasks: [{
+      id: 'T1', title: 'Project setup', description: 'Save real bom-rates sample responses and add tests/conftest.py', agent_role: 'coder', phase: 1,
+      files_hint: ['requirements.txt', 'tests/conftest.py', 'tests/fixtures/sources/bom-rates.json', ...FIXTURES],
+      creates_files: ['requirements.txt', 'tests/conftest.py', ...FIXTURES],
+      verification_command: 'grep -q fastapi requirements.txt',
+    }],
+  });
+
+  it('removes fixture paths a task declared for the source, keeps the saved response readable, and says what to use', async () => {
+    const f = factoryOn(await repo());
+    f.sourceFetch = fakeFetch({ 'https://www.mongolbank.mn/en/currency-rates/data': { type: 'application/json', body: RATES } });
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => setupPlan([{ name: 'bom-rates', url: SOURCE, method: 'POST', expect: 'json', purpose: 'daily rates' }]) };
+    const { tasks } = await f.planTasks(planningInput());
+    assert.deepEqual(tasks[0].creates_files, ['requirements.txt', 'tests/conftest.py']);
+    assert.deepEqual(tasks[0].files_hint, ['requirements.txt', 'tests/conftest.py', 'tests/fixtures/sources/bom-rates.json']);
+    assert.ok(tasks[0].notes_to_executor.some((n: string) => n.startsWith('Do not create tests/fixtures/mongolbank_sample.json, tests/fixtures/mongolbank_empty.json') && n.includes('tests/fixtures/sources/bom-rates.json')), tasks[0].notes_to_executor.join('\n'));
+    assert.ok(f.logs.some((l: string) => /Planning check: T1 declared fixture files for an external source/.test(l)), f.logs.join('\n'));
+  });
+
+  it('leaves the fixture paths alone when no source was probed', async () => {
+    const f = factoryOn(await repo());
+    f.sourceFetch = async () => { throw new Error('must not fetch'); };
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => setupPlan([]) };
+    const { tasks } = await f.planTasks(planningInput());
+    assert.deepEqual(tasks[0].creates_files, ['requirements.txt', 'tests/conftest.py', ...FIXTURES]);
+  });
+
+  it('does not probe a requirement URL with placeholders or one a listed source already covers', async () => {
+    const f = factoryOn(await repo());
+    const seen: string[] = [];
+    const routes = fakeFetch({ 'https://www.mongolbank.mn/en/currency-rates/data': { type: 'application/json', body: RATES } });
+    f.sourceFetch = (async (input: any, init?: any) => { seen.push(String(input)); return routes(input, init); }) as typeof fetch;
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => blueprint(SOURCE) };
+    await f.planTasks(planningInput('POST https://www.mongolbank.mn/en/currency-rates/data?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD and https://www.mongolbank.mn/en/currency-rates/data?startDate=2001-01-02'));
+    assert.deepEqual(seen, [SOURCE]);
+  });
+
+  it('still probes a requirement URL on another path, as advisory', async () => {
+    const f = factoryOn(await repo());
+    f.sourceFetch = fakeFetch({
+      'https://www.mongolbank.mn/en/currency-rates/data': { type: 'application/json', body: RATES },
+      'https://www.mongolbank.mn/en/rates': { type: 'text/html', body: SOFT_404 },
+    });
+    f.planner = { provider: 'deepseek', generateBlueprint: async () => blueprint(SOURCE) };
+    await f.planTasks(planningInput('The old scraper read https://www.mongolbank.mn/en/rates'));
+    assert.ok(f.logs.some((l: string) => /requirement-1 GET https:\/\/www\.mongolbank\.mn\/en\/rates → NOT OK.*not gating/.test(l)), f.logs.join('\n'));
+  });
+});
