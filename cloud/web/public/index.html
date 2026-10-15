@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asla Softfactory</title>
+<style>
+  :root { --ink:#202124; --muted:#5f6368; --line:#dadce0; --tint:#f1f3f4; --blue:#1a73e8; --green:#188038; --red:#d93025; --amber:#f9ab00; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 Arial, sans-serif; color:var(--ink); background:#fff; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); }
+  header b { color:var(--blue); }
+  main { display:grid; grid-template-columns: minmax(280px, 1fr) 1.4fr; gap:24px; padding:24px; max-width:1200px; margin:auto; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; padding:16px; } }
+  h2 { font-size:16px; margin:0 0 10px; }
+  textarea { width:100%; min-height:150px; padding:12px; border:1px solid var(--line); border-radius:8px; font:inherit; background:var(--tint); }
+  button { background:var(--blue); color:#fff; border:0; border-radius:20px; padding:10px 22px; font-weight:bold; cursor:pointer; margin-top:10px; }
+  button.ghost { background:none; color:var(--blue); border:1px solid var(--line); margin:0; }
+  .row { display:flex; justify-content:space-between; align-items:center; background:var(--tint); border-radius:8px; padding:9px 12px; margin-bottom:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:10px; }
+  .state { font-weight:bold; font-size:13px; }
+  .detail { font-size:12px; color:var(--muted); white-space:pre-wrap; margin:-4px 0 10px 32px; max-height:120px; overflow:auto; }
+  .status { font-size:13px; color:var(--muted); margin:8px 0 16px; }
+  .lesson { font-size:13px; border-bottom:1px solid var(--line); padding:6px 0; }
+  a { color:var(--blue); }
+</style>
+</head>
+<body>
+<header>
+  <div><b>asla</b> Softfactory · Gemini agents that ship software you can trust</div>
+  <div id="who"><button class="ghost" id="login">Sign in with Google</button></div>
+</header>
+<main>
+  <section>
+    <h2>Describe what you need</h2>
+    <textarea id="req">FastAPI service exposing Bank of Mongolia official exchange rates: GET /rates/latest and GET /rates/history?currency=&amp;from=&amp;to=, with a parser module, SQLite cache, and pytest tests using saved HTML fixtures</textarea>
+    <button id="go">Start run</button>
+    <div class="status" id="msg"></div>
+    <h2>Recent runs (Firestore)</h2>
+    <div id="runs" class="status">Sign in to see runs.</div>
+  </section>
+  <section>
+    <h2>Live pipeline</h2>
+    <div class="status" id="runstatus">No run yet.</div>
+    <div id="events"></div>
+  </section>
+</main>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getFirestore, doc, collection, query, orderBy, limit, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  // Firebase web config for project softfactory-490f2 (public identifiers, safe in client code)
+  const firebaseConfig = {
+    apiKey: "AIzaSyB8A1UBz5E6qloIiUsmSALZi0dAj-5HbrU",
+    authDomain: "softfactory-490f2.firebaseapp.com",
+    projectId: "softfactory-490f2",
+    storageBucket: "softfactory-490f2.firebasestorage.app",
+    messagingSenderId: "825253406714",
+    appId: "1:825253406714:web:8ebc5293c33e26b8d62643"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app), db = getFirestore(app);
+  const $ = (id) => document.getElementById(id);
+  const color = { done:"var(--green)", passed:"var(--green)", merged:"var(--green)", running:"var(--blue)", retry:"var(--amber)", failed:"var(--red)" };
+  let unsub = [];
+
+  $("login").onclick = () => signInWithPopup(auth, new GoogleAuthProvider());
+  onAuthStateChanged(auth, (u) => {
+    if (!u) return;
+    $("who").textContent = u.email;
+    onSnapshot(query(collection(db, "runs"), orderBy("created_at", "desc"), limit(10)), (s) => {
+      $("runs").innerHTML = s.empty ? "No runs yet." : s.docs.map(d => {
+        const r = d.data();
+        return `<div class="row" style="cursor:pointer" data-id="${d.id}"><span>${esc((r.request||"").slice(0,60))}…</span>
+                <span class="state">${esc(r.status)}</span></div>`;
+      }).join("");
+      document.querySelectorAll("#runs .row").forEach(el => el.onclick = () => watch(el.dataset.id));
+      if (!window._watched && !s.empty) { window._watched = true; watch(s.docs[0].id); }
+    });
+  });
+
+  $("go").onclick = async () => {
+    const u = auth.currentUser;
+    if (!u) { $("msg").textContent = "Please sign in first."; return; }
+    $("msg").textContent = "Starting…";
+    const r = await fetch("/api/runs", { method:"POST",
+      headers:{ "Content-Type":"application/json", Authorization:"Bearer " + await u.getIdToken() },
+      body: JSON.stringify({ request: $("req").value }) });
+    const j = await r.json();
+    if (!r.ok) { $("msg").textContent = j.detail || "Error"; return; }
+    $("msg").textContent = "Run " + j.run_id;
+    watch(j.run_id);
+  };
+
+  function watch(id) {
+    unsub.forEach(f => f()); unsub = [];
+    $("events").innerHTML = "";
+    unsub.push(onSnapshot(doc(db, "runs", id), (s) => {
+      const r = s.data() || {};
+      let t = "Status: " + (r.status || "…");
+      if (r.status === "green") t += " · build completed" + (r.repo_uri ? " (" + r.repo_uri + ")" : "");
+      $("runstatus").textContent = t;
+    }));
+    unsub.push(onSnapshot(query(collection(db, "runs", id, "events"), orderBy("at")), (s) => {
+      $("events").innerHTML = s.docs.map(d => {
+        const e = d.data();
+        return `<div class="row"><span><span class="dot" style="background:${color[e.state]||"var(--muted)"}"></span>${esc(e.agent)}</span>
+                <span class="state" style="color:${color[e.state]||"var(--muted)"}">${esc(e.state)}</span></div>` +
+               (e.detail ? `<div class="detail">${esc(e.detail.slice(0,600))}</div>` : "");
+      }).join("");
+    }));
+  }
+  function esc(s){ return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+</script>
+</body>
+</html>

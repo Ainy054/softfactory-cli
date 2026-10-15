@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+google-cloud-firestore
+google-cloud-storage
+firebase-admin

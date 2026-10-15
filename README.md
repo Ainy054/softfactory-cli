@@ -327,6 +327,30 @@ src/
   components/          Ink TUI
 ```
 
+## Google Cloud
+
+The `cloud/` folder connects Softfactory to Google Cloud (built for the Google Cloud AI Builder Cup 2026, team **asla**). Details are in [`cloud/README.md`](cloud/README.md).
+
+- **Gemini** plans the work (Gemini 3.1 Pro) and runs the coder, test-writer and Quality Inspector roles (Gemini Flash) through the `agy` provider.
+- **Firestore** holds the run history: one `runs/{runId}` document per run, with phase and task events in its `events` subcollection.
+- **Firebase Hosting + Authentication** serve the live console with Google sign-in: **https://softfactory-490f2.web.app**. It lists recent runs from Firestore and shows each phase and task as it changes. Rules are in `cloud/web/firestore.rules`.
+- **Cloud Run**: `cloud/orchestrator/` is a FastAPI service that runs the CLI and streams progress to Firestore, and `cloud/generated-app/Dockerfile` deploys an app Softfactory generated (for example the Bank of Mongolia exchange-rate API). `cloud/deploy.sh` deploys both and the console.
+
+### Mirroring a local run to Firestore
+
+`cloud/local/sf_mirror.py` runs `softfactory` on your own machine (where your Gemini / Antigravity login lives) and mirrors its progress to Firestore, so the console shows the run live:
+
+```bash
+pip3 install google-cloud-firestore
+gcloud auth application-default login
+gcloud auth application-default set-quota-project softfactory-490f2
+
+cd my-repo   # any git repository
+python3 /path/to/softfactory-cli/cloud/local/sf_mirror.py "FastAPI service exposing Bank of Mongolia official exchange rates ..."
+```
+
+It starts the CLI in a pseudo-terminal with the cloud flags (`--strategy=cloud --cloud-provider=agy --planner-provider=agy`, Gemini models, Docker sandbox), creates a `runs` document with the request and status, strips the terminal colour codes from the output, and parses phase progress (`Phase N: n/m done`), worker lines (`[T3] ...`) and finished tasks (`T3 ... [role] [Merged|Failed]`) into `events`. When the CLI exits, the run status is set to `green` or `failed` with the exit code. Extra arguments, such as `--resume`, are passed through to `softfactory`.
+
 ## Development
 
 ```bash
