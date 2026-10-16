@@ -30,6 +30,9 @@ SF_ENV = {
     "SOFTFACTORY_COMPAT_API_KEY": "adc",  # the proxy adds the real token
     "SOFTFACTORY_COMPAT_LABEL": "Gemini (Vertex)",
     "SOFTFACTORY_COMPAT_CONTEXT": "1000000",
+    # No __pycache__ in the worktrees: workers otherwise commit .pyc files and then
+    # spend turns trying to remove them with commands the allowlist refuses.
+    "PYTHONDONTWRITEBYTECODE": "1",
 }
 
 TASK = re.compile(r"\[(T\d+)\]\s*(.*)")
@@ -40,6 +43,8 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 def _state(line: str) -> str:
     l = line.lower()
+    if "tool error" in l:  # the allowlist refusing a command: the worker carries on
+        return "retry"
     if "failed" in l or "error" in l:
         return "failed"
     if "passed" in l or "success" in l or "merged" in l:
