@@ -2,6 +2,7 @@
 # One-time + repeatable deploy of Softfactory to Google Cloud / Firebase.
 # Usage:  PROJECT=my-gcp-project ./deploy.sh
 set -euo pipefail
+cd "$(dirname "$0")"
 PROJECT=${PROJECT:-softfactory-490f2}
 REGION=${REGION:-asia-northeast1}          # Tokyo, closest Cloud Run region to Mongolia
 BUCKET=${PROJECT}-softfactory
@@ -23,11 +24,17 @@ for ROLE in roles/datastore.user roles/storage.objectAdmin roles/aiplatform.user
 done
 
 # 3. Factory service (FastAPI + softfactory-cli) on Cloud Run
-#    first copy your built softfactory-cli folder into orchestrator/softfactory-cli (see Dockerfile)
+#    Gemini runs on Vertex AI under the service account (orchestrator/vertex_proxy.py): no API key.
+#    The CLI is copied in from this checkout: package files and the built dist/ only (never .env).
+CLI_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+(cd "$CLI_ROOT" && npm run -s build)
+rm -rf orchestrator/softfactory-cli && mkdir -p orchestrator/softfactory-cli
+cp "$CLI_ROOT/package.json" "$CLI_ROOT/package-lock.json" orchestrator/softfactory-cli/
+cp -R "$CLI_ROOT/dist" orchestrator/softfactory-cli/dist
 gcloud run deploy softfactory-api --source orchestrator --region "$REGION" \
   --service-account "$SA" --memory 4Gi --cpu 2 --no-cpu-throttling --timeout 3600 \
-  --min-instances 1 --allow-unauthenticated \
-  --set-env-vars "GOOGLE_CLOUD_PROJECT=$PROJECT,ARTIFACT_BUCKET=$BUCKET"
+  --min-instances 1 --max-instances 2 --allow-unauthenticated \
+  --set-env-vars "GOOGLE_CLOUD_PROJECT=$PROJECT,ARTIFACT_BUCKET=$BUCKET,VERTEX_LOCATION=global"
 
 # 4. Firebase Hosting (console) + Firestore rules
 #    first time: npm i -g firebase-tools && firebase login && firebase projects:addfirebase "$PROJECT"
