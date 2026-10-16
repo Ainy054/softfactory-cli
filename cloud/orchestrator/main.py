@@ -17,8 +17,10 @@ from pydantic import BaseModel
 
 from . import store
 from .pipeline import run_pipeline
+from .vertex_proxy import start_in_background
 
 firebase_admin.initialize_app()
+start_in_background()
 app = FastAPI(title="Softfactory orchestrator")
 ALLOW_ANON = os.environ.get("ALLOW_ANON", "false") == "true"  # demo switch for judges
 

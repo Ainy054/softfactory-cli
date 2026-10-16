@@ -16,11 +16,21 @@ from . import store
 
 BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
 SF_BIN = os.environ.get("SOFTFACTORY_BIN", "softfactory")
+# Gemini on Vertex AI through the loopback proxy (vertex_proxy.py), billed to the
+# project. Cloud Run has no Docker, so worker commands run in this container
+# under softfactory's allowlist (--sandbox=none); the container is the sandbox.
 SF_FLAGS = os.environ.get(
     "SOFTFACTORY_FLAGS",
-    '--strategy=cloud --cloud-provider=agy --planner-provider=agy '
-    '--cloud-model="Gemini 3.7 Flash (High)" --frontier-model="Gemini 3.1 Pro (High)" '
-    '--sandbox=auto --attempt-timeout 15 --run-budget 60')
+    "--strategy=cloud --cloud-provider=openai-compat --planner-provider=openai-compat "
+    "--cloud-model=google/gemini-3.8-flash --frontier-model=google/gemini-3.1-pro-preview "
+    "--planner-model=google/gemini-3.1-pro-preview "
+    "--sandbox=none --no-docker --no-tui --attempt-timeout 15 --run-budget 60")
+SF_ENV = {
+    "SOFTFACTORY_COMPAT_BASE_URL": f"http://127.0.0.1:{os.environ.get('VERTEX_PROXY_PORT', '18081')}/v1",
+    "SOFTFACTORY_COMPAT_API_KEY": "adc",  # the proxy adds the real token
+    "SOFTFACTORY_COMPAT_LABEL": "Gemini (Vertex)",
+    "SOFTFACTORY_COMPAT_CONTEXT": "1000000",
+}
 
 TASK = re.compile(r"\[(T\d+)\]\s*(.*)")
 DONE_TASK = re.compile(r"(T\d+)\s+(.+?)\s+\[(coder|test_writer)\]\s+\[(Merged|Failed)\]")
@@ -46,7 +56,7 @@ def run_pipeline(run_id: str, request: str):
         store.set_status(run_id, "running")
         subprocess.run("git init -q && git commit -q --allow-empty -m init", shell=True, cwd=work, check=True)
         cmd = f'{SF_BIN} {SF_FLAGS} --yes "$REQ"'
-        p = subprocess.Popen(cmd, shell=True, cwd=work, env={**os.environ, "REQ": request},
+        p = subprocess.Popen(cmd, shell=True, cwd=work, env={**SF_ENV, **os.environ, "REQ": request},
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         seen = set()
         for raw in p.stdout:

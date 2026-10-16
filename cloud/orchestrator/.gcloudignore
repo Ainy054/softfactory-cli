@@ -1,0 +1,4 @@
+# Upload the CLI copy deploy.sh makes (git-ignored); skip caches.
+__pycache__/
+*.pyc
+softfactory-cli/node_modules/
