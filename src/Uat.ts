@@ -112,6 +112,9 @@ const hostShell: ShellRunner = async (command, { cwd, env, timeoutMs }) => {
   }
 };
 
+/** An outside server's 5xx as Python requests, curl -f and common clients report it. */
+const UPSTREAM_SERVER_ERROR = /\b5\d\d (?:Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out)|Bad Gateway|Service Unavailable|Gateway Time-?out|The requested URL returned error: 5\d\d/i;
+
 const shellQuote = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
 
 /**
@@ -143,7 +146,7 @@ export async function pythonEnvironment(projectDir: string, venvDir: string): Pr
 export async function runUat(
   baseDir: string,
   config: UatConfig,
-  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner; env?: Record<string, string>; venvDir?: string },
+  options: { runId: string; featureId: string; evidenceDir?: string; log?: (line: string) => void; shell?: ShellRunner; env?: Record<string, string>; venvDir?: string; upstreamRetryMs?: number },
 ): Promise<UatResult> {
   const shell = options.shell ?? hostShell;
   const log = options.log ?? (() => {});
@@ -159,6 +162,19 @@ export async function runUat(
     return { exitCode, output, pid };
   };
   const substitute = (text: string) => text.replace(/\$SOFTFACTORY_RUN_ID|\$\{SOFTFACTORY_RUN_ID\}/g, options.runId);
+  // #106: the mongolbank-fastapi demo's live check failed on the bank's own
+  // `502 Bad Gateway` during backfill; every task was fine and the bank
+  // answered 200 minutes later. A step that fails on an outside server error
+  // runs once more after a pause; any other failure, or a second 5xx, stands.
+  const upstreamRetryMs = options.upstreamRetryMs ?? 10_000;
+  const runRetryingUpstream = async (name: string, command: string) => {
+    const first = await run(name, command);
+    if (first.exitCode === 0 || !UPSTREAM_SERVER_ERROR.test(first.output)) return { ...first, retried: false, pids: [first.pid] };
+    log(`UAT: ${name} hit an upstream server error; retrying once in ${Math.round(upstreamRetryMs / 1000)} s`);
+    await new Promise(resolve => setTimeout(resolve, upstreamRetryMs));
+    const second = await run(`${name} (retry after upstream server error)`, command);
+    return { ...second, retried: true, pids: [first.pid, second.pid] };
+  };
 
   let failed = false;
   try {
@@ -199,19 +215,19 @@ export async function runUat(
       failed = true;
     }
     for (const [index, command] of (failed ? [] : config.setup).entries()) {
-      const { exitCode, output, pid } = await run(`setup ${index + 1}`, command);
+      const { exitCode, output, pids, retried } = await runRetryingUpstream(`setup ${index + 1}`, command);
       // Remember every setup step that ran: mongolbank-rates' `uvicorn app.main:app
       // --port 8000 &` was still holding port 8000 three hours after the run.
-      if (pid !== undefined) setupGroups.push(pid);
-      steps.push({ name: `setup ${index + 1}`, command, passed: exitCode === 0, detail: exitCode === 0 ? 'ok' : `exit ${exitCode}: ${tail(output)}` });
+      for (const pid of pids) if (pid !== undefined) setupGroups.push(pid);
+      steps.push({ name: `setup ${index + 1}`, command, passed: exitCode === 0, detail: exitCode === 0 ? (retried ? 'ok after one retry (upstream server error)' : 'ok') : `exit ${exitCode}: ${tail(output)}` });
       if (exitCode !== 0) { failed = true; break; }
     }
     for (const probe of failed ? [] : config.probes) {
       const command = substitute(probe.run);
-      const { exitCode, output } = await run(`probe ${probe.name}`, command);
+      const { exitCode, output, retried } = await runRetryingUpstream(`probe ${probe.name}`, command);
       const matched = probe.expect ? new RegExp(probe.expect, 'm').test(output) : true;
       const passed = exitCode === 0 && matched;
-      steps.push({ name: `probe: ${probe.name}`, command, passed, detail: passed ? 'reachable' : exitCode !== 0 ? `exit ${exitCode}: ${tail(output)}` : `output did not match /${probe.expect}/: ${tail(output)}` });
+      steps.push({ name: `probe: ${probe.name}`, command, passed, detail: passed ? (retried ? 'reachable after one retry (upstream server error)' : 'reachable') : exitCode !== 0 ? `exit ${exitCode}: ${tail(output)}` : `output did not match /${probe.expect}/: ${tail(output)}` });
       failed ||= !passed;
     }
     // Legacy suites that are allowed to fail must not wedge a gating one: non-gating first, then gating, each in file order.
