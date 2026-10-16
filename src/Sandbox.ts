@@ -221,6 +221,8 @@ export function pythonInstallScript(plan: PythonDependencyPlan): string {
  * available and refuses to proceed when it is not, so an unsandboxed run is
  * always a choice the user made with --sandbox=none.
  */
+const DETECT_ATTEMPTS = 3;
+
 export class SandboxManager {
   available = false;
   private detected = false;
@@ -236,17 +238,35 @@ export class SandboxManager {
 
   get active(): boolean { return this.mode !== 'none' && this.available; }
 
+  /** One answer from the Docker daemon; overridden in tests. */
+  probeDocker: () => Promise<unknown> = () => execa('docker', ['version', '--format', '{{.Server.Version}}'], { timeout: 8000 });
+  /** The pause between attempts; overridden in tests. */
+  detectRetryMs = 3000;
+
+  /**
+   * #105: Docker Desktop can stall for longer than one probe's timeout. The
+   * mongolbank-fastapi demo halted with "Docker is not available" while
+   * `docker version` answered in 0.1 s before and after, so one slow answer
+   * is retried before the run is refused.
+   */
   async detect(): Promise<boolean> {
     if (this.detected) return this.available;
     this.detected = true;
     if (this.mode === 'none') return false;
-    try {
-      await execa('docker', ['version', '--format', '{{.Server.Version}}'], { timeout: 8000 });
-      this.available = true;
-    } catch {
-      this.available = false;
+    for (let attempt = 1; attempt <= DETECT_ATTEMPTS; attempt++) {
+      try {
+        await this.probeDocker();
+        this.available = true;
+        return true;
+      } catch (error: any) {
+        // A missing docker binary cannot answer later: no retry.
+        if (error?.code === 'ENOENT' || attempt === DETECT_ATTEMPTS) break;
+        this.log(`Docker did not answer (attempt ${attempt} of ${DETECT_ATTEMPTS}); retrying in ${Math.round(this.detectRetryMs / 1000)} s`);
+        await new Promise(resolve => setTimeout(resolve, this.detectRetryMs));
+      }
     }
-    return this.available;
+    this.available = false;
+    return false;
   }
 
   /** Why a run may not proceed, or null when it may. */
