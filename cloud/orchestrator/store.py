@@ -77,3 +77,18 @@ def find_lesson(error_text: str) -> dict | None:
 def top_lessons(limit: int = 20) -> list[dict]:
     q = db.collection("lessons").order_by("hits", direction=firestore.Query.DESCENDING).limit(limit)
     return [d.to_dict() for d in q.stream()]
+
+def fetch_historical_tasks(limit: int = 50) -> list[dict]:
+    """Fetch completed and failed historical runs from Firestore for RAG memory indexing."""
+    runs = db.collection("runs").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).stream()
+    records = []
+    for doc in runs:
+        data = doc.to_dict()
+        if "request" in data:
+            records.append({
+                "request": data.get("request", ""),
+                "status": data.get("status", "unknown"),
+                "error": data.get("error", ""),
+                "run_id": doc.id,
+            })
+    return records

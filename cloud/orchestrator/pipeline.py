@@ -13,6 +13,7 @@ import subprocess
 from google.cloud import storage
 
 from . import store
+from .faiss_retriever import FAISSMemoryRetriever
 
 BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
 SF_BIN = os.environ.get("SOFTFACTORY_BIN", "softfactory")
@@ -60,8 +61,23 @@ def run_pipeline(run_id: str, request: str):
     try:
         store.set_status(run_id, "running")
         subprocess.run("git init -q && git commit -q --allow-empty -m init", shell=True, cwd=work, check=True)
+
+        # Pre-process task goal with FAISS Memory Retrieval
+        augmented_request = request
+        try:
+            historical_records = store.fetch_historical_tasks(limit=50)
+            if historical_records:
+                retriever = FAISSMemoryRetriever()
+                retriever.build_index_from_records(historical_records)
+                similar_matches = retriever.search(query=request, top_k=3)
+                if similar_matches:
+                    rag_context = retriever.format_retrieved_context(similar_matches)
+                    augmented_request = f"{rag_context}\n\nTask Goal: {request}"
+        except Exception as e:
+            store.log_event(run_id, "RAG Memory", "retry", f"Skipped memory retrieval: {e}")
+
         cmd = f'{SF_BIN} {SF_FLAGS} --yes "$REQ"'
-        p = subprocess.Popen(cmd, shell=True, cwd=work, env={**SF_ENV, **os.environ, "REQ": request},
+        p = subprocess.Popen(cmd, shell=True, cwd=work, env={**SF_ENV, **os.environ, "REQ": augmented_request},
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         seen = set()
         for raw in p.stdout:
